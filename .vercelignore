@@ -7,6 +7,12 @@ api/test/
 mrp/test/
 mrp/tools/
 
+# MRP source is bundled at build time into mrp/app.bundle.js (committed); the
+# raw source, entry point and docs don't need to ship.
+mrp/mrp-console.jsx
+mrp/entry.jsx
+mrp/*.md
+
 # Docs aren't part of the running app.
 docs/
 

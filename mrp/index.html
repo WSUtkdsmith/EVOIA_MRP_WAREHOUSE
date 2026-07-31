@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Evoia — MRP Console</title>
+<style>html,body{height:100%;margin:0;background:#f6f7f5}#root{min-height:100%}</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script>
+// window.storage shim — presents the async key/value interface the MRP console
+// expects (get(key)->{value}, set(key,value)) backed by the shared backend,
+// scoped to the selected Business Unit. The MRP stores its whole dataset under
+// "mrp_console_data" plus one entry per lot attachment; we hold that key/value
+// map as the module's JSON blob in /api/state?bu=<id>&module=mrp, and mirror it
+// to localStorage so the app still works offline (same resilience as warehouse).
+(function () {
+  var bu = (function () {
+    try { return new URLSearchParams(location.search).get('bu') || 'evoia'; }
+    catch (e) { return 'evoia'; }
+  })();
+  var API = '/api/state?bu=' + encodeURIComponent(bu) + '&module=mrp';
+  var LS_KEY = 'evoiaMrpKV::' + bu;
+  var kv = {};
+
+  function saveLocal() { try { localStorage.setItem(LS_KEY, JSON.stringify(kv)); } catch (e) {} }
+  function loadLocal() { try { var s = localStorage.getItem(LS_KEY); if (s) kv = JSON.parse(s) || {}; } catch (e) {} }
+
+  // Load once before the app reads anything. The app awaits storage.get, so it
+  // naturally waits for this; its own 4s timeout falls back to seed data if the
+  // network is slow.
+  var ready = (async function () {
+    loadLocal();
+    try {
+      var resp = await fetch(API);
+      if (resp.ok) {
+        var body = await resp.json();
+        if (body && body.data && typeof body.data === 'object') { kv = body.data; saveLocal(); }
+      }
+    } catch (e) { console.warn('MRP state load failed (offline?):', e); }
+    return true;
+  })();
+
+  var flushTimer = null, flushing = false, dirtyAgain = false;
+  function scheduleFlush() {
+    saveLocal();
+    if (flushTimer) clearTimeout(flushTimer);
+    flushTimer = setTimeout(flush, 700);
+  }
+  async function flush() {
+    if (flushing) { dirtyAgain = true; return; }
+    flushing = true;
+    try {
+      await fetch(API, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data: kv })
+      });
+    } catch (e) {
+      console.warn('MRP state save failed (offline?):', e);
+    } finally {
+      flushing = false;
+      if (dirtyAgain) { dirtyAgain = false; scheduleFlush(); }
+    }
+  }
+
+  window.storage = {
+    get: async function (key) {
+      await ready;
+      return { value: Object.prototype.hasOwnProperty.call(kv, key) ? kv[key] : null };
+    },
+    set: async function (key, value) {
+      await ready;
+      kv[key] = value;
+      scheduleFlush();
+      return { ok: true };
+    },
+    remove: async function (key) {
+      await ready;
+      delete kv[key];
+      scheduleFlush();
+      return { ok: true };
+    }
+  };
+})();
+</script>
+<script src="app.bundle.js"></script>
+</body>
+</html>

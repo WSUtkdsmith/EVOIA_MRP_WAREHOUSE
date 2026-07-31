@@ -73,14 +73,13 @@ footer{max-width:1040px;margin:0 auto;padding:8px 22px 40px;color:var(--muted);f
     </section>
 
     <section class="card">
-      <span class="tag pending">Build pending</span>
+      <span class="tag live">Live</span>
       <h2>MRP Console</h2>
       <p>Purchasing, multi-stage production with lot genealogy, finite-capacity
-         scheduling, sales orders and lot-level costing. Comes online once its
-         React build step is wired for Vercel (Phase 2b).</p>
+         scheduling, sales orders and lot-level costing. Scoped to the selected
+         business unit; data persists to the shared backend.</p>
       <div class="go">
-        <button class="btn" id="openMrp" disabled>Open MRP →</button>
-        <span class="mini">React module — transpile step in progress</span>
+        <a class="btn primary" id="openMrp" href="#">Open MRP →</a>
       </div>
     </section>
   </div>
@@ -161,6 +160,8 @@ function render(){
 
   var wh = $('openWarehouse');
   wh.href = moduleUrl('warehouse/index.html', state.selected);
+  var mrp = $('openMrp');
+  mrp.href = moduleUrl('mrp/index.html', state.selected);
 }
 
 $('buSelect').addEventListener('change', function(e){

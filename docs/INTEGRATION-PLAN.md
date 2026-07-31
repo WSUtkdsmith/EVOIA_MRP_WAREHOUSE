@@ -85,12 +85,17 @@ canonical lot/batch key both sides read and write.
   and launch cards per module. Graceful fallback to seed units when the backend
   is unreachable. Warehouse wired to be BU-aware (`?bu=` → `/api/state?bu=&module=
   warehouse`, per-BU localStorage key). Pure shell/warehouse helpers verified.
-- **Phase 2b — MRP on Vercel (next).** The MRP is 14.4k lines of React JSX using
-  `window.storage`; it cannot run in a browser as-is. Add a lightweight build
-  step (recommend **esbuild**: JSX → one bundle, no framework churn) and redirect
-  its `window.storage` reads/writes to `/api/state?bu=&module=mrp`. Then enable
-  the MRP launch card and resolve the render-suite build so the full ~1,397-test
-  gate runs in CI.
+- **Phase 2b — MRP on Vercel (done).** esbuild bundles `mrp/entry.jsx`
+  (the default-exported `<App/>` mounted with React 18) + React + lucide into a
+  committed `mrp/app.bundle.js` (`npm run build:mrp`). `mrp/index.html` hosts it
+  behind a `window.storage` shim that presents the MRP's key/value contract
+  (`get→{value}`, `set`) over `/api/state?bu=&module=mrp`, with a localStorage
+  mirror for offline. Shell MRP card enabled and BU-scoped. Bundle builds clean
+  (0 errors); live browser render is confirmed post-deploy.
+  - *Follow-ups:* (a) render-suite CI so the full ~1,397-test gate runs (react is
+    now installable); (b) the committed bundle is a build artifact — a later
+    Vercel build step could generate it instead; (c) `@vercel/postgres@0.10.0`
+    is deprecated in favour of Neon's native SDK — works today, migrate later.
 - **Phase 3 — Unify the inventory spine.** Make MRP lots and warehouse pallet
   lines two views of the same stock; connect receiving/shipping across modules
   on the shared map.
