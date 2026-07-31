@@ -250,6 +250,26 @@ transaction logic is duplicated.
     pending receipts so two people receiving the same delivery an hour apart see
     the second as already booked.
   - Tests: catalog 69 assertions (up 22), warehouse 71 (up 26).
+- *Step 3b — purchase order editor (done).* The forecast could only raise orders
+  for materials it flagged as short, and orders were read-only once raised — so
+  the multi-line model was not reachable from the UI at all. Now:
+  - **New purchase order** on the purchasing tab opens a full editor: reference
+    (auto-minted), supplier, dates, notes, and a line editor.
+  - Per line: material, **container picked per line**, container count → quantity
+    derived (units conserved), unit cost, live line total and order total. The
+    same material can appear on several lines, one per container size — the case
+    the line model exists for, now authorable by hand.
+  - A material with no packaging can still be ordered, by quantity, and says so.
+  - **Save draft** or **Save and place**. Opening a draft opens it editable;
+    anything placed opens read-only with a **Cancel order** action, and a
+    received order offers no cancel at all.
+  - Guards live in the data layer, not the modal: `tx.savePurchaseOrder` refuses
+    to edit a non-draft (the supplier holds it, and stock may have landed
+    against lines that must not move underneath receipts), refuses a duplicate
+    reference, and drops abandoned half-filled rows rather than failing the
+    save. `tx.cancelPurchaseOrder` refuses an order already received in full.
+  - 22 new assertions; render-smoke covers empty, two-container-size draft,
+    placed (read-only, zero inputs), received, and the tab button.
 - *Step 4 (next)* — apply pending receipts to the MRP through
   `tx.receiveAgainstOrder`, flipping them to `applied`. The idempotency ledger
   is the careful part: a re-synced or edited receipt must never mint a second

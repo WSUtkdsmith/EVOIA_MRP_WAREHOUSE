@@ -161,6 +161,82 @@ console.log('\n--- raising is defensive ---');
   ok('nothing is raised from empty, unknown or zero-quantity rows', D.purchaseOrders.length === n);
 }
 
+console.log('\n--- authoring an order by hand ---');
+{
+  const D = seedData();
+  const raw = D.rawMaterials[0];
+  const packs = [
+    { id: 'pk-s', sku: 'S', packageType: 'sack', size: '60 kg', unitsPerPackage: 60, isDefault: true },
+    { id: 'pk-t', sku: 'T', packageType: 'tote', size: '1000 kg', unitsPerPackage: 1000 }
+  ];
+  raw.packagings = packs;
+
+  const bad = tx.savePurchaseOrder(D, { reference: 'HAND-1', supplier: 'Acme', lines: [] });
+  ok('an order with no usable line is refused', bad.ok === false);
+
+  const halfFilled = tx.savePurchaseOrder(D, { reference: 'HAND-1', supplier: 'Acme', lines: [
+    { rawMaterialId: raw.id, qty: 600, unitCost: 5, packagingId: 'pk-s', containerCount: 10 },
+    { rawMaterialId: '', qty: 0 },                    // abandoned row
+    { rawMaterialId: raw.id, qty: 0, unitCost: 5 }    // no quantity
+  ]});
+  ok('a hand-written order saves', halfFilled.ok === true);
+  ok('and drops the half-filled rows rather than refusing the save',
+     halfFilled.po.lines.length === 1);
+  ok('it is a draft until deliberately placed', halfFilled.po.status === 'Draft');
+
+  // the case the whole line model exists for
+  const two = tx.savePurchaseOrder(D, { purchaseOrderId: halfFilled.po.id, reference: 'HAND-1',
+    supplier: 'Acme', lines: [
+      { rawMaterialId: raw.id, qty: 600, unitCost: 5, packagingId: 'pk-s', containerCount: 10 },
+      { rawMaterialId: raw.id, qty: 3000, unitCost: 4.5, packagingId: 'pk-t', containerCount: 3 }
+    ]});
+  ok('the same material can be ordered in two container sizes on one order',
+     two.ok === true && two.po.lines.length === 2);
+  ok('each size keeps its own container', two.po.lines[0].packagingId === 'pk-s' && two.po.lines[1].packagingId === 'pk-t');
+  ok('and its own price', two.po.lines[0].unitCost === 5 && two.po.lines[1].unitCost === 4.5);
+  ok('editing did not duplicate the order',
+     D.purchaseOrders.filter(p => p.reference === 'HAND-1').length === 1);
+  ok('order value is the sum of the lines', Math.abs(poTotalCost(two.po) - (600 * 5 + 3000 * 4.5)) < 0.001);
+
+  const dupe = tx.savePurchaseOrder(D, { reference: 'HAND-1', supplier: 'X',
+    lines: [{ rawMaterialId: raw.id, qty: 1, unitCost: 1 }] });
+  ok('a reference already in use is refused', dupe.ok === false);
+
+  const auto = tx.savePurchaseOrder(D, { supplier: 'X', lines: [{ rawMaterialId: raw.id, qty: 1, unitCost: 1 }] });
+  ok('a missing reference is minted', auto.ok === true && !!auto.po.reference);
+
+  // once placed it is a commitment, not a draft
+  tx.placePurchaseOrder(D, { purchaseOrderId: two.po.id });
+  const afterPlace = tx.savePurchaseOrder(D, { purchaseOrderId: two.po.id, reference: 'HAND-1',
+    supplier: 'Acme', lines: [{ rawMaterialId: raw.id, qty: 999, unitCost: 5 }] });
+  ok('a placed order cannot be edited', afterPlace.ok === false);
+  ok('and its lines are untouched by the attempt', two.po.lines.length === 2);
+  ok('editing an order that does not exist is refused',
+     tx.savePurchaseOrder(D, { purchaseOrderId: 'nope', lines: [{ rawMaterialId: raw.id, qty: 1 }] }).ok === false);
+}
+
+console.log('\n--- cancelling ---');
+{
+  const D = seedData();
+  const raw = D.rawMaterials[0];
+  const made = tx.savePurchaseOrder(D, { supplier: 'Acme', lines: [{ rawMaterialId: raw.id, qty: 100, unitCost: 2 }] });
+  const po = made.po;
+  ok('a draft can be cancelled', tx.cancelPurchaseOrder(D, { purchaseOrderId: po.id, reason: 'no longer needed' }).ok === true);
+  ok('the reason is recorded', /no longer needed/.test(po.notes));
+  ok('a cancelled order owes nothing', poOutstanding(po) === 0);
+  ok('and stops counting as cover', openOrderQty(D, raw.id) === 0 || !D.purchaseOrders.some(p => p.id === po.id && p.status !== 'Cancelled'));
+  ok('cancelling twice is refused', tx.cancelPurchaseOrder(D, { purchaseOrderId: po.id }).ok === false);
+  ok('it is no longer receivable', !tx.receivablePurchaseOrders(D).some(p => p.id === po.id));
+
+  const done = tx.savePurchaseOrder(D, { supplier: 'B', lines: [{ rawMaterialId: raw.id, qty: 10, unitCost: 1 }] }).po;
+  tx.placePurchaseOrder(D, { purchaseOrderId: done.id });
+  tx.receiveAgainstOrder(D, { purchaseOrderId: done.id, qty: 10, lotNumber: 'ALL-IN' });
+  ok('an order received in full cannot be cancelled',
+     tx.cancelPurchaseOrder(D, { purchaseOrderId: done.id }).ok === false);
+  ok('cancelling an order that does not exist is refused',
+     tx.cancelPurchaseOrder(D, { purchaseOrderId: 'nope' }).ok === false);
+}
+
 console.log('\n--- references ---');
 {
   const D = seedData();

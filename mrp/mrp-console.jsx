@@ -2016,6 +2016,71 @@ const tx = {
     return { ok: true, po };
   },
 
+  /* Create or amend a purchase order by hand.
+
+     Only a draft can be edited. Once an order is placed the supplier has
+     it, and once stock has landed against it the receipts and their lots
+     refer to lines that must not move underneath them - so the guard is
+     here in the data layer rather than in the modal, where any other code
+     path would bypass it.
+
+     Lines with no material or no quantity are dropped rather than
+     rejected: a half-filled row someone abandoned should not block the
+     save, but it must not become an order line either. */
+  savePurchaseOrder(db, { purchaseOrderId, reference, supplier, orderDate, expectedDate, notes, lines }) {
+    const existing = purchaseOrderId ? repo.find(db, "purchaseOrders", purchaseOrderId) : null;
+    if (purchaseOrderId && !existing) return { ok: false, error: "That purchase order no longer exists." };
+    if (existing && existing.status !== "Draft") {
+      return { ok: false, error: "Only a draft order can be edited. This one has already been placed." };
+    }
+
+    const ref = String(reference || "").trim() || nextPoReference(db);
+    const clash = (db.purchaseOrders || []).find(po => po.reference === ref && po.id !== (existing && existing.id));
+    if (clash) return { ok: false, error: "Reference " + ref + " is already in use." };
+
+    const clean = (lines || [])
+      .filter(l => l && l.rawMaterialId && (Number(l.qty) || 0) > 0)
+      .map(l => ({
+        id: l.id || uid(),
+        rawMaterialId: l.rawMaterialId,
+        qty: Number(l.qty) || 0,
+        unitCost: Number(l.unitCost) || 0,
+        packagingId: l.packagingId || "",
+        containerCount: Number(l.containerCount) || 0,
+        notes: l.notes || ""
+      }));
+    if (!clean.length) return { ok: false, error: "An order needs at least one line with a material and a quantity." };
+
+    const payload = {
+      reference: ref,
+      supplier: supplier || "",
+      orderDate: orderDate || todayStr(),
+      expectedDate: expectedDate || todayStr(),
+      notes: notes || "",
+      lines: clean,
+      status: "Draft",
+      receipts: existing ? (existing.receipts || []) : []
+    };
+    const po = repo.upsert(db, "purchaseOrders", existing ? existing.id : null, payload);
+    return { ok: true, po };
+  },
+
+  /* Cancel an order. A cancelled order stops counting toward cover and
+     stops accepting stock, which is why poOutstanding reads zero for one.
+     An order already fully received has nothing left to cancel, and
+     saying so is more useful than silently doing nothing. */
+  cancelPurchaseOrder(db, { purchaseOrderId, reason }) {
+    const po = repo.find(db, "purchaseOrders", purchaseOrderId);
+    if (!po) return { ok: false, error: "That purchase order no longer exists." };
+    if (po.status === "Cancelled") return { ok: false, error: "That order is already cancelled." };
+    if (poDerivedStatus(po) === "Received") {
+      return { ok: false, error: "That order has been received in full - there is nothing left to cancel." };
+    }
+    po.status = "Cancelled";
+    if (reason) po.notes = (po.notes ? po.notes + " — " : "") + "Cancelled: " + reason;
+    return { ok: true, po };
+  },
+
   /* Orders the warehouse may receive against: placed, not yet complete.
      A draft has not been sent to anyone and a cancelled order should not
      be accepting stock, so neither is receivable. */
@@ -8071,7 +8136,8 @@ export default function App() {
             onOpenBatch={(batchId) => setModal({ type: "batchRecord", id: batchId })} />
         )}
         {tab === "forecast" && <ForecastTab data={data} horizon={horizon} setHorizon={setHorizon}
-          update={update} onOpenOrder={(id) => setModal({ type: "purchaseOrder", id })} />}
+          update={update} onOpenOrder={(id) => setModal({ type: "purchaseOrder", id })}
+          onNewOrder={() => setModal({ type: "newPurchaseOrder" })} />}
         {tab === "utilization" && <UtilizationTab data={data} horizon={horizon} setHorizon={setHorizon} />}
         {tab === "revenue" && <RevenueTab data={data} horizon={horizon} setHorizon={setHorizon}
           onOpenShipment={(id) => setModal({ type: "shipmentTrace", id })}
@@ -8196,8 +8262,17 @@ export default function App() {
 
       {modal && modal.type === "purchaseOrder" && (() => {
         const rec = purchaseOrderRecords(data).find(r => r.po.id === modal.id);
-        return rec ? <PurchaseOrderModal record={rec} onClose={() => setModal(null)} /> : null;
+        if (!rec) return null;
+        // A draft is still being written, so it opens editable. Anything
+        // placed is a commitment the supplier holds, and opens read-only.
+        return rec.po.status === "Draft"
+          ? <PurchaseOrderEditor data={data} id={modal.id} onClose={() => setModal(null)} update={update} />
+          : <PurchaseOrderModal record={rec} onClose={() => setModal(null)}
+              onCancelOrder={() => { update(d => { tx.cancelPurchaseOrder(d, { purchaseOrderId: modal.id }); return d; }); setModal(null); }} />;
       })()}
+      {modal && modal.type === "newPurchaseOrder" && (
+        <PurchaseOrderEditor data={data} id={null} onClose={() => setModal(null)} update={update} />
+      )}
 
       {modal && modal.type === "batchRecord" && (() => {
         const rec = batchRecords(data).find(b => b.batchId === modal.id);
@@ -11973,7 +12048,177 @@ function ScheduleModal({ data, id, onClose, update }) {
    Reached by clicking an order anywhere it appears, the same way a
    batch record opens from the production calendar.
 ----------------------------------------------------------------*/
-function PurchaseOrderModal({ record, onClose }) {
+/* Create or amend a draft purchase order.
+
+   The line is the unit of an order, so the editor is a line editor: a
+   material, the container it is bought in, and how many of them. Quantity
+   is derived from the container count rather than typed, because that is
+   how ordering actually works and it is what keeps units conserved -
+   containers x units-per-container = quantity. A material with no
+   packaging can still be ordered, by quantity, and says so.
+
+   Only drafts reach here; anything placed opens read-only instead. */
+function PurchaseOrderEditor({ data, id, onClose, update }) {
+  const existing = id ? (data.purchaseOrders || []).find(p => p.id === id) : null;
+  const [f, setF] = useState(() => existing ? structuredClone(existing) : {
+    reference: nextPoReference(data), supplier: "", orderDate: todayStr(),
+    expectedDate: todayStr(), notes: "", lines: []
+  });
+  const [error, setError] = useState("");
+  const set = (k, v) => setF(prev => ({ ...prev, [k]: v }));
+
+  const materials = data.rawMaterials || [];
+  const packagingsFor = (rawMaterialId) => {
+    const raw = getRaw(data, rawMaterialId);
+    return (raw && raw.packagings) || [];
+  };
+
+  const patchLine = (i, patch) => setF(prev => ({
+    ...prev,
+    lines: prev.lines.map((l, j) => (j === i ? { ...l, ...patch } : l))
+  }));
+
+  // Changing the material re-points the line at that material's default
+  // container and its list price, since neither carries across.
+  const setMaterial = (i, rawMaterialId) => {
+    const raw = getRaw(data, rawMaterialId);
+    const packs = (raw && raw.packagings) || [];
+    const pkg = packs.find(p => p.isDefault) || packs[0] || null;
+    const line = f.lines[i];
+    const count = Number(line.containerCount) || 0;
+    patchLine(i, {
+      rawMaterialId,
+      packagingId: pkg ? pkg.id : "",
+      unitCost: raw ? (Number(raw.unitCost) || 0) : 0,
+      qty: pkg ? qtyFromContainers(pkg, count) : (Number(line.qty) || 0)
+    });
+  };
+
+  const setContainers = (i, count) => {
+    const line = f.lines[i];
+    const pkg = packagingsFor(line.rawMaterialId).find(p => p.id === line.packagingId);
+    patchLine(i, { containerCount: count, ...(pkg ? { qty: qtyFromContainers(pkg, count) } : {}) });
+  };
+
+  const setPackaging = (i, packagingId) => {
+    const line = f.lines[i];
+    const pkg = packagingsFor(line.rawMaterialId).find(p => p.id === packagingId);
+    patchLine(i, { packagingId, ...(pkg ? { qty: qtyFromContainers(pkg, Number(line.containerCount) || 0) } : {}) });
+  };
+
+  const addLine = () => setF(prev => ({
+    ...prev,
+    lines: [...prev.lines, { id: uid(), rawMaterialId: "", qty: 0, unitCost: 0, packagingId: "", containerCount: 0, notes: "" }]
+  }));
+  const removeLine = (i) => setF(prev => ({ ...prev, lines: prev.lines.filter((_, j) => j !== i) }));
+
+  const total = f.lines.reduce((s, l) => s + (Number(l.qty) || 0) * (Number(l.unitCost) || 0), 0);
+
+  const save = (thenPlace) => {
+    let res;
+    update(d => {
+      res = tx.savePurchaseOrder(d, { purchaseOrderId: existing ? existing.id : null, ...f });
+      if (res.ok && thenPlace) res = tx.placePurchaseOrder(d, { purchaseOrderId: res.po.id });
+      return d;
+    });
+    if (res && !res.ok) { setError(res.error); return; }
+    onClose();
+  };
+
+  return (
+    <Modal title={existing ? "Edit draft order " + (existing.reference || "") : "New purchase order"} onClose={onClose} wide>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 12, marginBottom: 14 }}>
+        <Field label="Reference"><input style={inputStyle} value={f.reference} onChange={e => set("reference", e.target.value)} /></Field>
+        <Field label="Supplier"><input style={inputStyle} value={f.supplier} onChange={e => set("supplier", e.target.value)} placeholder="Supplier name" /></Field>
+        <Field label="Order date"><input type="date" style={inputStyle} value={f.orderDate} onChange={e => set("orderDate", e.target.value)} /></Field>
+        <Field label="Expected"><input type="date" style={inputStyle} value={f.expectedDate} onChange={e => set("expectedDate", e.target.value)} /></Field>
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+        <div style={{ fontWeight: 700, fontSize: 13 }}>Lines</div>
+        <Btn variant="secondary" onClick={addLine}><Plus size={14} />Add line</Btn>
+      </div>
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 10 }}>
+        The same material can appear more than once — one line per container size, which is how the
+        warehouse receives and stores it.
+      </div>
+
+      {f.lines.length === 0 && (
+        <div style={{ fontSize: 12.5, color: "#B87510", marginBottom: 10 }}>
+          No lines yet. An order needs at least one material and quantity.
+        </div>
+      )}
+
+      {f.lines.map((line, i) => {
+        const packs = packagingsFor(line.rawMaterialId);
+        const pkg = packs.find(p => p.id === line.packagingId);
+        const raw = getRaw(data, line.rawMaterialId);
+        return (
+          <div key={line.id || i} style={{ display: "grid", gridTemplateColumns: "1.6fr 1.2fr 0.8fr 1fr 0.9fr 1fr auto",
+                                           gap: 8, alignItems: "end", marginBottom: 8 }}>
+            <Field label="Material">
+              <select style={inputStyle} value={line.rawMaterialId} onChange={e => setMaterial(i, e.target.value)}>
+                <option value="">Select a material…</option>
+                {materials.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+            </Field>
+            <Field label="Container">
+              {packs.length ? (
+                <select style={inputStyle} value={line.packagingId} onChange={e => setPackaging(i, e.target.value)}>
+                  {packs.map(p => <option key={p.id} value={p.id}>{packagingLabel(p)}</option>)}
+                </select>
+              ) : (
+                <div style={{ fontSize: 11.5, color: "#B87510", paddingBottom: 9 }}>
+                  {line.rawMaterialId ? "No packaging — ordered by quantity" : "—"}
+                </div>
+              )}
+            </Field>
+            <Field label="Containers">
+              <input type="number" min="0" style={inputStyle} disabled={!pkg}
+                value={line.containerCount || 0}
+                onChange={e => setContainers(i, Math.max(0, parseInt(e.target.value) || 0))} />
+            </Field>
+            <Field label={"Quantity" + (raw && raw.unit ? " (" + raw.unit + ")" : "")}>
+              <input type="number" step="any" min="0" style={inputStyle} value={line.qty || 0}
+                disabled={!!pkg}
+                onChange={e => patchLine(i, { qty: parseFloat(e.target.value) || 0 })} />
+            </Field>
+            <Field label="Unit cost">
+              <input type="number" step="0.01" min="0" style={inputStyle} value={line.unitCost || 0}
+                onChange={e => patchLine(i, { unitCost: parseFloat(e.target.value) || 0 })} />
+            </Field>
+            <Field label="Line total">
+              <div className="mono" style={{ height: 38, display: "flex", alignItems: "center", color: "#3C4038" }}>
+                {fmtMoney((Number(line.qty) || 0) * (Number(line.unitCost) || 0))}
+              </div>
+            </Field>
+            <IconBtn title="Remove line" onClick={() => removeLine(i)}><Trash2 size={14} /></IconBtn>
+          </div>
+        );
+      })}
+
+      <Field label="Notes"><input style={inputStyle} value={f.notes} onChange={e => set("notes", e.target.value)} placeholder="Terms, contact, anything the dock should know" /></Field>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 16, flexWrap: "wrap", gap: 10 }}>
+        <div style={{ fontSize: 14 }}>
+          Order total <b className="mono">{fmtMoney(total)}</b>
+          <span style={{ color: "#8A9099", fontSize: 12 }}> · {f.lines.length} line(s)</span>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+          <Btn variant="secondary" onClick={() => save(false)}>Save draft</Btn>
+          <Btn onClick={() => save(true)}>Save and place</Btn>
+        </div>
+      </div>
+      {error && <div style={{ color: "#A32D2D", fontSize: 12.5, marginTop: 8, textAlign: "right" }}>{error}</div>}
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginTop: 6, textAlign: "right" }}>
+        Placing an order is what makes it receivable in the warehouse.
+      </div>
+    </Modal>
+  );
+}
+
+function PurchaseOrderModal({ record, onClose, onCancelOrder }) {
   const r = record;
   const money = (n) => fmtMoney(n || 0);
   const tone = r.status === "Received" ? "good"
@@ -12071,8 +12316,16 @@ function PurchaseOrderModal({ record, onClose }) {
           {r.po.notes}
         </div>
       )}
-      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 16 }}>
-        <Btn variant="secondary" onClick={onClose}>Close</Btn>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 16, gap: 10 }}>
+        <div style={{ fontSize: 11.5, color: "#8A9099" }}>
+          A placed order is read-only — the supplier holds it, and stock may already have landed against it.
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          {onCancelOrder && r.status !== "Cancelled" && r.status !== "Received" && (
+            <Btn variant="secondary" onClick={onCancelOrder}>Cancel order</Btn>
+          )}
+          <Btn variant="secondary" onClick={onClose}>Close</Btn>
+        </div>
       </div>
     </Modal>
   );
@@ -12383,7 +12636,7 @@ function ReorderPanel({ data, update, onOpenOrder }) {
   );
 }
 
-function ForecastTab({ data, horizon, setHorizon, onOpenOrder, update }) {
+function ForecastTab({ data, horizon, setHorizon, onOpenOrder, onNewOrder, update }) {
   const [layout, setLayout] = useState("requirements");
   const [calMode, setCalMode] = useState("all");
   const [month, setMonth] = useState(() => todayStr().slice(0, 7));
@@ -12503,6 +12756,9 @@ function ForecastTab({ data, horizon, setHorizon, onOpenOrder, update }) {
           </div>
         )}
         {layout === "history" && <TimeRangeControls state={tr} />}
+        <div style={{ marginLeft: "auto" }}>
+          <Btn onClick={onNewOrder}><Plus size={15} />New purchase order</Btn>
+        </div>
       </div>
 
       <div style={{
