@@ -8439,11 +8439,101 @@ function RawMaterialsTab({ data, search, setSearch, onAdd, onEdit, onDelete, onI
   );
 }
 
+/* ---------------------------------------------------------------
+   Warehouse cataloging (Phase 3) — the storage attributes and
+   packaging variants that make a catalog item physically slottable.
+   Shared by all four catalog modals.
+----------------------------------------------------------------*/
+const PACKAGE_TYPES = ["drum", "tote", "barrel", "jug", "pail", "sack", "bag", "box", "case", "pallet", "each"];
+
+// Editor for an item's packaging variants. Each is a distinct storable SKU the
+// warehouse slots and counts (a 1 gal jug and a 2.5 gal jug are different stock
+// units); packagesPerSlot is its footprint. A lot points at one via packagingId.
+function PackagingsEditor({ packagings, onChange, itemSku }) {
+  const list = Array.isArray(packagings) ? packagings : [];
+  const patch = (i, k, v) => onChange(list.map((p, j) => (j === i ? { ...p, [k]: v } : p)));
+  const add = () => onChange([...list, {
+    id: uid(),
+    sku: itemSku ? itemSku + "-" + (list.length + 1) : "",
+    packageType: "drum", size: "", unitsPerPackage: 1, packagesPerSlot: 1,
+    isDefault: list.length === 0
+  }]);
+  const remove = (i) => {
+    const next = list.filter((_, j) => j !== i);
+    if (next.length && !next.some(p => p.isDefault)) next[0] = { ...next[0], isDefault: true };
+    onChange(next);
+  };
+  const setDefault = (i) => onChange(list.map((p, j) => ({ ...p, isDefault: j === i })));
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+        <div style={{ fontWeight: 700, fontSize: 13 }}>Packaging / storable SKUs</div>
+        <Btn variant="secondary" onClick={add}><Plus size={14} />Add packaging</Btn>
+      </div>
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 10 }}>
+        Each packaging is a distinct stock unit the warehouse slots and counts
+        (for example a 1 gal jug versus a 2.5 gal jug). Packages per slot is its footprint.
+      </div>
+      {list.length === 0 && (
+        <div style={{ fontSize: 12, color: "#B87510", marginBottom: 8 }}>
+          No packaging defined yet. The warehouse cannot catalog this item until at least one is added.
+        </div>
+      )}
+      {list.map((p, i) => (
+        <div key={p.id || i} style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 1fr 0.9fr 0.9fr auto auto", gap: 8, alignItems: "end", marginBottom: 8 }}>
+          <Field label="SKU"><input style={inputStyle} value={p.sku || ""} onChange={e => patch(i, "sku", e.target.value)} placeholder="SSB-1GAL" /></Field>
+          <Field label="Container">
+            <select style={inputStyle} value={p.packageType || "drum"} onChange={e => patch(i, "packageType", e.target.value)}>
+              {PACKAGE_TYPES.map(o => <option key={o} value={o}>{o}</option>)}
+            </select>
+          </Field>
+          <Field label="Size"><input style={inputStyle} value={p.size || ""} onChange={e => patch(i, "size", e.target.value)} placeholder="1 gal" /></Field>
+          <Field label="Units/pkg"><input type="number" style={inputStyle} value={p.unitsPerPackage ?? 1} onChange={e => patch(i, "unitsPerPackage", parseFloat(e.target.value) || 0)} /></Field>
+          <Field label="Pkgs/slot"><input type="number" style={inputStyle} value={p.packagesPerSlot ?? 1} onChange={e => patch(i, "packagesPerSlot", parseFloat(e.target.value) || 0)} /></Field>
+          <Field label="Default"><input type="radio" checked={!!p.isDefault} onChange={() => setDefault(i)} style={{ height: 20 }} /></Field>
+          <IconBtn title="Remove packaging" onClick={() => remove(i)}><Trash2 size={14} /></IconBtn>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// The "Warehouse cataloging" section dropped into each catalog modal: storage
+// attributes plus the packaging editor. showHazard is true only for raw
+// materials, whose top grid does not already carry a hazard select.
+function CatalogWarehouseSection({ f, set, showHazard }) {
+  return (
+    <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 14, marginBottom: 16 }}>
+      <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 10 }}>Warehouse cataloging</div>
+      <div style={{ display: "grid", gridTemplateColumns: showHazard ? "1fr 1fr 1fr" : "1fr 1fr", gap: 12, marginBottom: 14 }}>
+        <Field label="Shelf life (days)" hint="Sets each lot's expiry: production date plus shelf life">
+          <input type="number" style={inputStyle} value={f.shelfLifeDays ?? ""} onChange={e => set("shelfLifeDays", e.target.value === "" ? null : (parseInt(e.target.value) || 0))} placeholder="e.g. 365" />
+        </Field>
+        <Field label="Physically stored" hint="Whether this item occupies a warehouse slot">
+          <label style={{ display: "flex", alignItems: "center", gap: 8, height: 38, cursor: "pointer" }}>
+            <input type="checkbox" checked={f.physicallyStored !== false} onChange={e => set("physicallyStored", e.target.checked)} />
+            <span style={{ fontSize: 12.5, color: "#51635a" }}>Slot this item</span>
+          </label>
+        </Field>
+        {showHazard && (
+          <Field label="Hazard classification">
+            <select style={inputStyle} value={f.hazardClass || "N/A"} onChange={e => set("hazardClass", e.target.value)}>
+              {HAZARD_CLASS_OPTIONS.map(o => <option key={o} value={o}>{o}</option>)}
+            </select>
+          </Field>
+        )}
+      </div>
+      <PackagingsEditor packagings={f.packagings} onChange={(p) => set("packagings", p)} itemSku={f.sku} />
+    </div>
+  );
+}
+
 function RawMaterialModal({ data, id, onClose, update }) {
   const existing = id ? getRaw(data, id) : null;
   const [f, setF] = useState(existing ? structuredClone(existing) : {
     name: "", sku: "", supplier: "", unitCost: 0, unit: "ea", certStatus: "Not required",
-    leadTimeDays: 7, moq: 1, reorderPoint: 0, onOrder: 0, notes: "", composition: [], lots: []
+    leadTimeDays: 7, moq: 1, reorderPoint: 0, onOrder: 0, notes: "", composition: [], lots: [],
+    hazardClass: "N/A", shelfLifeDays: null, physicallyStored: true, packagings: []
   });
   const set = (k, v) => setF(prev => ({ ...prev, [k]: v }));
 
@@ -8476,6 +8566,8 @@ function RawMaterialModal({ data, id, onClose, update }) {
       <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 14, marginBottom: 16 }}>
         <CompositionEditor composition={f.composition} onChange={(c) => set("composition", c)} componentOptions={data.components} data={data} />
       </div>
+
+      <CatalogWarehouseSection f={f} set={set} showHazard={true} />
 
       <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 14 }}>
         <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 10 }}>Lots on hand</div>
@@ -8658,7 +8750,7 @@ function InventoryCardModal({ data, itemType, itemId, onClose, update }) {
 
 function IntermediateProductModal({ data, id, onClose, update }) {
   const existing = id ? getIntermediateProduct(data, id) : null;
-  const [f, setF] = useState(existing ? structuredClone(existing) : { name: "", sku: "", unit: "ea", notes: "", composition: [], autoComposition: false, hazardClass: "N/A", lots: [] });
+  const [f, setF] = useState(existing ? structuredClone(existing) : { name: "", sku: "", unit: "ea", notes: "", composition: [], autoComposition: false, hazardClass: "N/A", lots: [], shelfLifeDays: null, physicallyStored: true, packagings: [] });
   const set = (k, v) => setF(prev => ({ ...prev, [k]: v }));
 
   const save = () => {
@@ -8695,6 +8787,8 @@ function IntermediateProductModal({ data, id, onClose, update }) {
           : <CompositionEditor composition={f.composition} onChange={(c) => set("composition", c)} componentOptions={data.components} data={data} showCostWeight={false} />}
       </div>
 
+      <CatalogWarehouseSection f={f} set={set} showHazard={false} />
+
       <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 14 }}>
         <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 4 }}>Lots on hand</div>
         <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 10 }}>
@@ -8726,7 +8820,7 @@ function FinishedGoodsTab({ data, search, setSearch, onAdd, onEdit, onDelete, on
 
 function FinishedGoodModal({ data, id, onClose, update }) {
   const existing = id ? getFinished(data, id) : null;
-  const [f, setF] = useState(existing ? structuredClone(existing) : { name: "", sku: "", unit: "ea", notes: "", composition: [], autoComposition: false, hazardClass: "N/A", lots: [] });
+  const [f, setF] = useState(existing ? structuredClone(existing) : { name: "", sku: "", unit: "ea", notes: "", composition: [], autoComposition: false, hazardClass: "N/A", lots: [], shelfLifeDays: null, physicallyStored: true, packagings: [] });
   const set = (k, v) => setF(prev => ({ ...prev, [k]: v }));
 
   const save = () => {
@@ -8762,6 +8856,8 @@ function FinishedGoodModal({ data, id, onClose, update }) {
           ? <ComputedCompositionView itemType="finished" itemId={id} data={data} />
           : <CompositionEditor composition={f.composition} onChange={(c) => set("composition", c)} componentOptions={data.components} data={data} showCostWeight={false} />}
       </div>
+
+      <CatalogWarehouseSection f={f} set={set} showHazard={false} />
 
       <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 14 }}>
         <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 4 }}>Lots on hand</div>
@@ -9945,7 +10041,7 @@ function WasteStreamCard({ item, data, readOnly, onEdit, onDelete }) {
 
 function WasteStreamModal({ data, id, onClose, update }) {
   const existing = id ? getWasteStream(data, id) : null;
-  const [f, setF] = useState(existing ? structuredClone(existing) : { name: "", sku: "", unit: "ea", notes: "", componentId: "", accumulate: false, hazardClass: "N/A", lots: [] });
+  const [f, setF] = useState(existing ? structuredClone(existing) : { name: "", sku: "", unit: "ea", notes: "", componentId: "", accumulate: false, hazardClass: "N/A", lots: [], shelfLifeDays: null, physicallyStored: true, packagings: [] });
   const set = (k, v) => setF(prev => ({ ...prev, [k]: v }));
 
   const save = () => {
@@ -9979,6 +10075,8 @@ function WasteStreamModal({ data, id, onClose, update }) {
         </Field>
         <Field label="Notes" span={2}><textarea style={{ ...inputStyle, minHeight: 50, resize: "vertical" }} value={f.notes} onChange={e => set("notes", e.target.value)} placeholder="Disposal method, handling requirements…" /></Field>
       </div>
+
+      <CatalogWarehouseSection f={f} set={set} showHazard={false} />
 
       {f.accumulate && (
         <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 14 }}>

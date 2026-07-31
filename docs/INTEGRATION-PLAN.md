@@ -107,8 +107,15 @@ canonical lot/batch key both sides read and write.
     `packagings` (IMPORT_ORDER); seeded default packagings + computed expiry.
     New `packaging.test.mjs` suite (50 assertions). Gate: 879 logic assertions,
     0 parse errors; MRP bundle rebuilt.
-  - *Step 2 (next)* — MRP UI to enter the new fields. *Step 3* — warehouse reads
-    the unified catalog to slot MRP items on the shared map.
+  - *Step 2a — catalog UI (done).* All four catalog modals gained a "Warehouse
+    cataloging" section: shelf life, physically-stored, hazard (raw materials),
+    and a reusable `PackagingsEditor` (add/remove packagings, set the default).
+    Verified by a server-render smoke test (react-dom/server) of every modal in
+    add and edit mode plus the new components; logic gate 879, bundle rebuilt.
+  - *Step 2b (next)* — lot-level fields in `LotsEditor` (packaging selector,
+    production/arrival dates, computed expiry, origin/mfg/order-ref).
+  - *Step 3* — warehouse reads the unified catalog to slot MRP items on the
+    shared map.
 - **Phase 4 — Polish + handoff.** Address inherited MRP gaps (process-flow SVG,
   reconstructed regions, conversion-cost pricing, multi-lot shipments) by
   priority; hand the auth seam to the security developer.
