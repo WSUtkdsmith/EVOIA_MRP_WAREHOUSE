@@ -1,0 +1,15 @@
+# Keep test scripts and dev tooling out of the deployment. Files under api/ that
+# are NOT request handlers must not ship — Vercel would turn each into a route
+# and a script with no handler export breaks the build.
+api/test/
+
+# MRP test harness and node suites are dev-only (run in CI, not deployed).
+mrp/test/
+mrp/tools/
+
+# Docs aren't part of the running app.
+docs/
+
+# Never deploy source snapshots.
+*.zip
+warehouse/archive/
