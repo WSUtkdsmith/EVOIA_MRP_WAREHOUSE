@@ -231,8 +231,29 @@ transaction logic is duplicated.
     it") rather than quietly ordered by bare quantity.
   - Render-smoke covers all four states: stocked (empty state), short
     (suggestions), drafts pending, and the whole tab.
-- *Step 3* — `/api/catalog` exposes receivable orders; warehouse receiving
-  quotes one.
+- *Step 3 — the dock quotes an order (done).*
+  - `/api/catalog` now returns `purchaseOrders[]`: placed orders that still owe
+    something, one entry per line, each naming the material, the container it
+    was bought in, how many to expect, and what is outstanding. Draft, cancelled
+    and fully-received orders are excluded — a draft has been sent to nobody.
+    `deriveReceivableOrders` mirrors the MRP's `tx.receivablePurchaseOrders`;
+    duplicating it is acceptable for a **read**, and deliberately does not extend
+    to the write (step 4 goes through the MRP's own transaction).
+  - Warehouse: an **Inbound purchase orders** view in the MRP Catalog window,
+    one row per order line with overdue dates called out, and a **Receive**
+    action per line. Receiving asks for pallet, quantity, supplier batch and
+    location, refuses more than the order still owes, and books a real pallet
+    that picks and ships like any other.
+  - The receipt records `mrpPoId` / `mrpPoLineId` / `mrpOrderRef` and is marked
+    **`mrpReceiptStatus: 'pending'`** — the MRP has not been told yet. That mark
+    is the seed of step 4's ledger, and `mrpPoLineReceived` already counts
+    pending receipts so two people receiving the same delivery an hour apart see
+    the second as already booked.
+  - Tests: catalog 69 assertions (up 22), warehouse 71 (up 26).
+- *Step 4 (next)* — apply pending receipts to the MRP through
+  `tx.receiveAgainstOrder`, flipping them to `applied`. The idempotency ledger
+  is the careful part: a re-synced or edited receipt must never mint a second
+  lot.
 - *Step 4* — the pending-receipt queue and its idempotency ledger (the careful
   part: a re-synced or edited receipt must not mint a second lot).
 - **Phase 4 — Polish + handoff.** Address inherited MRP gaps (process-flow SVG,

@@ -161,6 +161,102 @@ function countUncataloged(data) {
   return n;
 }
 
+// --- Purchase orders the warehouse may receive against ---------------------
+//
+// An order is the record both systems agree on: the MRP raises it, the dock
+// receives against its reference. Only a placed order that still owes something
+// qualifies — a draft has not been sent to anyone, and a cancelled or completed
+// order should not be accepting stock.
+//
+// This mirrors the MRP's own `tx.receivablePurchaseOrders`. It is duplicated
+// here rather than imported because the MRP's transactions live inside its
+// bundle; that is acceptable for a *read*, and deliberately does not extend to
+// the write — applying a receipt still goes through the MRP's own transaction,
+// so its data-layer enforcement stays authoritative.
+const RECEIVABLE_STATUSES = ['Ordered', 'Part received'];
+
+function poLineReceived(po, lineId, firstLineId) {
+  return (po.receipts || []).reduce((s, r) => {
+    const target = r.lineId || firstLineId;
+    return target === lineId ? s + (Number(r.qty) || 0) : s;
+  }, 0);
+}
+
+// Index every packaging in the database by id, so an order line can name the
+// container it was bought in without re-walking the catalog per line.
+function packagingIndex(data) {
+  const idx = {};
+  ITEM_TYPES.forEach(([collection]) => {
+    (Array.isArray(data[collection]) ? data[collection] : []).forEach((item) => {
+      (item && Array.isArray(item.packagings) ? item.packagings : []).forEach((p) => {
+        if (p && p.id) idx[p.id] = p;
+      });
+    });
+  });
+  return idx;
+}
+
+function deriveReceivableOrders(mrpData) {
+  const data = mrpData && typeof mrpData === 'object' ? mrpData : {};
+  const materials = {};
+  (Array.isArray(data.rawMaterials) ? data.rawMaterials : []).forEach((r) => {
+    if (r && r.id) materials[r.id] = r;
+  });
+  const packs = packagingIndex(data);
+
+  const out = [];
+  (Array.isArray(data.purchaseOrders) ? data.purchaseOrders : []).forEach((po) => {
+    if (!po || typeof po !== 'object') return;
+    if (RECEIVABLE_STATUSES.indexOf(po.status) === -1) return;
+    const allLines = Array.isArray(po.lines) ? po.lines : [];
+    const firstLineId = allLines.length ? allLines[0].id : '';
+
+    const lines = allLines.map((line) => {
+      const mat = materials[line.rawMaterialId] || null;
+      const pkg = (line.packagingId && packs[line.packagingId])
+        || (mat && (mat.packagings || []).find((p) => p.isDefault))
+        || (mat && (mat.packagings || [])[0])
+        || null;
+      const qty = Number(line.qty) || 0;
+      const received = poLineReceived(po, line.id, firstLineId);
+      return {
+        lineId: line.id || '',
+        rawMaterialId: line.rawMaterialId || '',
+        itemName: mat ? (mat.name || '') : '(deleted material)',
+        itemSku: mat ? (mat.sku || '') : '',
+        unit: mat ? (mat.unit || '') : '',
+        skuId: pkg ? (pkg.id || '') : '',
+        sku: pkg ? (pkg.sku || '') : '',
+        packageType: pkg ? (pkg.packageType || '') : '',
+        size: pkg ? (pkg.size || '') : '',
+        unitsPerPackage: pkg && pkg.unitsPerPackage != null ? Number(pkg.unitsPerPackage) : null,
+        containerCount: line.containerCount == null || line.containerCount === ''
+          ? null : Number(line.containerCount),
+        qty,
+        unitCost: Number(line.unitCost) || 0,
+        lineCost: qty * (Number(line.unitCost) || 0),
+        receivedQty: received,
+        outstanding: Math.max(0, qty - received),
+      };
+    }).filter((l) => l.outstanding > 0);
+
+    if (!lines.length) return;
+    out.push({
+      poId: po.id || '',
+      reference: po.reference || '',
+      supplier: po.supplier || '',
+      orderDate: po.orderDate || '',
+      expectedDate: po.expectedDate || '',
+      status: po.status,
+      notes: po.notes || '',
+      lines,
+      totalOutstanding: lines.reduce((s, l) => s + l.outstanding, 0),
+      totalCost: lines.reduce((s, l) => s + l.lineCost, 0),
+    });
+  });
+  return out.sort((a, b) => String(a.expectedDate).localeCompare(String(b.expectedDate)));
+}
+
 // The MRP stores its whole dataset as a JSON string under this key in the
 // module's key/value blob (see mrp/index.html's window.storage shim).
 const MRP_DATA_KEY = 'mrp_console_data';
@@ -175,6 +271,8 @@ function extractMrpData(moduleState) {
 
 module.exports = {
   ITEM_TYPES,
+  RECEIVABLE_STATUSES,
+  deriveReceivableOrders,
   EXPIRING_SOON_DAYS,
   MRP_DATA_KEY,
   monthsBetween,

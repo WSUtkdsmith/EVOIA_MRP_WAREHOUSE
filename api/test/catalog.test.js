@@ -121,5 +121,85 @@ eq(C.extractMrpData({}), null, 'missing key yields null');
 eq(C.extractMrpData(null), null, 'null state yields null');
 eq(C.extractMrpData({ [C.MRP_DATA_KEY]: '{bad json' }), null, 'unparseable blob yields null, not a throw');
 
+// --- receivable purchase orders -------------------------------------------
+const PO_FIXTURE = {
+  rawMaterials: [{
+    id: 'rm1', name: 'Green coffee', sku: 'GC-1', unit: 'kg',
+    packagings: [
+      { id: 'pk-sack', sku: 'GC-1-60KG', packageType: 'sack', size: '60 kg', unitsPerPackage: 60, isDefault: true },
+      { id: 'pk-tote', sku: 'GC-1-1000KG', packageType: 'tote', size: '1000 kg', unitsPerPackage: 1000 },
+    ],
+    lots: [],
+  }],
+  purchaseOrders: [
+    { id: 'po1', reference: 'PO-1', supplier: 'Acme', status: 'Ordered',
+      orderDate: '2026-07-01', expectedDate: '2026-09-01',
+      lines: [
+        { id: 'l1', rawMaterialId: 'rm1', qty: 600, unitCost: 5, packagingId: 'pk-sack', containerCount: 10 },
+        { id: 'l2', rawMaterialId: 'rm1', qty: 3000, unitCost: 4.5, packagingId: 'pk-tote', containerCount: 3 },
+      ],
+      receipts: [] },
+    { id: 'po2', reference: 'PO-2', supplier: 'Acme', status: 'Draft',
+      orderDate: '2026-07-01', expectedDate: '2026-08-01',
+      lines: [{ id: 'l3', rawMaterialId: 'rm1', qty: 100, unitCost: 5 }], receipts: [] },
+    { id: 'po3', reference: 'PO-3', supplier: 'Beta', status: 'Cancelled',
+      orderDate: '2026-07-01', expectedDate: '2026-08-01',
+      lines: [{ id: 'l4', rawMaterialId: 'rm1', qty: 100, unitCost: 5 }], receipts: [] },
+    { id: 'po4', reference: 'PO-4', supplier: 'Beta', status: 'Part received',
+      orderDate: '2026-06-01', expectedDate: '2026-07-15',
+      lines: [
+        { id: 'l5', rawMaterialId: 'rm1', qty: 500, unitCost: 5 },
+        { id: 'l6', rawMaterialId: 'rm1', qty: 200, unitCost: 5 },
+      ],
+      receipts: [{ id: 'r1', lineId: 'l5', qty: 500, date: '2026-07-01' }] },
+  ],
+};
+const orders = C.deriveReceivableOrders(PO_FIXTURE);
+
+eq(orders.map(o => o.reference), ['PO-4', 'PO-1'], 'only placed orders that still owe, soonest expected first');
+ok(!orders.some(o => o.status === 'Draft'), 'a draft has been sent to nobody and is not receivable');
+ok(!orders.some(o => o.status === 'Cancelled'), 'a cancelled order does not accept stock');
+
+const po1 = orders.find(o => o.reference === 'PO-1');
+eq(po1.lines.length, 2, 'both container sizes come through as separate lines');
+eq(po1.lines[0].sku, 'GC-1-60KG', 'a line names the container it was bought in');
+eq(po1.lines[0].size, '60 kg', 'with its size');
+eq(po1.lines[0].containerCount, 10, 'and how many containers to expect');
+eq(po1.lines[1].sku, 'GC-1-1000KG', 'the second line keeps its own container');
+eq(po1.lines[1].unitCost, 4.5, 'and its own price');
+eq(po1.totalOutstanding, 3600, 'outstanding is the sum of the lines');
+eq(po1.totalCost, 600 * 5 + 3000 * 4.5, 'value is the sum of the lines');
+eq(po1.lines[0].itemName, 'Green coffee', 'the material is named for the dock');
+eq(po1.lines[0].unit, 'kg', 'in its own unit');
+
+const po4 = orders.find(o => o.reference === 'PO-4');
+eq(po4.lines.length, 1, 'a line already settled drops off, leaving only what is still owed');
+eq(po4.lines[0].lineId, 'l6', 'and it is the unsettled one');
+eq(po4.lines[0].outstanding, 200, 'outstanding nets off what already arrived');
+
+// a fully received order is not receivable even if its status lags
+const settled = C.deriveReceivableOrders({
+  rawMaterials: PO_FIXTURE.rawMaterials,
+  purchaseOrders: [{ id: 'p', reference: 'PO-9', status: 'Part received',
+    lines: [{ id: 'x', rawMaterialId: 'rm1', qty: 100, unitCost: 1 }],
+    receipts: [{ id: 'r', lineId: 'x', qty: 100, date: '2026-01-01' }] }],
+});
+eq(settled.length, 0, 'nothing owed means nothing to receive, whatever the status says');
+
+// receipts written before lines existed carry no lineId
+const legacy = C.deriveReceivableOrders({
+  rawMaterials: PO_FIXTURE.rawMaterials,
+  purchaseOrders: [{ id: 'p', reference: 'PO-8', status: 'Part received',
+    lines: [{ id: 'only', rawMaterialId: 'rm1', qty: 100, unitCost: 1 }],
+    receipts: [{ id: 'r', qty: 40, date: '2026-01-01' }] }],
+});
+eq(legacy[0].lines[0].outstanding, 60, 'a receipt with no line is attributed to the first line');
+
+eq(C.deriveReceivableOrders(null), [], 'null data yields no orders, not a throw');
+eq(C.deriveReceivableOrders({ purchaseOrders: 'nonsense' }), [], 'malformed orders ignored');
+eq(C.deriveReceivableOrders({ purchaseOrders: [null] }), [], 'a null order is skipped');
+ok(C.RECEIVABLE_STATUSES.indexOf('Ordered') >= 0 && C.RECEIVABLE_STATUSES.indexOf('Draft') === -1,
+   'the receivable statuses are placed ones only');
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

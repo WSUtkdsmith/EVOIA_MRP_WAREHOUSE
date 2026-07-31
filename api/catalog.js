@@ -35,12 +35,15 @@ module.exports = async function handler(req, res) {
     const state = await db.getModuleState(bu, 'mrp');
     const mrpData = catalog.extractMrpData(state.data);
     const derived = catalog.deriveCatalog(mrpData, new Date());
+    const purchaseOrders = catalog.deriveReceivableOrders(mrpData);
 
     return res.status(200).json({
       businessUnit: bu,
       updatedAt: state.updatedAt,
       hasMrpData: !!mrpData,
       ...derived,
+      purchaseOrders,
+      counts: { ...derived.counts, receivableOrders: purchaseOrders.length },
     });
   } catch (err) {
     console.error('EVOIA /api/catalog error:', err);
