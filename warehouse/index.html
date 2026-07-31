@@ -5780,6 +5780,28 @@ body.reconMapPickMode .palletTag{
   </div>
 </dialog>
 
+<dialog id="mrpPlaceDialog">
+  <div class="modal">
+    <div class="modalHead"><h2>Place MRP lot</h2><button type="button" class="x" data-close="mrpPlaceDialog">×</button></div>
+    <form id="mrpPlaceForm">
+      <div id="mrpPlaceSummary" class="totalsBox" style="margin-bottom:10px"></div>
+      <label class="field"><span>Pallet ID<b class="reqMark">*</b></span><input id="mrpPlacePalletId" required placeholder="EV123"></label>
+      <div class="two">
+        <label class="field"><span>Quantity to place<b class="reqMark">*</b></span><input id="mrpPlaceQty" type="number" step="any" min="0" required></label>
+        <label class="field"><span>MFG</span><select id="mrpPlaceMfg"><option value="EV">EV</option><option value="LV">LV</option></select></label>
+      </div>
+      <label class="field"><span>Location</span>
+        <select id="mrpPlaceLocation"><option value="">Open Floor</option></select>
+      </label>
+      <div id="mrpPlaceError" style="color:var(--red);font-weight:800;font-size:13px;margin:6px 0"></div>
+      <div class="actions" style="justify-content:flex-end;margin-top:10px">
+        <button type="button" class="btn" data-close="mrpPlaceDialog">Cancel</button>
+        <button type="submit" class="btn primary">Place pallet</button>
+      </div>
+    </form>
+  </div>
+</dialog>
+
 <dialog id="workWindowDialog">
   <div class="modal logWindowDialog">
     <div class="modalHead"><h2>Tasks List <span id="workCount" class="workCount">0</span></h2><button type="button" class="x" data-close="workWindowDialog">×</button></div>
@@ -7756,6 +7778,7 @@ function init(){
   $('openReceivingWindowBtn').onclick=openReceivingLogWindow;
   $('openShippingWindowBtn').onclick=openShippingLogWindow;
   $('openMrpCatalogBtn').onclick=openMrpCatalog;
+  $('mrpPlaceForm').onsubmit=submitMrpPlacement;
   $('refreshMrpCatalogBtn').onclick=()=>loadMrpCatalog(true);
   $('mrpCatalogSearch').oninput=renderMrpCatalog;
   $('mrpCatalogView').onchange=renderMrpCatalog;
@@ -14418,6 +14441,92 @@ function retireSourcePalletIfEmpty(p){
 function toast(msg){const t=$('toast');t.textContent=msg;t.style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>t.style.display='none',2600)}
 
 /* ---------------------------------------------------------------------------
+   MRP lot placement — the write direction of the shared spine.
+
+   Ownership is split deliberately, because both sides can otherwise move the
+   same number and diverge silently:
+     - the MRP owns the lot: what was produced, what it cost, where it came from;
+     - the warehouse owns placement: which pallet the stock sits on, in which
+       slot, and the working quantity that picking and shipping draw down.
+   The link is mrpLotId on a pallet content line. Placed quantity is tracked
+   here; the lot's own quantity stays the MRP's. Where the two disagree we show
+   the difference rather than reconciling it, because a real two-way quantity
+   sync needs conflict rules nobody has specified yet.
+
+   These four functions are pure so they can be tested outside a browser -
+   see warehouse/test/placement.test.js.
+--------------------------------------------------------------------------- */
+
+// lotId -> { placedQty, palletIds } across every pallet content line.
+function mrpPlacementIndex(pallets){
+  const idx={};
+  (pallets||[]).forEach(p=>{
+    (p&&p.contents||[]).forEach(line=>{
+      const lotId=line&&line.mrpLotId;
+      if(!lotId) return;
+      if(!idx[lotId]) idx[lotId]={placedQty:0,palletIds:[]};
+      idx[lotId].placedQty+=Number(line.quantityCurrent)||0;
+      if(idx[lotId].palletIds.indexOf(p.palletId)===-1) idx[lotId].palletIds.push(p.palletId);
+    });
+  });
+  return idx;
+}
+
+// How much of a lot is on the floor, and how that compares with the MRP's own
+// quantity. "over" means the warehouse holds more than the MRP thinks exists -
+// worth seeing, not worth hiding.
+function mrpLotPlacement(lot,idx){
+  const entry=(idx||{})[lot&&lot.lotId]||{placedQty:0,palletIds:[]};
+  const lotQty=Number(lot&&lot.qty)||0;
+  const placed=Number(entry.placedQty)||0;
+  const remaining=Math.max(0,lotQty-placed);
+  let status='unplaced';
+  if(placed>lotQty+0.0001) status='over';
+  else if(placed>0&&remaining>0.0001) status='partial';
+  else if(placed>0) status='placed';
+  return {placedQty:placed,remaining,status,palletIds:entry.palletIds};
+}
+
+// A pallet content line that points back at the MRP lot it came from. Carries
+// expiration, which the warehouse's own lines never had.
+function mrpContentLine(lot,qty){
+  return {
+    id:String(Date.now()+Math.random()),
+    batch:(lot&&lot.lotNumber)||'',
+    packageType:(lot&&lot.size)||(lot&&lot.packageType)||'',
+    description:[(lot&&lot.itemName)||'',(lot&&lot.sku)||''].filter(Boolean).join(' · '),
+    quantityOriginal:Number(qty)||0,
+    quantityCurrent:Number(qty)||0,
+    expiration:(lot&&lot.expirationDate)||'',
+    mrpLotId:(lot&&lot.lotId)||'',
+    mrpItemId:(lot&&lot.itemId)||'',
+    mrpSku:(lot&&lot.sku)||''
+  };
+}
+
+// Build the pallet record for a placement. Location handling mirrors savePallet:
+// a rack/stage/build code, or the open floor with default coordinates.
+function buildPalletFromMrpLot(lot,opts){
+  const o=opts||{};
+  const stamp=o.now||new Date().toISOString();
+  const p={
+    createdAt:stamp,updatedAt:stamp,
+    palletId:String(o.palletId||'').trim().toUpperCase(),
+    mfg:o.mfg||(lot&&lot.mfg)||'EV',
+    origin:(lot&&lot.origin)||'',
+    status:'Active',
+    notes:o.notes||('Placed from MRP lot '+((lot&&lot.lotNumber)||'')),
+    contents:[mrpContentLine(lot,o.qty)],
+    damage:{isDamaged:false,description:'',photoDataUrl:'',photoName:'',reportedAt:''},
+    locationType:'floor',location:'',stageLocation:'',buildLocation:'',zone:'Open Floor',x:525,y:635
+  };
+  if(o.locationType==='rack'&&o.location){
+    p.locationType='rack';p.location=o.location;p.zone='';p.x=0;p.y=0;
+  }
+  return p;
+}
+
+/* ---------------------------------------------------------------------------
    MRP Catalog — the shared inventory spine.
 
    Reads /api/catalog?bu=<id>, which derives storable SKUs and stock from this
@@ -14455,6 +14564,7 @@ function openMrpCatalog(){
   loadMrpCatalog(false);
 }
 
+const MRP_PLACE_TONE={unplaced:'#66746c',partial:'#d97500',placed:'#2f6f43',over:'#e53935'};
 const MRP_STATUS_TONE={expired:'#e53935',expiring:'#d97500',ok:'#2f6f43',unknown:'#66746c'};
 const MRP_STATUS_LABEL={expired:'Expired',expiring:'Expiring soon',ok:'OK',unknown:'No expiry'};
 
@@ -14495,19 +14605,88 @@ function renderMrpCatalog(){
     else if(filter==='expired') rows=rows.filter(l=>l.status==='expired'&&l.qty>0);
     else if(filter==='expiring') rows=rows.filter(l=>l.status==='expiring'&&l.qty>0);
     rows=rows.filter(match);
-    head.innerHTML='<tr><th>Lot</th><th>SKU</th><th>Item</th><th>Size</th><th>Qty</th><th>Expiration</th><th>Status</th><th>Origin</th><th>Order ref</th></tr>';
-    body.innerHTML=rows.length?rows.slice(0,500).map(l=>`<tr>
+    const idx=mrpPlacementIndex(state.pallets);
+    head.innerHTML='<tr><th>Lot</th><th>SKU</th><th>Item</th><th>Size</th><th>Qty</th><th>Expiration</th><th>Status</th><th>Placement</th><th>Origin</th><th></th></tr>';
+    body.innerHTML=rows.length?rows.slice(0,500).map(l=>{
+      const pl=mrpLotPlacement(l,idx);
+      const placeTxt=pl.status==='unplaced'?'Not placed'
+        :pl.status==='placed'?('On '+pl.palletIds.join(', '))
+        :pl.status==='partial'?(formatNum(pl.placedQty)+' placed · '+formatNum(pl.remaining)+' left')
+        :('Over by '+formatNum(pl.placedQty-(Number(l.qty)||0)));
+      return `<tr>
       <td><b>${esc(l.lotNumber)}</b></td><td>${esc(l.sku)}</td>
       <td>${esc(l.itemName)}</td><td>${esc(l.size)}</td>
       <td>${esc(formatNum(l.qty))} ${esc(l.unit||'')}</td>
       <td>${esc(l.expirationDate||'—')}</td>
       <td style="color:${MRP_STATUS_TONE[l.status]||'#66746c'};font-weight:800">${esc(MRP_STATUS_LABEL[l.status]||l.status)}</td>
-      <td>${esc(l.origin||'')}</td><td>${esc(l.orderRef||'')}</td></tr>`).join('')
-      :'<tr><td colspan="9">No stock matches.</td></tr>';
-    if(rows.length>500) body.innerHTML+=`<tr><td colspan="9"><small>Showing the first 500 of ${rows.length} rows — narrow the search to see more.</small></td></tr>`;
+      <td style="color:${MRP_PLACE_TONE[pl.status]}">${esc(placeTxt)}</td>
+      <td>${esc(l.origin||'')}</td>
+      <td>${pl.remaining>0.0001?`<button type="button" class="btn small placeMrpLotBtn" data-lot="${esc(l.lotId)}">Place</button>`:''}</td></tr>`;
+    }).join('')
+      :'<tr><td colspan="10">No stock matches.</td></tr>';
+    if(rows.length>500) body.innerHTML+=`<tr><td colspan="10"><small>Showing the first 500 of ${rows.length} rows — narrow the search to see more.</small></td></tr>`;
+    body.querySelectorAll('.placeMrpLotBtn').forEach(b=>b.onclick=()=>openMrpPlacement(b.dataset.lot));
     $('mrpCatalogCount').textContent=rows.length;
   }
   if($('topCatalogCount')) $('topCatalogCount').textContent=(c.lotsInStock||0);
+}
+
+// Open the placement form for one catalog lot, pre-filled with what is left to
+// place and the next free pallet id for its manufacturer.
+function openMrpPlacement(lotId){
+  const lot=((mrpCatalog&&mrpCatalog.lots)||[]).find(l=>l.lotId===lotId);
+  if(!lot) return toast('Lot not found in the catalog.');
+  if(!requirePermission('createReceiving','placing inventory')) return;
+  const pl=mrpLotPlacement(lot,mrpPlacementIndex(state.pallets));
+  mrpPlaceLotId=lotId;
+  const mfg=(lot.mfg==='LV'||lot.mfg==='EV')?lot.mfg:'EV';
+  $('mrpPlaceSummary').innerHTML=`<h3>${esc(lot.itemName)} — ${esc(lot.sku||'')}</h3>
+    <div class="totalsGrid">
+      <div class="totalCard"><b>${esc(lot.lotNumber)}</b><span>Lot</span></div>
+      <div class="totalCard"><b>${esc(formatNum(lot.qty))} ${esc(lot.unit||'')}</b><span>MRP quantity</span></div>
+      <div class="totalCard"><b>${esc(formatNum(pl.remaining))}</b><span>Left to place</span></div>
+      <div class="totalCard"><b>${esc(lot.expirationDate||'—')}</b><span>Expires</span></div>
+    </div>`;
+  $('mrpPlaceMfg').value=mfg;
+  $('mrpPlacePalletId').value=mfg+(state.settings['next'+mfg]||1);
+  $('mrpPlaceQty').value=pl.remaining;
+  $('mrpPlaceQty').max=pl.remaining;
+  const sel=$('mrpPlaceLocation');
+  sel.innerHTML='<option value="">Open Floor</option>'+
+    RACK.filter(loc=>!occupantAt(loc)).map(loc=>`<option value="${esc(loc)}">${esc(loc)}</option>`).join('');
+  $('mrpPlaceError').textContent='';
+  $('mrpPlaceDialog').showModal();
+}
+let mrpPlaceLotId='';
+
+function submitMrpPlacement(e){
+  e.preventDefault();
+  const lot=((mrpCatalog&&mrpCatalog.lots)||[]).find(l=>l.lotId===mrpPlaceLotId);
+  if(!lot) return;
+  const err=$('mrpPlaceError'); err.textContent='';
+  const palletId=$('mrpPlacePalletId').value.trim().toUpperCase();
+  const qty=Number($('mrpPlaceQty').value)||0;
+  const loc=$('mrpPlaceLocation').value;
+  if(!palletId) { err.textContent='Pallet ID is required.'; return; }
+  if(state.pallets.some(p=>p.palletId===palletId)) { err.textContent='That pallet ID already exists.'; return; }
+  if(qty<=0) { err.textContent='Enter a quantity greater than zero.'; return; }
+  const pallet=buildPalletFromMrpLot(lot,{
+    palletId,qty,mfg:$('mrpPlaceMfg').value,
+    locationType:loc?'rack':'floor',location:loc,now:now()
+  });
+  if(loc){
+    const check=canMoveToLocation(palletId,loc,pallet);
+    if(!check.ok){ err.textContent=check.msg; return; }
+  }
+  state.pallets.push(pallet);
+  bump(pallet.mfg,palletId);
+  hist(palletId,'Created','Placed from MRP lot '+lot.lotNumber+' at '+locationText(pallet));
+  addReceiptLog(pallet);
+  save();
+  $('mrpPlaceDialog').close();
+  render();
+  renderMrpCatalog();
+  toast(`Placed ${formatNum(qty)} from lot ${lot.lotNumber} on ${palletId}.`);
 }
 
 init();

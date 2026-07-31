@@ -133,8 +133,29 @@ canonical lot/batch key both sides read and write.
       render paths simulated against a DOM stub.
     - *Note:* the catalog payload is ~480 KB for 762 lots. Fine now; if it grows,
       add server-side filtering/paging rather than trimming client-side.
-  - *Step 3b (next)* — write direction: create warehouse pallets from MRP lots
-    and place them on the shared map, so a lot and a pallet become one record.
+  - *Step 3b — placement / write direction (done).* From the MRP Catalog, a lot
+    can be **placed**: it creates a warehouse pallet whose content line links
+    back via `mrpLotId` (carrying `mrpSku`, `mrpItemId` and **expiration**, which
+    the warehouse's own lines never had), into a free rack slot or the open
+    floor. The catalog shows each lot's placement state — not placed / partially
+    placed / on pallet(s) / **over-placed** — and only offers Place while
+    quantity remains.
+    - **Ownership split (the design decision):** the MRP owns the lot (what was
+      produced, what it cost, where it came from); the warehouse owns placement
+      (which pallet, which slot, and the working quantity picking draws down).
+      Where the two disagree the difference is **shown, not reconciled** — a real
+      two-way quantity sync needs conflict rules nobody has specified. That is
+      why `over` is a visible state rather than a clamp.
+    - Placement reuses the app's own mechanics (`canMoveToLocation`, `bump`,
+      `hist`, `addReceiptLog`, `save`), so a placed pallet is an ordinary pallet:
+      it moves, picks, ships and reconciles like any other.
+    - **The warehouse now has tests** — `warehouse/test/placement.test.js` (45
+      assertions) extracts the pure helpers from the single-file app by name and
+      asserts on them, closing the "no tests" gap flagged at the start. Verified
+      end-to-end against the real seed: unplaced → partial → placed across two
+      pallets, other lots unaffected.
+  - *Not yet:* placing **into** the MRP (a warehouse receipt creating an MRP lot),
+    drag-to-place on the map, and multi-slot footprints from `packagesPerSlot`.
 - **Phase 4 — Polish + handoff.** Address inherited MRP gaps (process-flow SVG,
   reconstructed regions, conversion-cost pricing, multi-lot shipments) by
   priority; hand the auth seam to the security developer.

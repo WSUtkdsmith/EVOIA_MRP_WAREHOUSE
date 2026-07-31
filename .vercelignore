@@ -19,3 +19,6 @@ docs/
 # Never deploy source snapshots.
 *.zip
 warehouse/archive/
+
+# Warehouse test suite is dev-only.
+warehouse/test/
