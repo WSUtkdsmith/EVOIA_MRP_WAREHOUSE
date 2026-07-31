@@ -709,7 +709,13 @@ const SCHEMA = {
       supplier: "str", orderDate: "date!", qty: "num!", unitCost: "num",
       expectedDate: "date!",
       status: "enum:Draft|Ordered|Part received|Received|Cancelled!",
-      notes: "str"
+      notes: "str",
+      // What was ordered physically: which container/size, and how many of
+      // them. `qty` stays the authoritative figure in the material's own unit
+      // so nothing downstream has to convert; containerCount is what the
+      // warehouse counts off the truck. Both optional so orders predating this
+      // keep working.
+      packagingId: "str", containerCount: "num"
     },
     embeds: {},
     children: {
@@ -1916,6 +1922,68 @@ const tx = {
     return { ok: true, lot, po };
   },
 
+  /* Raise purchase orders from reviewed suggestions.
+
+     The order is the record the warehouse receives against, so it is
+     written once, deliberately, with a unique reference - references are
+     minted inside the loop against the growing database so a batch of
+     suggestions accepted together cannot collide with each other.
+
+     Raised as Draft: a suggestion that has been accepted is not yet an
+     order that has been placed with a supplier. */
+  raisePurchaseOrders(db, rows) {
+    const created = [];
+    (rows || []).forEach(row => {
+      const raw = getRaw(db, row.rawMaterialId);
+      if (!raw) return;
+      const qty = Number(row.qty) || 0;
+      if (qty <= 0) return;
+      const po = repo.create(db, "purchaseOrders", {
+        reference: row.reference || nextPoReference(db),
+        rawMaterialId: row.rawMaterialId,
+        supplier: row.supplier || raw.supplier || "",
+        orderDate: row.orderDate || todayStr(),
+        expectedDate: row.expectedDate || todayStr(),
+        qty,
+        unitCost: Number(row.unitCost) || 0,
+        packagingId: row.packagingId || "",
+        containerCount: Number(row.containerCount) || 0,
+        status: "Draft",
+        notes: row.notes || "Raised from reorder forecast",
+        receipts: []
+      });
+      created.push(po);
+    });
+    return { ok: true, created };
+  },
+
+  /* Place a drafted order with the supplier.
+
+     Draft is deliberately sticky - poDerivedStatus will not infer its way
+     out of it, because a draft is a decision rather than a state to be
+     guessed at. So there has to be an explicit step that says this order
+     was actually placed, and it is that step which makes the order
+     receivable. Without it a delivery could be booked against an order
+     nobody ever sent. */
+  placePurchaseOrder(db, { purchaseOrderId, orderDate, expectedDate }) {
+    const po = repo.find(db, "purchaseOrders", purchaseOrderId);
+    if (!po) return { ok: false, error: "That purchase order no longer exists." };
+    if (po.status === "Cancelled") return { ok: false, error: "A cancelled order cannot be placed." };
+    if (po.status !== "Draft") return { ok: false, error: "Only a draft order can be placed." };
+    if (orderDate) po.orderDate = orderDate;
+    if (expectedDate) po.expectedDate = expectedDate;
+    po.status = "Ordered";
+    return { ok: true, po };
+  },
+
+  /* Orders the warehouse may receive against: placed, not yet complete.
+     A draft has not been sent to anyone and a cancelled order should not
+     be accepting stock, so neither is receivable. */
+  receivablePurchaseOrders(db) {
+    return (db.purchaseOrders || []).filter(po =>
+      (po.status === "Ordered" || po.status === "Part received") && poOutstanding(po) > 0);
+  },
+
   /* Record a review decision on a sales order line. Accepting or adjusting
      does not itself raise a run - that is releaseSalesOrderLine - so a
      decision can be revisited before anything hits the schedule. */
@@ -2338,21 +2406,35 @@ function seedWarehouseCatalog(cols) {
     return d.toISOString().slice(0, 10);
   };
   const skuSuffix = (size) => size.replace(/[^0-9a-zA-Z]+/g, "").toUpperCase();
+  // [packageType, size, unitsPerPackage, packagesPerSlot]. unitsPerPackage is
+  // how many of the item's OWN unit fit in one container, so ordering by the
+  // container conserves units: containers x unitsPerPackage = quantity. A
+  // placeholder of 1 here would have a 55 gal drum holding one kilogram, and
+  // every purchase order raised off it would read as nonsense.
+  const packsFor = (type, unit) => {
+    if (type === "intermediate") return [["tote", "1000 kg", 1000, 1]];
+    if (type === "waste") return [["barrel", "200 kg", 200, 1]];
+    if (type === "finished") return [["case", "case of 12", 12, 40], ["case", "case of 24", 24, 24]];
+    // Raw materials are bought in whatever their own unit is measured in.
+    if (unit === "kg") return [["sack", "60 kg", 60, 12]];
+    if (unit === "L") return [["drum", "200 L", 200, 4]];
+    return [["case", "case of 1000", 1000, 20]];
+  };
   const plan = [
-    ["raw", cols.rawMaterials, [["drum", "55 gal", 1]]],
-    ["intermediate", cols.intermediateProducts, [["tote", "275 gal", 1]]],
-    ["finished", cols.finishedGoods, [["jug", "1 gal", 4], ["jug", "2.5 gal", 2]]],
-    ["waste", cols.wasteStreams, [["barrel", "55 gal", 1]]]
+    ["raw", cols.rawMaterials],
+    ["intermediate", cols.intermediateProducts],
+    ["finished", cols.finishedGoods],
+    ["waste", cols.wasteStreams]
   ];
-  plan.forEach(([type, list, packs]) => {
+  plan.forEach(([type, list]) => {
     (list || []).forEach((item) => {
       if (item.shelfLifeDays == null) item.shelfLifeDays = SEED_SHELF_LIFE[type];
       if (item.physicallyStored == null) item.physicallyStored = true;
       if (!Array.isArray(item.packagings) || !item.packagings.length) {
-        item.packagings = packs.map(([packageType, size, packagesPerSlot], i) => ({
+        item.packagings = packsFor(type, item.unit).map(([packageType, size, unitsPerPackage, packagesPerSlot], i) => ({
           id: uid(),
           sku: item.sku + "-" + skuSuffix(size),
-          packageType, size, unitsPerPackage: 1, packagesPerSlot,
+          packageType, size, unitsPerPackage, packagesPerSlot,
           isDefault: i === 0
         }));
       }
@@ -4701,6 +4783,148 @@ function openOrderQty(data, rawMaterialId) {
     return raw ? Number(raw.onOrder) || 0 : 0;
   }
   return orders.reduce((s, po) => s + poOutstanding(po), 0);
+}
+
+/* ---------------------------------------------------------------
+   Ordering by the container, and what a purchase order is worth.
+
+   A purchase order is the record both systems agree on: the MRP raises
+   it, the warehouse receives against it. So it has to carry what each
+   side needs - the material and its cost for the MRP, the container and
+   how many of them for the dock.
+
+   `qty` stays authoritative and is always in the material's own unit;
+   containerCount is derived from it through the packaging rather than
+   held independently, so the two can never drift apart. Units are
+   conserved: containers x units-per-container = qty.
+----------------------------------------------------------------*/
+
+/* Units in one container. Absent or nonsensical values fall back to 1,
+   which makes a container equal one unit rather than zero - a bad
+   packaging record should not silently make an order worth nothing. */
+function unitsPerContainer(packaging) {
+  const n = Number(packaging && packaging.unitsPerPackage);
+  return n > 0 ? n : 1;
+}
+
+/* The packaging a purchase order was raised against, or the material's
+   default when the order predates packaging. Null when neither exists. */
+function poPackaging(data, po) {
+  const raw = getRaw(data, po && po.rawMaterialId);
+  const list = (raw && raw.packagings) || [];
+  if (!list.length) return null;
+  return (po && po.packagingId && list.find(p => p.id === po.packagingId))
+    || list.find(p => p.isDefault) || list[0] || null;
+}
+
+/* How a container reads on a dock sheet: "60 kg sack", but just
+   "case of 1000" when the size already names the container. */
+function packagingLabel(packaging) {
+  if (!packaging) return "";
+  const size = String(packaging.size || "").trim();
+  const type = String(packaging.packageType || "").trim();
+  if (!type) return size;
+  if (!size) return type;
+  return size.toLowerCase().includes(type.toLowerCase()) ? size : size + " " + type;
+}
+
+function qtyFromContainers(packaging, containerCount) {
+  return (Number(containerCount) || 0) * unitsPerContainer(packaging);
+}
+
+/* Containers needed to hold a quantity. Rounded up, because a part
+   container is still a container that has to be ordered and stored. */
+function containersFromQty(packaging, qty) {
+  const per = unitsPerContainer(packaging);
+  return Math.ceil(((Number(qty) || 0) / per) - 0.000001) || 0;
+}
+
+/* What the order is worth. Held nowhere - always derived from quantity
+   and unit cost, so it cannot disagree with them. */
+function poTotalCost(po) {
+  return (Number(po && po.qty) || 0) * (Number(po && po.unitCost) || 0);
+}
+
+/* "10 x 55 gal drum" - how the order reads on a dock sheet. */
+function poContainerSummary(data, po) {
+  const pkg = poPackaging(data, po);
+  if (!pkg) return "";
+  const count = (po && po.containerCount != null && po.containerCount !== "")
+    ? Number(po.containerCount) : containersFromQty(pkg, po && po.qty);
+  return count + " × " + packagingLabel(pkg);
+}
+
+/* Stock physically on hand for a material, from its lots. */
+function rawStockOnHand(raw) {
+  return ((raw && raw.lots) || []).reduce((s, l) => s + (Number(l.qty) || 0), 0);
+}
+
+/* ---------------------------------------------------------------
+   Forecast -> suggested orders.
+
+   Reorder point and minimum order quantity are already held per
+   material; this is what they were for. A material is short when what
+   is on hand plus what is already on order will not cover its reorder
+   point. The shortfall is then rounded up to whole containers and to
+   the minimum order quantity, so a suggestion is something that can
+   actually be placed rather than an arbitrary number.
+
+   Deliberately a suggestion, not an automatic order: it returns rows to
+   review, and nothing is written until they are accepted.
+----------------------------------------------------------------*/
+function suggestPurchaseOrders(data, options) {
+  const opts = options || {};
+  const materials = (data && data.rawMaterials) || [];
+  const rows = [];
+  materials.forEach(raw => {
+    const reorderPoint = Number(raw.reorderPoint) || 0;
+    if (reorderPoint <= 0) return;
+    const onHand = rawStockOnHand(raw);
+    const onOrder = openOrderQty(data, raw.id);
+    const available = onHand + onOrder;
+    if (available >= reorderPoint) return;
+
+    const pkg = (raw.packagings || []).find(p => p.isDefault) || (raw.packagings || [])[0] || null;
+    const shortfall = reorderPoint - available;
+    const moq = Number(raw.moq) || 0;
+    const target = Math.max(shortfall, moq);
+    const containerCount = pkg ? containersFromQty(pkg, target) : 0;
+    // Ordering by the container can only ever round up, never below the
+    // shortfall that triggered the suggestion.
+    const qty = pkg ? qtyFromContainers(pkg, containerCount) : target;
+
+    rows.push({
+      rawMaterialId: raw.id,
+      name: raw.name,
+      sku: raw.sku,
+      supplier: raw.supplier || "",
+      unit: raw.unit || "",
+      onHand, onOrder, available, reorderPoint, shortfall, moq,
+      packagingId: pkg ? pkg.id : "",
+      packagingSku: pkg ? pkg.sku : "",
+      packagingLabel: packagingLabel(pkg),
+      containerCount, qty,
+      unitCost: Number(raw.unitCost) || 0,
+      totalCost: qty * (Number(raw.unitCost) || 0),
+      leadTimeDays: Number(raw.leadTimeDays) || 0,
+      expectedDate: shiftISO(opts.today || todayStr(), Number(raw.leadTimeDays) || 0),
+      uncataloged: !pkg
+    });
+  });
+  return rows.sort((a, b) => (b.shortfall / (b.reorderPoint || 1)) - (a.shortfall / (a.reorderPoint || 1)));
+}
+
+/* References have to be unique - they are the order's natural key and
+   what the warehouse quotes when receiving. Minted from the highest
+   existing number so a reference is never reused. */
+function nextPoReference(data, prefix) {
+  const p = prefix || "PO-";
+  let max = 0;
+  ((data && data.purchaseOrders) || []).forEach(po => {
+    const m = String(po.reference || "").match(/(\d+)\s*$/);
+    if (m) max = Math.max(max, Number(m[1]) || 0);
+  });
+  return p + String(max + 1).padStart(4, "0");
 }
 
 /* One row per order, with everything derived resolved, newest first. */

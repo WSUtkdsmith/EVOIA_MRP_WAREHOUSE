@@ -154,8 +154,52 @@ canonical lot/batch key both sides read and write.
       asserts on them, closing the "no tests" gap flagged at the start. Verified
       end-to-end against the real seed: unplaced → partial → placed across two
       pallets, other lots unaffected.
-  - *Not yet:* placing **into** the MRP (a warehouse receipt creating an MRP lot),
-    drag-to-place on the map, and multi-slot footprints from `packagesPerSlot`.
+  - *Not yet:* drag-to-place on the map, and multi-slot footprints from
+    `packagesPerSlot`.
+
+## Phase 4 — Single-entry receiving (the reverse write direction)
+
+Goods that are *purchased* arrive at the dock before the MRP knows about them,
+so Phase 3's MRP → warehouse direction is backwards for them. Today receiving is
+keyed twice, once per system, and the two can diverge silently.
+
+**The design (agreed):** the **purchase order is the contract between the two
+systems**. The MRP raises it from the reorder forecast — vendor, material,
+container size, quantity, total cost — and the warehouse receives against that
+reference. This removes the matching problem entirely: the dock never guesses an
+item, it quotes an order that already names everything. Applied via **Option A
+(pending queue)**: the warehouse records intent, the MRP applies it through its
+own `tx`, so the MRP's data-layer enforcement stays authoritative and no
+transaction logic is duplicated.
+
+- *Step 1 — purchase-order model + forecast (done).*
+  - `purchaseOrders` gained `packagingId` and `containerCount`. `qty` stays
+    authoritative in the material's own unit and containerCount is derived
+    through the packaging, so **units are conserved**: containers ×
+    units-per-container = quantity, and rounding to whole containers can only
+    ever round *up*, never below the shortfall that triggered the order.
+  - `poTotalCost` is always derived from quantity × unit cost, never stored, so
+    it cannot disagree with them. `poContainerSummary` reads "400 × 60 kg sack".
+  - `suggestPurchaseOrders(data)` — the forecast. A material is short when
+    on-hand plus on-order will not cover its reorder point; the shortfall is
+    rounded up to whole containers and to the MOQ. Returns rows to review;
+    nothing is written until accepted.
+  - `tx.raisePurchaseOrders` writes them as **Draft** (an accepted suggestion is
+    not an order that has been placed), `tx.placePurchaseOrder` moves Draft →
+    Ordered, and `tx.receivablePurchaseOrders` is what the warehouse may receive
+    against — placed and not yet complete. That lifecycle exists because
+    `poDerivedStatus` deliberately treats Draft as sticky: without an explicit
+    placing step, a delivery could be booked against an order nobody ever sent.
+  - Seed packagings now carry **real container capacities** (60 kg sack, 1000 kg
+    tote, case of 12/24). The earlier placeholder of 1 unit per container made
+    orders read as "24,000 × 55 gal drum" for 24,000 kg.
+  - `mrp/test/purchase-planning.test.mjs` — 53 assertions.
+- *Step 2 (next)* — MRP UI: container/total-cost fields on the order, and a
+  suggested-orders panel to review, raise and place.
+- *Step 3* — `/api/catalog` exposes receivable orders; warehouse receiving
+  quotes one.
+- *Step 4* — the pending-receipt queue and its idempotency ledger (the careful
+  part: a re-synced or edited receipt must not mint a second lot).
 - **Phase 4 — Polish + handoff.** Address inherited MRP gaps (process-flow SVG,
   reconstructed regions, conversion-cost pricing, multi-lot shipments) by
   priority; hand the auth seam to the security developer.
