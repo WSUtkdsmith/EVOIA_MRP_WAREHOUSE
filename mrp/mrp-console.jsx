@@ -8071,7 +8071,7 @@ export default function App() {
             onOpenBatch={(batchId) => setModal({ type: "batchRecord", id: batchId })} />
         )}
         {tab === "forecast" && <ForecastTab data={data} horizon={horizon} setHorizon={setHorizon}
-          onOpenOrder={(id) => setModal({ type: "purchaseOrder", id })} />}
+          update={update} onOpenOrder={(id) => setModal({ type: "purchaseOrder", id })} />}
         {tab === "utilization" && <UtilizationTab data={data} horizon={horizon} setHorizon={setHorizon} />}
         {tab === "revenue" && <RevenueTab data={data} horizon={horizon} setHorizon={setHorizon}
           onOpenShipment={(id) => setModal({ type: "shipmentTrace", id })}
@@ -12206,7 +12206,184 @@ function ProcurementCalendar({ data, month, setMonth, mode, rawFilter, onOpenOrd
   );
 }
 
-function ForecastTab({ data, horizon, setHorizon, onOpenOrder }) {
+/* Reorder forecast -> purchase orders.
+
+   The forecast only ever suggests. Everything here is reviewable before
+   anything is written: a row can be excluded, its container count edited
+   (quantity follows, because ordering is by the container), and only then
+   raised. Raising groups by supplier, so one supplier gets one order with
+   a line per material and per container size.
+
+   Orders are raised as drafts. Placing them is a second, deliberate step,
+   because a draft is an intention and a placed order is a commitment the
+   warehouse can receive against. */
+function ReorderPanel({ data, update, onOpenOrder }) {
+  const suggestions = useMemo(() => suggestPurchaseOrders(data), [data]);
+  const [edits, setEdits] = useState({});     // rawMaterialId -> { containerCount, excluded }
+  const [raised, setRaised] = useState([]);   // references from the last raise
+
+  const rowsFor = () => suggestions
+    .filter(s => !(edits[s.rawMaterialId] || {}).excluded)
+    .map(s => {
+      const e = edits[s.rawMaterialId] || {};
+      const pkg = (getRaw(data, s.rawMaterialId).packagings || []).find(p => p.id === s.packagingId);
+      const containerCount = e.containerCount != null ? e.containerCount : s.containerCount;
+      const qty = pkg ? qtyFromContainers(pkg, containerCount) : s.qty;
+      return { ...s, containerCount, qty, totalCost: qty * s.unitCost };
+    })
+    .filter(s => s.qty > 0);
+
+  const chosen = rowsFor();
+  const grandTotal = chosen.reduce((t, r) => t + r.totalCost, 0);
+  const supplierCount = new Set(chosen.map(r => r.supplier || "(no supplier)")).size;
+
+  const setEdit = (id, patch) => setEdits(prev => ({ ...prev, [id]: { ...(prev[id] || {}), ...patch } }));
+
+  const raise = () => {
+    const rows = rowsFor();
+    if (!rows.length) return;
+    let created = [];
+    update(d => { created = tx.raisePurchaseOrders(d, rows).created; return d; });
+    setRaised(created.map(po => po.reference));
+    setEdits({});
+  };
+
+  const drafts = (data.purchaseOrders || []).filter(po => po.status === "Draft");
+  const placeAll = () => update(d => {
+    (d.purchaseOrders || []).filter(po => po.status === "Draft")
+      .forEach(po => tx.placePurchaseOrder(d, { purchaseOrderId: po.id }));
+    return d;
+  });
+
+  return (
+    <div>
+      {raised.length > 0 && (
+        <div style={{ padding: "9px 12px", marginBottom: 12, borderRadius: 7, fontSize: 13,
+                      background: "#F1F6F2", border: "1px solid #CFE0D3" }}>
+          Raised as draft: <b>{raised.join(", ")}</b>. Review and place them below to make them
+          receivable in the warehouse.
+        </div>
+      )}
+
+      {drafts.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap",
+                      padding: "10px 14px", marginBottom: 14, borderRadius: 8, fontSize: 13,
+                      background: "#FFF9EF", border: "1px solid #E8D5A8" }}>
+          <div><b>{drafts.length}</b> draft order(s) not yet placed</div>
+          <div style={{ color: "#8C6B45" }}>
+            A draft cannot be received against until it is placed with the supplier.
+          </div>
+          <Btn onClick={placeAll}>Place all drafts</Btn>
+        </div>
+      )}
+
+      {suggestions.length === 0 ? (
+        <div style={{ padding: 24, textAlign: "center", color: "#7A8079", fontSize: 13,
+                      border: "1px dashed #DCE1E8", borderRadius: 10 }}>
+          Nothing needs reordering. Every material's stock on hand plus what is already on order
+          covers its reorder point.
+        </div>
+      ) : (
+        <>
+          <div style={{ display: "flex", gap: 20, flexWrap: "wrap", alignItems: "center",
+                        padding: "10px 14px", marginBottom: 12, borderRadius: 8, fontSize: 13,
+                        background: "#F4F6F9", border: "1px solid #DCE1E8" }}>
+            <div><b>{chosen.length}</b> of {suggestions.length} material(s) selected</div>
+            <div>{supplierCount} supplier order(s) will be raised</div>
+            <div>Total <b className="mono">{fmtMoney(grandTotal)}</b></div>
+            <Btn onClick={raise} disabled={!chosen.length}>Raise draft orders</Btn>
+          </div>
+
+          <div style={{ background: "#fff", border: "1px solid #E2E4DD", borderRadius: 10, padding: 12 }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
+              <thead>
+                <tr style={{ textAlign: "left", color: "#7A8079" }}>
+                  <th style={{ padding: "4px 6px" }}>Include</th>
+                  <th style={{ padding: "4px 6px" }}>Material</th>
+                  <th style={{ padding: "4px 6px" }}>Supplier</th>
+                  <th style={{ padding: "4px 6px", textAlign: "right" }}>On hand</th>
+                  <th style={{ padding: "4px 6px", textAlign: "right" }}>On order</th>
+                  <th style={{ padding: "4px 6px", textAlign: "right" }}>Reorder at</th>
+                  <th style={{ padding: "4px 6px" }}>Container</th>
+                  <th style={{ padding: "4px 6px", textAlign: "right" }}>Containers</th>
+                  <th style={{ padding: "4px 6px", textAlign: "right" }}>Quantity</th>
+                  <th style={{ padding: "4px 6px", textAlign: "right" }}>Cost</th>
+                  <th style={{ padding: "4px 6px" }}>Expected</th>
+                </tr>
+              </thead>
+              <tbody>
+                {suggestions.map(s => {
+                  const e = edits[s.rawMaterialId] || {};
+                  const excluded = !!e.excluded;
+                  const pkg = (getRaw(data, s.rawMaterialId).packagings || []).find(p => p.id === s.packagingId);
+                  const containerCount = e.containerCount != null ? e.containerCount : s.containerCount;
+                  const qty = pkg ? qtyFromContainers(pkg, containerCount) : s.qty;
+                  const short = qty + 0.001 < s.shortfall;
+                  return (
+                    <tr key={s.rawMaterialId} style={{ borderTop: "1px solid #EEF0EA", opacity: excluded ? 0.45 : 1 }}>
+                      <td style={{ padding: "5px 6px" }}>
+                        <input type="checkbox" checked={!excluded}
+                          onChange={ev => setEdit(s.rawMaterialId, { excluded: !ev.target.checked })} />
+                      </td>
+                      <td style={{ padding: "5px 6px" }}>
+                        <b>{s.name}</b>
+                        <span style={{ color: "#9AA09A" }}> · {s.sku}</span>
+                        {s.uncataloged && (
+                          <div style={{ color: "#B87510", fontSize: 11 }}>
+                            No packaging defined — ordered by quantity, and the warehouse cannot slot it.
+                          </div>
+                        )}
+                      </td>
+                      <td style={{ padding: "5px 6px" }}>{s.supplier || "—"}</td>
+                      <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>{fmtNum(s.onHand)}</td>
+                      <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>{fmtNum(s.onOrder)}</td>
+                      <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>{fmtNum(s.reorderPoint)}</td>
+                      <td style={{ padding: "5px 6px" }}>{s.packagingLabel || "—"}</td>
+                      <td style={{ padding: "5px 6px", textAlign: "right" }}>
+                        <input type="number" min="0" disabled={excluded || !pkg}
+                          value={containerCount}
+                          onChange={ev => setEdit(s.rawMaterialId, { containerCount: Math.max(0, parseInt(ev.target.value) || 0) })}
+                          style={{ ...inputStyle, width: 78, textAlign: "right", padding: "4px 6px" }} />
+                      </td>
+                      <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>
+                        {fmtNum(qty)} {s.unit}
+                        {short && <div style={{ color: "#B87510", fontSize: 11 }}>below the shortfall</div>}
+                      </td>
+                      <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>{fmtMoney(qty * s.unitCost)}</td>
+                      <td style={{ padding: "5px 6px" }}>{fmtDate(s.expectedDate)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {drafts.length > 0 && (
+        <div style={{ background: "#fff", border: "1px solid #E2E4DD", borderRadius: 10, padding: 14, marginTop: 14 }}>
+          <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 8 }}>Draft orders</div>
+          {drafts.map(po => (
+            <div key={po.id} role="button" tabIndex={0}
+              onClick={() => onOpenOrder(po.id)}
+              onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpenOrder(po.id); } }}
+              style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap",
+                       padding: "7px 4px", borderTop: "1px solid #EEF0EA", cursor: "pointer", fontSize: 12.5 }}>
+              <b>{po.reference}</b>
+              <span>{po.supplier || "—"}</span>
+              <span style={{ color: "#7A8079" }}>{(po.lines || []).length} line(s)</span>
+              <span style={{ color: "#7A8079" }}>{poContainerSummary(data, po)}</span>
+              <span className="mono">{fmtMoney(poTotalCost(po))}</span>
+              <span style={{ color: "#7A8079" }}>expected {fmtDate(po.expectedDate)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ForecastTab({ data, horizon, setHorizon, onOpenOrder, update }) {
   const [layout, setLayout] = useState("requirements");
   const [calMode, setCalMode] = useState("all");
   const [month, setMonth] = useState(() => todayStr().slice(0, 7));
@@ -12300,7 +12477,7 @@ function ForecastTab({ data, horizon, setHorizon, onOpenOrder }) {
 
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
         <div style={{ display: "flex", gap: 4 }}>
-          {[["requirements", "Requirements"], ["calendar", "Delivery calendar"], ["history", "Delivery history"]]
+          {[["requirements", "Requirements"], ["reorder", "Reorder forecast"], ["calendar", "Delivery calendar"], ["history", "Delivery history"]]
             .map(([k, label]) => (
               <div key={k} role="button" tabIndex={0} onClick={() => setLayout(k)}
                 onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setLayout(k); } }}
@@ -12346,6 +12523,10 @@ function ForecastTab({ data, horizon, setHorizon, onOpenOrder }) {
           </div>
         )}
       </div>
+
+      {layout === "reorder" && (
+        <ReorderPanel data={data} update={update} onOpenOrder={onOpenOrder} />
+      )}
 
       {layout === "calendar" && (
         <ProcurementCalendar data={data} month={month} setMonth={setMonth}

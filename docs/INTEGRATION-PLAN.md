@@ -213,11 +213,24 @@ transaction logic is duplicated.
     its slowest line is.
   - `purchase_order_lines` had to be added to `IMPORT_ORDER` — the same trap
     `packagings` hit: without it the lines exported fine and imported to nothing.
-- *Step 2 (in progress)* — MRP UI. The order modal now lists its lines
-  (material, containers, quantity, unit cost, line total, outstanding) and the
-  purchasing tab's material filter matches on any line. **Still to do: the
-  suggested-orders panel** to review a forecast, raise the orders and place
-  them.
+- *Step 2 — MRP UI (done).* The order modal lists its lines (material,
+  containers, quantity, unit cost, line total, outstanding) and the purchasing
+  tab's material filter matches on any line. A new **Reorder forecast** segment
+  on the purchasing tab carries the whole raise-and-place flow:
+  - Every short material listed with on-hand, on-order, reorder point,
+    container, quantity and cost. Rows can be **excluded**, and the **container
+    count edited** — quantity follows it, because ordering is by the container.
+    Editing below the shortfall is allowed but called out rather than blocked.
+  - A running summary of how many **supplier orders** will be raised and what
+    they are worth, then **Raise draft orders**.
+  - Drafts are surfaced with their own banner and list, and **Place all drafts**
+    makes them receivable — the deliberate second step, since a draft is an
+    intention and a placed order is a commitment the warehouse can receive
+    against.
+  - Items with no packaging are flagged in place ("the warehouse cannot slot
+    it") rather than quietly ordered by bare quantity.
+  - Render-smoke covers all four states: stocked (empty state), short
+    (suggestions), drafts pending, and the whole tab.
 - *Step 3* — `/api/catalog` exposes receivable orders; warehouse receiving
   quotes one.
 - *Step 4* — the pending-receipt queue and its idempotency ledger (the careful
