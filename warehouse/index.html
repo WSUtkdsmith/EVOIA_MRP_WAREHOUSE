@@ -5624,6 +5624,7 @@ body.reconMapPickMode .palletTag{
     <button id="openShippingWindowBtn" type="button" class="btn topTabBtn">Shipping Log <span id="topShippedCount" class="miniCount">0</span></button>
     <button id="openInventoryWindowBtn" type="button" class="btn topTabBtn">Inventory Register <span id="topInventoryCount" class="miniCount">0</span></button>
     <button id="openBatchConsumptionBtn" type="button" class="btn topTabBtn">Batch Use Log <span id="topBatchUseCount" class="miniCount">0</span></button>
+    <button id="openMrpCatalogBtn" type="button" class="btn topTabBtn">MRP Catalog <span id="topCatalogCount" class="miniCount">0</span></button>
     <button id="openReportsBtn" type="button" class="btn topTabBtn">Reports</button>
     <button id="openSettingsBtn" type="button" class="btn topTabBtn">Settings</button>
   </div>
@@ -5744,6 +5745,37 @@ body.reconMapPickMode .palletTag{
     <div class="tableWrap"><table>
       <thead><tr><th>Pallet ID</th><th>MFG</th><th>Status</th><th>Location</th><th>Contents</th><th>Updated</th></tr></thead>
       <tbody id="table"></tbody>
+    </table></div>
+  </div>
+</dialog>
+
+<dialog id="mrpCatalogDialog">
+  <div class="modal logWindowDialog">
+    <div class="modalHead"><h2>MRP Catalog <span id="mrpCatalogCount" class="receivedCount">0</span></h2><button type="button" class="x" data-close="mrpCatalogDialog">×</button></div>
+    <div class="logHead"><span id="mrpCatalogStatus">Storable SKUs and stock from the MRP for this business unit.</span><button id="refreshMrpCatalogBtn" class="btn">Refresh</button></div>
+    <div class="totalsBox inventoryWindowTotals"><h3>Catalog Totals</h3><div id="mrpCatalogTotals" class="totalsGrid"></div></div>
+    <div class="windowSearchBar">
+      <label class="field"><span>Search catalog</span><input id="mrpCatalogSearch" placeholder="Item, SKU, size, lot, origin, order ref..."></label>
+    </div>
+    <div class="two" style="margin-bottom:10px">
+      <label class="field"><span>View</span>
+        <select id="mrpCatalogView">
+          <option value="lots">Stock on hand (lots)</option>
+          <option value="skus">Storable SKUs</option>
+        </select>
+      </label>
+      <label class="field"><span>Filter</span>
+        <select id="mrpCatalogFilter">
+          <option value="instock">In stock only</option>
+          <option value="expired">Expired only</option>
+          <option value="expiring">Expiring soon</option>
+          <option value="all">Everything</option>
+        </select>
+      </label>
+    </div>
+    <div class="tableWrap"><table>
+      <thead id="mrpCatalogHead"></thead>
+      <tbody id="mrpCatalogBody"></tbody>
     </table></div>
   </div>
 </dialog>
@@ -7723,6 +7755,11 @@ function init(){
   $('cameDamaged').onchange=toggleDamageFields; $('damagePhoto').onchange=previewDamagePhoto; $('printFulfillmentBtn').onclick=printFulfillmentDetails; $('printReceivingBtn').onclick=printReceivingDetails;
   $('openReceivingWindowBtn').onclick=openReceivingLogWindow;
   $('openShippingWindowBtn').onclick=openShippingLogWindow;
+  $('openMrpCatalogBtn').onclick=openMrpCatalog;
+  $('refreshMrpCatalogBtn').onclick=()=>loadMrpCatalog(true);
+  $('mrpCatalogSearch').oninput=renderMrpCatalog;
+  $('mrpCatalogView').onchange=renderMrpCatalog;
+  $('mrpCatalogFilter').onchange=renderMrpCatalog;
   $('openInventoryWindowBtn').onclick=openInventoryWindow;
   $('openBatchConsumptionBtn').onclick=openBatchConsumptionLog;
   $('openMovementLogBtn').onclick=openMovementLog;
@@ -14379,8 +14416,103 @@ function retireSourcePalletIfEmpty(p){
 }
 
 function toast(msg){const t=$('toast');t.textContent=msg;t.style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>t.style.display='none',2600)}
+
+/* ---------------------------------------------------------------------------
+   MRP Catalog — the shared inventory spine.
+
+   Reads /api/catalog?bu=<id>, which derives storable SKUs and stock from this
+   business unit's MRP data. The warehouse does not parse MRP internals; the
+   endpoint owns that shape. Read-only for now: this is what the warehouse can
+   catalog and slot, shown alongside the stock it already holds.
+--------------------------------------------------------------------------- */
+let mrpCatalog=null, mrpCatalogLoading=false;
+
+async function loadMrpCatalog(force){
+  if(mrpCatalogLoading) return;
+  if(mrpCatalog && !force){ renderMrpCatalog(); return; }
+  mrpCatalogLoading=true;
+  $('mrpCatalogStatus').textContent='Loading catalog…';
+  try{
+    const resp=await fetch('/api/catalog?bu='+encodeURIComponent(EVOIA_BU));
+    if(!resp.ok) throw new Error('HTTP '+resp.status);
+    mrpCatalog=await resp.json();
+    const c=mrpCatalog.counts||{};
+    $('mrpCatalogStatus').textContent=mrpCatalog.hasMrpData
+      ? `${c.skus||0} storable SKUs · ${c.lotsInStock||0} lots in stock`
+      : 'No MRP data for this business unit yet. Open the MRP module and load or enter data first.';
+  }catch(e){
+    console.warn('MRP catalog load failed:',e);
+    mrpCatalog=null;
+    $('mrpCatalogStatus').textContent='Could not reach the catalog service — check the connection and try Refresh.';
+  }finally{
+    mrpCatalogLoading=false;
+    renderMrpCatalog();
+  }
+}
+
+function openMrpCatalog(){
+  $('mrpCatalogDialog').showModal();
+  loadMrpCatalog(false);
+}
+
+const MRP_STATUS_TONE={expired:'#e53935',expiring:'#d97500',ok:'#2f6f43',unknown:'#66746c'};
+const MRP_STATUS_LABEL={expired:'Expired',expiring:'Expiring soon',ok:'OK',unknown:'No expiry'};
+
+function renderMrpCatalog(){
+  const head=$('mrpCatalogHead'), body=$('mrpCatalogBody'), totals=$('mrpCatalogTotals');
+  if(!head||!body) return;
+  if(!mrpCatalog){
+    head.innerHTML=''; body.innerHTML='<tr><td>Nothing to show yet.</td></tr>';
+    totals.innerHTML=''; $('mrpCatalogCount').textContent='0';
+    return;
+  }
+  const c=mrpCatalog.counts||{};
+  totals.innerHTML=[
+    ['Storable SKUs',c.skus||0],['Lots in stock',c.lotsInStock||0],
+    ['Expired',c.expired||0],['Expiring soon',c.expiring||0],
+    ['Uncataloged items',c.uncataloged||0]
+  ].map(([k,v])=>`<div class="totalCard"><b>${esc(v)}</b><span>${esc(k)}</span></div>`).join('');
+
+  const view=$('mrpCatalogView').value, filter=$('mrpCatalogFilter').value;
+  const q=($('mrpCatalogSearch').value||'').trim().toLowerCase();
+  const match=(o)=>!q||Object.values(o).some(v=>String(v??'').toLowerCase().includes(q));
+
+  if(view==='skus'){
+    const rows=(mrpCatalog.skus||[]).filter(match);
+    head.innerHTML='<tr><th>SKU</th><th>Item</th><th>Type</th><th>Container</th><th>Size</th><th>Pkgs/Slot</th><th>Shelf life</th><th>Hazard</th></tr>';
+    body.innerHTML=rows.length?rows.map(s=>`<tr>
+      <td><b>${esc(s.sku)}</b>${s.isDefault?' <small>(default)</small>':''}</td>
+      <td>${esc(s.itemName)}</td><td>${esc(s.itemType)}</td>
+      <td>${esc(s.packageType)}</td><td>${esc(s.size)}</td>
+      <td>${esc(s.packagesPerSlot??'')}</td>
+      <td>${s.shelfLifeDays?esc(s.shelfLifeDays)+' d':''}</td>
+      <td>${esc(s.hazardClass||'')}</td></tr>`).join('')
+      :'<tr><td colspan="8">No storable SKUs match.</td></tr>';
+    $('mrpCatalogCount').textContent=rows.length;
+  }else{
+    let rows=(mrpCatalog.lots||[]);
+    if(filter==='instock') rows=rows.filter(l=>l.qty>0);
+    else if(filter==='expired') rows=rows.filter(l=>l.status==='expired'&&l.qty>0);
+    else if(filter==='expiring') rows=rows.filter(l=>l.status==='expiring'&&l.qty>0);
+    rows=rows.filter(match);
+    head.innerHTML='<tr><th>Lot</th><th>SKU</th><th>Item</th><th>Size</th><th>Qty</th><th>Expiration</th><th>Status</th><th>Origin</th><th>Order ref</th></tr>';
+    body.innerHTML=rows.length?rows.slice(0,500).map(l=>`<tr>
+      <td><b>${esc(l.lotNumber)}</b></td><td>${esc(l.sku)}</td>
+      <td>${esc(l.itemName)}</td><td>${esc(l.size)}</td>
+      <td>${esc(formatNum(l.qty))} ${esc(l.unit||'')}</td>
+      <td>${esc(l.expirationDate||'—')}</td>
+      <td style="color:${MRP_STATUS_TONE[l.status]||'#66746c'};font-weight:800">${esc(MRP_STATUS_LABEL[l.status]||l.status)}</td>
+      <td>${esc(l.origin||'')}</td><td>${esc(l.orderRef||'')}</td></tr>`).join('')
+      :'<tr><td colspan="9">No stock matches.</td></tr>';
+    if(rows.length>500) body.innerHTML+=`<tr><td colspan="9"><small>Showing the first 500 of ${rows.length} rows — narrow the search to see more.</small></td></tr>`;
+    $('mrpCatalogCount').textContent=rows.length;
+  }
+  if($('topCatalogCount')) $('topCatalogCount').textContent=(c.lotsInStock||0);
+}
+
 init();
 syncStateFromServerOnBoot();
+loadMrpCatalog(false);
 </script>
 <div id="printStage" class="printStage"></div>
 </body>

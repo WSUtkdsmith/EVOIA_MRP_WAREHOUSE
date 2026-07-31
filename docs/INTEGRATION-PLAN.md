@@ -120,8 +120,21 @@ canonical lot/batch key both sides read and write.
     from each modal draft through `LotsEditor`. Render-smoke verified.
   - *Follow-up:* the dedicated `ReceivingModal` quick-receive flow could set
     these on receipt too (lots are already editable via the catalog modals).
-  - *Step 3* — warehouse reads the unified catalog to slot MRP items on the
-    shared map.
+  - *Step 3a — catalog API + warehouse read (done).* `GET /api/catalog?bu=<id>`
+    derives storable SKUs and stock from the BU's MRP data, so the warehouse
+    never parses MRP internals. Derivation is pure (`api/_catalog.js`, 47
+    assertions) and ages each lot against a reference date into
+    `ok` / `expiring` / `expired` / `unknown`, counting uncataloged items rather
+    than dropping them. The warehouse gained an **MRP Catalog** window (topbar,
+    with an in-stock badge): storable-SKU and stock views, search, and
+    expired/expiring filters. Read-only.
+    - *Verified against the real seed:* 60 SKUs, 762 lots (442 in stock, 90
+      expired, 207 expiring, 0 uncataloged); every lot joins to a SKU; all eight
+      render paths simulated against a DOM stub.
+    - *Note:* the catalog payload is ~480 KB for 762 lots. Fine now; if it grows,
+      add server-side filtering/paging rather than trimming client-side.
+  - *Step 3b (next)* — write direction: create warehouse pallets from MRP lots
+    and place them on the shared map, so a lot and a pallet become one record.
 - **Phase 4 — Polish + handoff.** Address inherited MRP gaps (process-flow SVG,
   reconstructed regions, conversion-cost pricing, multi-lot shipments) by
   priority; hand the auth seam to the security developer.
