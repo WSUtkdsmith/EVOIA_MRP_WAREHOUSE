@@ -420,8 +420,9 @@ const LOT_EMBEDS = {
   }
 };
 
-/* Owner discriminator shared by the two polymorphic child tables. The
-   type values are exactly the itemType tags already used throughout. */
+/* Owner discriminator shared by the polymorphic child tables (lots,
+   composition and packagings). The type values are exactly the itemType
+   tags already used throughout. */
 const OWNER = {
   typeColumn: "ownerType",
   idColumn: "ownerId",
@@ -446,10 +447,30 @@ const LOTS_TABLE = {
     producedQty: "num",
     // Which run of which process created this lot. Both blank on a
     // purchased lot.
-    batchId: "str", processId: "ref:processes"
+    batchId: "str", processId: "ref:processes",
+    // Warehouse cataloging (Phase 3) — all optional and additive; the existing
+    // `date` is retained. expirationDate is computed from productionDate + the
+    // owning item's shelfLifeDays but stays editable. packagingId points at one
+    // of that item's packagings by id (a local id, not a cross-entity ref).
+    packagingId: "str", expirationDate: "date",
+    productionDate: "date", arrivalDate: "date",
+    origin: "str", mfg: "str", orderRef: "str", containerCount: "num"
   },
   embeds: LOT_EMBEDS,
   children: LOT_CHILDREN
+};
+
+/* Packaging variants for a catalog item. Each is a distinct storable SKU — the
+   warehouse treats "SSB 1 gal" and "SSB 2.5 gal" as different stock units — with
+   its own footprint. Shares the OWNER discriminator with lots and composition,
+   so it is one table addressed by all four catalog entities. A lot records which
+   packaging it is via lot.packagingId. */
+const PACKAGINGS_TABLE = {
+  table: "packagings", pk: "id", naturalKey: "sku", polymorphic: OWNER,
+  columns: {
+    id: "str", sku: "str!", packageType: "str!", size: "str!",
+    unitsPerPackage: "num", packagesPerSlot: "num", isDefault: "bool"
+  }
 };
 
 const COMPOSITION_TABLE = {
@@ -485,12 +506,17 @@ const SCHEMA = {
     columns: {
       id: "str", name: "str!", sku: "str!", supplier: "str", unitCost: "num", unit: "str",
       certStatus: "str", leadTimeDays: "num", moq: "num", reorderPoint: "num",
-      onOrder: "num", notes: "str"
+      onOrder: "num", notes: "str",
+      // Physical cataloging (warehouse). hazardClass added for parity with the
+      // other catalog entities; shelfLifeDays drives computed lot expiry;
+      // physicallyStored flags items that actually occupy a warehouse slot.
+      hazardClass: "str", shelfLifeDays: "num", physicallyStored: "bool"
     },
     embeds: {},
     children: {
       lots: LOTS_TABLE,
-      composition: COMPOSITION_TABLE
+      composition: COMPOSITION_TABLE,
+      packagings: PACKAGINGS_TABLE
     }
   },
 
@@ -501,12 +527,14 @@ const SCHEMA = {
     naturalKey: "sku",
     columns: {
       id: "str", name: "str!", sku: "str!", unit: "str", notes: "str",
-      autoComposition: "bool", hazardClass: "str"
+      autoComposition: "bool", hazardClass: "str",
+      shelfLifeDays: "num", physicallyStored: "bool"
     },
     embeds: {},
     children: {
       lots: LOTS_TABLE,
-      composition: COMPOSITION_TABLE
+      composition: COMPOSITION_TABLE,
+      packagings: PACKAGINGS_TABLE
     }
   },
 
@@ -517,12 +545,14 @@ const SCHEMA = {
     naturalKey: "sku",
     columns: {
       id: "str", name: "str!", sku: "str!", unit: "str", notes: "str",
-      autoComposition: "bool", hazardClass: "str"
+      autoComposition: "bool", hazardClass: "str",
+      shelfLifeDays: "num", physicallyStored: "bool"
     },
     embeds: {},
     children: {
       lots: LOTS_TABLE,
-      composition: COMPOSITION_TABLE
+      composition: COMPOSITION_TABLE,
+      packagings: PACKAGINGS_TABLE
     }
   },
 
@@ -777,10 +807,11 @@ const SCHEMA = {
     naturalKey: "sku",
     columns: {
       id: "str", name: "str!", sku: "str", unit: "str", notes: "str",
-      componentId: "ref:components", accumulate: "bool", hazardClass: "str"
+      componentId: "ref:components", accumulate: "bool", hazardClass: "str",
+      shelfLifeDays: "num", physicallyStored: "bool"
     },
     embeds: {},
-    children: { lots: LOTS_TABLE }
+    children: { lots: LOTS_TABLE, packagings: PACKAGINGS_TABLE }
   },
 
   operatingCalendars: {
@@ -1214,7 +1245,7 @@ const IMPORT_ORDER = [
   "raw_materials", "intermediate_products", "finished_goods",
   "components", "operating_calendars", "calendar_closures", "calendar_overrides",
   "equipment", "customers", "waste_streams", "processes",
-  "composition", "process_inputs", "process_equipment", "process_outputs",
+  "composition", "packagings", "process_inputs", "process_equipment", "process_outputs",
   "maintenance", "production_targets", "purchase_orders",
   "sales_orders", "sales_order_lines", "fulfilment_cancellations",
   "production_schedule", "schedule_revisions",
@@ -2290,6 +2321,54 @@ function expandMaintenanceWindows(entry, horizonStart, horizonEnd) {
    so, rather than the new one being invisible forever behind whatever is
    already in storage. */
 const SEED_VERSION = "coffee-2026-07";
+
+// Phase 3 — warehouse cataloging seed. Decorates each catalog item with a
+// default packaging (a distinct storable SKU), a shelf life, and stamps each of
+// its lots with that packaging, a production date and a computed expiry (plus an
+// arrival date and origin where the source is known). Run as one pass at the end
+// of seedData so the large item/lot construction above stays untouched. Every
+// value is deterministic (no now()), so the seed stays reproducible.
+const SEED_SHELF_LIFE = { raw: 365, intermediate: 180, finished: 540, waste: 90 };
+function seedWarehouseCatalog(cols) {
+  const addDays = (iso, n) => {
+    if (!iso || !n) return "";
+    const d = new Date(iso + "T00:00:00Z");
+    if (isNaN(d.getTime())) return "";
+    d.setUTCDate(d.getUTCDate() + Number(n));
+    return d.toISOString().slice(0, 10);
+  };
+  const skuSuffix = (size) => size.replace(/[^0-9a-zA-Z]+/g, "").toUpperCase();
+  const plan = [
+    ["raw", cols.rawMaterials, [["drum", "55 gal", 1]]],
+    ["intermediate", cols.intermediateProducts, [["tote", "275 gal", 1]]],
+    ["finished", cols.finishedGoods, [["jug", "1 gal", 4], ["jug", "2.5 gal", 2]]],
+    ["waste", cols.wasteStreams, [["barrel", "55 gal", 1]]]
+  ];
+  plan.forEach(([type, list, packs]) => {
+    (list || []).forEach((item) => {
+      if (item.shelfLifeDays == null) item.shelfLifeDays = SEED_SHELF_LIFE[type];
+      if (item.physicallyStored == null) item.physicallyStored = true;
+      if (!Array.isArray(item.packagings) || !item.packagings.length) {
+        item.packagings = packs.map(([packageType, size, packagesPerSlot], i) => ({
+          id: uid(),
+          sku: item.sku + "-" + skuSuffix(size),
+          packageType, size, unitsPerPackage: 1, packagesPerSlot,
+          isDefault: i === 0
+        }));
+      }
+      const def = item.packagings[0];
+      (item.lots || []).forEach((lot) => {
+        if (!lot.packagingId) lot.packagingId = def.id;
+        if (!lot.productionDate) lot.productionDate = lot.date || "";
+        if (!lot.expirationDate && lot.productionDate) {
+          lot.expirationDate = addDays(lot.productionDate, item.shelfLifeDays);
+        }
+        if (!lot.arrivalDate && type === "raw") lot.arrivalDate = lot.date || "";
+        if (!lot.origin) lot.origin = item.supplier || (type === "raw" ? "Supplier" : "Evoia Plant");
+      });
+    });
+  });
+}
 
 function seedData() {
   /* ===============================================================
@@ -3440,6 +3519,8 @@ function seedData() {
       entry.standardCostAtFulfillment = Math.round(actual * (1 + (rnd() - 0.45) * 0.16) * 10000) / 10000;
     });
   }
+
+  seedWarehouseCatalog({ rawMaterials, intermediateProducts, finishedGoods, wasteStreams });
 
   return backfillRowIds({
     seedVersion: SEED_VERSION,

@@ -101,6 +101,14 @@ canonical lot/batch key both sides read and write.
   on the shared map. Catalog gap analysis + agreed schema delta:
   **`docs/PHASE3-CATALOG-GAPS.md`** (packagings as distinct SKUs; shelf-life →
   computed expiry; core storage rules; lot-level origin/mfg/ref/dates).
+  - *Step 1 — schema delta (done).* Added the `packagings` shared polymorphic
+    table, `shelfLifeDays`/`physicallyStored` on all four entities (+`hazardClass`
+    on raw materials), and 8 optional lot columns; taught the importer about
+    `packagings` (IMPORT_ORDER); seeded default packagings + computed expiry.
+    New `packaging.test.mjs` suite (50 assertions). Gate: 879 logic assertions,
+    0 parse errors; MRP bundle rebuilt.
+  - *Step 2 (next)* — MRP UI to enter the new fields. *Step 3* — warehouse reads
+    the unified catalog to slot MRP items on the shared map.
 - **Phase 4 — Polish + handoff.** Address inherited MRP gaps (process-flow SVG,
   reconstructed regions, conversion-cost pricing, multi-lot shipments) by
   priority; hand the auth seam to the security developer.
