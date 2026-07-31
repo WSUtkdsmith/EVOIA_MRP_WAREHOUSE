@@ -98,7 +98,9 @@ canonical lot/batch key both sides read and write.
     is deprecated in favour of Neon's native SDK — works today, migrate later.
 - **Phase 3 — Unify the inventory spine.** Make MRP lots and warehouse pallet
   lines two views of the same stock; connect receiving/shipping across modules
-  on the shared map.
+  on the shared map. Catalog gap analysis + agreed schema delta:
+  **`docs/PHASE3-CATALOG-GAPS.md`** (packagings as distinct SKUs; shelf-life →
+  computed expiry; core storage rules; lot-level origin/mfg/ref/dates).
 - **Phase 4 — Polish + handoff.** Address inherited MRP gaps (process-flow SVG,
   reconstructed regions, conversion-cost pricing, multi-lot shipments) by
   priority; hand the auth seam to the security developer.
