@@ -705,26 +705,36 @@ const SCHEMA = {
     pk: "id",
     naturalKey: "reference",
     columns: {
-      id: "str", reference: "str!", rawMaterialId: "ref:rawMaterials!",
-      supplier: "str", orderDate: "date!", qty: "num!", unitCost: "num",
+      id: "str", reference: "str!",
+      supplier: "str", orderDate: "date!",
       expectedDate: "date!",
       status: "enum:Draft|Ordered|Part received|Received|Cancelled!",
-      notes: "str",
-      // What was ordered physically: which container/size, and how many of
-      // them. `qty` stays the authoritative figure in the material's own unit
-      // so nothing downstream has to convert; containerCount is what the
-      // warehouse counts off the truck. Both optional so orders predating this
-      // keep working.
-      packagingId: "str", containerCount: "num"
+      notes: "str"
     },
     embeds: {},
     children: {
+      /* One line per thing ordered. An order routinely covers several
+         materials from one supplier, and just as often the same material
+         in two container sizes - which the warehouse receives and stores
+         as separate stock. So material, container and quantity all live
+         on the line, exactly as a sales order carries its products.
+
+         `qty` is authoritative and in the material's own unit;
+         containerCount is what gets counted off the truck. Units are
+         conserved: containers x units-per-container = qty. */
+      lines: {
+        table: "purchase_order_lines", fk: "purchaseOrderId", pk: "id",
+        columns: {
+          id: "str", rawMaterialId: "ref:rawMaterials!", qty: "num!",
+          unitCost: "num", packagingId: "str", containerCount: "num", notes: "str"
+        }
+      },
       // Deliveries land in instalments more often than not, so receipts are
       // their own rows rather than a single date on the order. Each one
-      // points at the stock lot it created.
+      // points at the line it satisfies and the stock lot it created.
       receipts: {
         table: "purchase_receipts", fk: "purchaseOrderId", pk: "id",
-        columns: { id: "str", date: "date!", qty: "num!", lotId: "str", notes: "str" },
+        columns: { id: "str", lineId: "str", date: "date!", qty: "num!", lotId: "str", notes: "str" },
         lotRefs: { lotId: { companion: "lotNumber" } }
       }
     }
@@ -1252,7 +1262,7 @@ const IMPORT_ORDER = [
   "components", "operating_calendars", "calendar_closures", "calendar_overrides",
   "equipment", "customers", "waste_streams", "processes",
   "composition", "packagings", "process_inputs", "process_equipment", "process_outputs",
-  "maintenance", "production_targets", "purchase_orders",
+  "maintenance", "production_targets", "purchase_orders", "purchase_order_lines",
   "sales_orders", "sales_order_lines", "fulfilment_cancellations",
   "production_schedule", "schedule_revisions",
   "lots", "lot_sources", "lot_actual_equipment", "lot_actual_labor", "lot_qc_checks",
@@ -1895,17 +1905,27 @@ const tx = {
      order was placed at, and record the instalment against the order. Both
      or neither - a lot with no receipt row would silently detach stock from
      the order that paid for it. */
-  receiveAgainstOrder(db, { purchaseOrderId, date, qty, lotNumber, notes, unitCost }) {
+  receiveAgainstOrder(db, { purchaseOrderId, lineId, date, qty, lotNumber, notes, unitCost }) {
     const po = repo.find(db, "purchaseOrders", purchaseOrderId);
     if (!po) return { ok: false, error: "That purchase order no longer exists." };
     const amount = Number(qty) || 0;
     if (amount <= 0) return { ok: false, error: "Received quantity must be greater than zero." };
 
+    // Which line this delivery satisfies. Naming one is the honest case, but
+    // a delivery against a single-line order needs no ceremony, so fall back
+    // to the first line still owed - never to a line already complete.
+    const lines = poLines(po);
+    if (!lines.length) return { ok: false, error: "That order has nothing on it to receive." };
+    const line = lineId
+      ? lines.find(l => l.id === lineId)
+      : (lines.find(l => poLineOutstanding(po, l) > 0) || lines[0]);
+    if (!line) return { ok: false, error: "That order line no longer exists." };
+
     const price = (unitCost === "" || unitCost === undefined || unitCost === null)
-      ? (Number(po.unitCost) || 0)
+      ? (Number(line.unitCost) || 0)
       : Number(unitCost) || 0;
 
-    const lot = repo.addLot(db, "rawMaterials", po.rawMaterialId, {
+    const lot = repo.addLot(db, "rawMaterials", line.rawMaterialId, {
       lotNumber: lotNumber || po.reference, date: date || todayStr(),
       qty: amount, producedQty: amount, unitCost: price,
       notes: notes || ("Received against " + po.reference),
@@ -1915,11 +1935,11 @@ const tx = {
 
     if (!Array.isArray(po.receipts)) po.receipts = [];
     po.receipts.push({
-      id: uid(), date: date || todayStr(), qty: amount,
+      id: uid(), lineId: line.id, date: date || todayStr(), qty: amount,
       lotId: lot.id, notes: notes || ""
     });
     po.status = poDerivedStatus(po);
-    return { ok: true, lot, po };
+    return { ok: true, lot, po, line };
   },
 
   /* Raise purchase orders from reviewed suggestions.
@@ -1931,25 +1951,45 @@ const tx = {
 
      Raised as Draft: a suggestion that has been accepted is not yet an
      order that has been placed with a supplier. */
-  raisePurchaseOrders(db, rows) {
-    const created = [];
-    (rows || []).forEach(row => {
+  raisePurchaseOrders(db, rows, options) {
+    const opts = options || {};
+    const usable = (rows || []).filter(row =>
+      row && getRaw(db, row.rawMaterialId) && (Number(row.qty) || 0) > 0);
+
+    /* One order per supplier by default: a buyer sends a supplier one order
+       covering everything wanted from them, not one per material - and the
+       same material in two container sizes is two lines on that order, not
+       two orders. Pass groupBySupplier: false to raise them separately. */
+    const groups = new Map();
+    usable.forEach((row, i) => {
       const raw = getRaw(db, row.rawMaterialId);
-      if (!raw) return;
-      const qty = Number(row.qty) || 0;
-      if (qty <= 0) return;
+      const supplier = row.supplier || raw.supplier || "";
+      const key = opts.groupBySupplier === false ? "row:" + i : supplier;
+      if (!groups.has(key)) groups.set(key, { supplier, rows: [] });
+      groups.get(key).rows.push(row);
+    });
+
+    const created = [];
+    groups.forEach(group => {
+      // The order is expected when its slowest line is, so nothing is
+      // reported as late while a line is still legitimately in transit.
+      const expected = group.rows.map(r => r.expectedDate).filter(Boolean).sort();
       const po = repo.create(db, "purchaseOrders", {
-        reference: row.reference || nextPoReference(db),
-        rawMaterialId: row.rawMaterialId,
-        supplier: row.supplier || raw.supplier || "",
-        orderDate: row.orderDate || todayStr(),
-        expectedDate: row.expectedDate || todayStr(),
-        qty,
-        unitCost: Number(row.unitCost) || 0,
-        packagingId: row.packagingId || "",
-        containerCount: Number(row.containerCount) || 0,
+        reference: opts.reference || nextPoReference(db),
+        supplier: group.supplier,
+        orderDate: opts.orderDate || todayStr(),
+        expectedDate: expected.length ? expected[expected.length - 1] : todayStr(),
         status: "Draft",
-        notes: row.notes || "Raised from reorder forecast",
+        notes: opts.notes || "Raised from reorder forecast",
+        lines: group.rows.map(row => ({
+          id: uid(),
+          rawMaterialId: row.rawMaterialId,
+          qty: Number(row.qty) || 0,
+          unitCost: Number(row.unitCost) || 0,
+          packagingId: row.packagingId || "",
+          containerCount: Number(row.containerCount) || 0,
+          notes: row.notes || ""
+        })),
         receipts: []
       });
       created.push(po);
@@ -2397,7 +2437,7 @@ const SEED_VERSION = "coffee-2026-07";
 // of seedData so the large item/lot construction above stays untouched. Every
 // value is deterministic (no now()), so the seed stays reproducible.
 const SEED_SHELF_LIFE = { raw: 365, intermediate: 180, finished: 540, waste: 90 };
-function seedWarehouseCatalog(cols) {
+function seedWarehouseCatalog(cols, purchaseOrders) {
   const addDays = (iso, n) => {
     if (!iso || !n) return "";
     const d = new Date(iso + "T00:00:00Z");
@@ -2448,6 +2488,20 @@ function seedWarehouseCatalog(cols) {
         if (!lot.arrivalDate && type === "raw") lot.arrivalDate = lot.date || "";
         if (!lot.origin) lot.origin = item.supplier || (type === "raw" ? "Supplier" : "Evoia Plant");
       });
+    });
+  });
+
+  // Orders are generated before packagings exist, so their lines are given
+  // their container here - the same default the material itself carries.
+  const byMaterial = {};
+  (cols.rawMaterials || []).forEach(r => { byMaterial[r.id] = r; });
+  (purchaseOrders || []).forEach(po => {
+    (po.lines || []).forEach(line => {
+      const raw = byMaterial[line.rawMaterialId];
+      const pkg = raw && ((raw.packagings || []).find(p => p.isDefault) || (raw.packagings || [])[0]);
+      if (!pkg) return;
+      if (!line.packagingId) line.packagingId = pkg.id;
+      if (!line.containerCount) line.containerCount = containersFromQty(pkg, line.qty);
     });
   });
 }
@@ -2945,20 +2999,26 @@ function seedData() {
   const purchaseOrders = [];
   let poSeq = 4100;
   const mkOrder = (raw, orderDate, qty, expectedDate, over) => {
+    const amount = Math.round(qty * 100) / 100;
     const po = {
       id: uid(), reference: "PO-" + (++poSeq),
-      rawMaterialId: raw.id, supplier: raw.supplier,
-      orderDate, qty: Math.round(qty * 100) / 100,
-      unitCost: priceAt(raw, orderDate),
+      supplier: raw.supplier,
+      orderDate,
       expectedDate, status: "Ordered", notes: "", receipts: [],
+      lines: [{
+        id: uid(), rawMaterialId: raw.id, qty: amount,
+        unitCost: priceAt(raw, orderDate),
+        packagingId: "", containerCount: 0,
+        notes: ""
+      }],
       ...(over || {})
     };
     purchaseOrders.push(po);
     return po;
   };
   const receiveOrder = (po, lot, qty, date) => {
-    po.receipts.push({ id: uid(), date, qty: Math.round(qty * 100) / 100, lotId: lot.id, notes: "" });
-    po.status = poReceivedQty(po) + 0.001 < po.qty ? "Part received" : "Received";
+    po.receipts.push({ id: uid(), lineId: po.lines[0].id, date, qty: Math.round(qty * 100) / 100, lotId: lot.id, notes: "" });
+    po.status = poReceivedQty(po) + 0.001 < poOrderedQty(po) ? "Part received" : "Received";
   };
 
   // Goods-in: a green coffee delivery every three weeks or so.
@@ -3407,8 +3467,8 @@ function seedData() {
       inDays < 0 ? { notes: "Chased with the supplier \u2014 no revised date yet." } : undefined);
     // one arrives in two instalments, the first already landed
     if (raw === greenRobusta) {
-      const part = po.qty * 0.4;
-      const partLot = mkLot(raw, "GCVN", day(todayStr(), -3), part, { unitCost: po.unitCost,
+      const part = po.lines[0].qty * 0.4;
+      const partLot = mkLot(raw, "GCVN", day(todayStr(), -3), part, { unitCost: po.lines[0].unitCost,
         notes: "First instalment against " + po.reference });
       receiveOrder(po, partLot, part, day(todayStr(), -3));
     }
@@ -3602,7 +3662,7 @@ function seedData() {
     });
   }
 
-  seedWarehouseCatalog({ rawMaterials, intermediateProducts, finishedGoods, wasteStreams });
+  seedWarehouseCatalog({ rawMaterials, intermediateProducts, finishedGoods, wasteStreams }, purchaseOrders);
 
   return backfillRowIds({
     seedVersion: SEED_VERSION,
@@ -3754,17 +3814,43 @@ function normalizeSalesOrders(list) {
 }
 
 /* Orders loaded from a database that predates them. */
+/* Orders written before an order could hold several lines carried the
+   material, quantity and cost on the order itself. Those become a single
+   line, and their receipts are attributed to it, so an order raised under
+   the old shape keeps reading and receiving exactly as it did. The legacy
+   fields are dropped once folded in, so there is only ever one place a
+   quantity lives. */
 function normalizePurchaseOrders(list) {
-  return (Array.isArray(list) ? list : []).map(po => ({
-    ...po,
-    qty: Number(po.qty) || 0,
-    unitCost: Number(po.unitCost) || 0,
-    status: po.status || "Ordered",
-    receipts: (Array.isArray(po.receipts) ? po.receipts : []).map(r => ({
-      id: r.id || uid(), date: r.date || "", qty: Number(r.qty) || 0,
-      lotId: r.lotId || "", notes: r.notes || ""
-    }))
-  }));
+  return (Array.isArray(list) ? list : []).map(po => {
+    let lines = Array.isArray(po.lines) ? po.lines : [];
+    if (!lines.length && po.rawMaterialId) {
+      lines = [{
+        id: uid(), rawMaterialId: po.rawMaterialId,
+        qty: Number(po.qty) || 0, unitCost: Number(po.unitCost) || 0,
+        packagingId: po.packagingId || "", containerCount: Number(po.containerCount) || 0,
+        notes: ""
+      }];
+    }
+    lines = lines.map(l => ({
+      id: l.id || uid(), rawMaterialId: l.rawMaterialId || "",
+      qty: Number(l.qty) || 0, unitCost: Number(l.unitCost) || 0,
+      packagingId: l.packagingId || "", containerCount: Number(l.containerCount) || 0,
+      notes: l.notes || ""
+    }));
+    const firstLineId = lines.length ? lines[0].id : "";
+    const next = {
+      ...po,
+      status: po.status || "Ordered",
+      lines,
+      receipts: (Array.isArray(po.receipts) ? po.receipts : []).map(r => ({
+        id: r.id || uid(), lineId: r.lineId || firstLineId, date: r.date || "",
+        qty: Number(r.qty) || 0, lotId: r.lotId || "", notes: r.notes || ""
+      }))
+    };
+    delete next.rawMaterialId; delete next.qty; delete next.unitCost;
+    delete next.packagingId; delete next.containerCount;
+    return next;
+  });
 }
 
 /* Equipment saved before machines could follow their own hours has no
@@ -4739,13 +4825,42 @@ function batchRecords(data, options) {
    calendar is for.
 =============================================================== */
 
+/* An order's lines. Orders written before lines existed are migrated on
+   load, so anything reaching here has them. */
+function poLines(po) {
+  return (po && po.lines) || [];
+}
+
+/* Total ordered across every line - the figure the order as a whole is
+   judged against. */
+function poOrderedQty(po) {
+  return poLines(po).reduce((s, l) => s + (Number(l.qty) || 0), 0);
+}
+
 function poReceivedQty(po) {
   return (po.receipts || []).reduce((s, r) => s + (Number(r.qty) || 0), 0);
 }
 
+/* Received against one line. Receipts written before lines existed carry
+   no lineId; those are attributed to the first line, which is where the
+   migration put the whole order. */
+function poLineReceivedQty(po, lineId) {
+  const lines = poLines(po);
+  const firstId = lines.length ? lines[0].id : "";
+  return (po.receipts || []).reduce((s, r) => {
+    const target = r.lineId || firstId;
+    return target === lineId ? s + (Number(r.qty) || 0) : s;
+  }, 0);
+}
+
+function poLineOutstanding(po, line) {
+  if (!line || po.status === "Cancelled") return 0;
+  return Math.max(0, (Number(line.qty) || 0) - poLineReceivedQty(po, line.id));
+}
+
 function poOutstanding(po) {
   if (po.status === "Cancelled") return 0;
-  return Math.max(0, (Number(po.qty) || 0) - poReceivedQty(po));
+  return Math.max(0, poOrderedQty(po) - poReceivedQty(po));
 }
 
 /* Last instalment date, which is when the order actually completed. */
@@ -4760,7 +4875,7 @@ function poActualDate(po) {
 function poDerivedStatus(po) {
   if (po.status === "Cancelled" || po.status === "Draft") return po.status;
   const received = poReceivedQty(po);
-  const ordered = Number(po.qty) || 0;
+  const ordered = poOrderedQty(po);
   if (received <= 0) return "Ordered";
   if (received + 0.001 < ordered) return "Part received";
   return "Received";
@@ -4777,12 +4892,19 @@ function poDaysLate(po) {
    a hand-maintained figure. Falls back to the stored `onOrder` only when a
    material has no orders at all, so databases that predate this keep working. */
 function openOrderQty(data, rawMaterialId) {
-  const orders = (data.purchaseOrders || []).filter(po => po.rawMaterialId === rawMaterialId);
-  if (!orders.length) {
+  let found = false, total = 0;
+  (data.purchaseOrders || []).forEach(po => {
+    poLines(po).forEach(line => {
+      if (line.rawMaterialId !== rawMaterialId) return;
+      found = true;
+      total += poLineOutstanding(po, line);
+    });
+  });
+  if (!found) {
     const raw = getRaw(data, rawMaterialId);
     return raw ? Number(raw.onOrder) || 0 : 0;
   }
-  return orders.reduce((s, po) => s + poOutstanding(po), 0);
+  return total;
 }
 
 /* ---------------------------------------------------------------
@@ -4809,11 +4931,11 @@ function unitsPerContainer(packaging) {
 
 /* The packaging a purchase order was raised against, or the material's
    default when the order predates packaging. Null when neither exists. */
-function poPackaging(data, po) {
-  const raw = getRaw(data, po && po.rawMaterialId);
+function poPackaging(data, line) {
+  const raw = getRaw(data, line && line.rawMaterialId);
   const list = (raw && raw.packagings) || [];
   if (!list.length) return null;
-  return (po && po.packagingId && list.find(p => p.id === po.packagingId))
+  return (line && line.packagingId && list.find(p => p.id === line.packagingId))
     || list.find(p => p.isDefault) || list[0] || null;
 }
 
@@ -4841,17 +4963,26 @@ function containersFromQty(packaging, qty) {
 
 /* What the order is worth. Held nowhere - always derived from quantity
    and unit cost, so it cannot disagree with them. */
+function poLineCost(line) {
+  return (Number(line && line.qty) || 0) * (Number(line && line.unitCost) || 0);
+}
+
 function poTotalCost(po) {
-  return (Number(po && po.qty) || 0) * (Number(po && po.unitCost) || 0);
+  return poLines(po).reduce((s, l) => s + poLineCost(l), 0);
 }
 
 /* "10 x 55 gal drum" - how the order reads on a dock sheet. */
-function poContainerSummary(data, po) {
-  const pkg = poPackaging(data, po);
+function poLineContainerSummary(data, line) {
+  const pkg = poPackaging(data, line);
   if (!pkg) return "";
-  const count = (po && po.containerCount != null && po.containerCount !== "")
-    ? Number(po.containerCount) : containersFromQty(pkg, po && po.qty);
+  const count = (line && line.containerCount != null && line.containerCount !== "")
+    ? Number(line.containerCount) : containersFromQty(pkg, line && line.qty);
   return count + " × " + packagingLabel(pkg);
+}
+
+/* Every line's containers, as the order reads on a dock sheet. */
+function poContainerSummary(data, po) {
+  return poLines(po).map(l => poLineContainerSummary(data, l)).filter(Boolean).join(", ");
 }
 
 /* Stock physically on hand for a material, from its lots. */
@@ -4931,26 +5062,48 @@ function nextPoReference(data, prefix) {
 function purchaseOrderRecords(data, options) {
   const opts = options || {};
   return (data.purchaseOrders || []).map(po => {
-    const raw = getRaw(data, po.rawMaterialId);
+    const lines = poLines(po);
+    const lineRows = lines.map(line => {
+      const lraw = getRaw(data, line.rawMaterialId);
+      return {
+        line, raw: lraw,
+        materialName: lraw ? lraw.name : "(deleted material)",
+        materialSku: lraw ? lraw.sku : "",
+        unit: lraw ? lraw.unit : "",
+        qty: Number(line.qty) || 0,
+        unitCost: Number(line.unitCost) || 0,
+        value: poLineCost(line),
+        receivedQty: poLineReceivedQty(po, line.id),
+        outstanding: poLineOutstanding(po, line),
+        containers: poLineContainerSummary(data, line)
+      };
+    });
+    // A single-line order still reads as one material, which is how most of
+    // them arrive; only a genuinely mixed order says so.
+    const first = lineRows[0];
+    const raw = first ? first.raw : null;
     const received = poReceivedQty(po);
     const status = poDerivedStatus(po);
     const actualDate = poActualDate(po);
     const daysLate = poDaysLate(po);
     return {
-      po, raw,
+      po, raw, lines: lineRows,
       reference: po.reference,
-      materialName: raw ? raw.name : "(deleted material)",
-      materialSku: raw ? raw.sku : "",
-      unit: raw ? raw.unit : "",
+      materialName: lineRows.length > 1
+        ? lineRows.length + " materials"
+        : (first ? first.materialName : "(empty order)"),
+      materialSku: lineRows.length === 1 && first ? first.materialSku : "",
+      unit: lineRows.length === 1 && first ? first.unit : "",
+      containers: poContainerSummary(data, po),
       supplier: po.supplier || (raw ? raw.supplier : ""),
       orderDate: po.orderDate,
       expectedDate: po.expectedDate,
       actualDate,
-      qty: Number(po.qty) || 0,
+      qty: poOrderedQty(po),
       receivedQty: received,
       outstanding: poOutstanding(po),
-      unitCost: Number(po.unitCost) || 0,
-      value: (Number(po.unitCost) || 0) * (Number(po.qty) || 0),
+      unitCost: lineRows.length === 1 && first ? first.unitCost : 0,
+      value: poTotalCost(po),
       status,
       open: status === "Ordered" || status === "Part received",
       late: daysLate !== null && daysLate > 0,
@@ -4979,10 +5132,11 @@ function purchaseOrderRecords(data, options) {
 function purchaseOrderedEvents(data, rawMaterialId) {
   return (data.purchaseOrders || [])
     .filter(po => po.status !== "Cancelled")
-    .filter(po => !rawMaterialId || po.rawMaterialId === rawMaterialId)
     .filter(po => po.orderDate)
-    .map(po => ({ date: po.orderDate, series: "ordered", value: Number(po.qty) || 0,
-                  rawMaterialId: po.rawMaterialId, poId: po.id }));
+    .flatMap(po => poLines(po)
+      .filter(l => !rawMaterialId || l.rawMaterialId === rawMaterialId)
+      .map(l => ({ date: po.orderDate, series: "ordered", value: Number(l.qty) || 0,
+                   rawMaterialId: l.rawMaterialId, poId: po.id, lineId: l.id })));
 }
 
 /* Quantity expected to arrive, dated by the expected date. Outstanding only -
@@ -4990,21 +5144,27 @@ function purchaseOrderedEvents(data, rawMaterialId) {
 function purchaseExpectedEvents(data, rawMaterialId) {
   return (data.purchaseOrders || [])
     .filter(po => po.status !== "Cancelled")
-    .filter(po => !rawMaterialId || po.rawMaterialId === rawMaterialId)
-    .filter(po => po.expectedDate && poOutstanding(po) > 0)
-    .map(po => ({ date: po.expectedDate, series: "expected", value: poOutstanding(po),
-                  rawMaterialId: po.rawMaterialId, poId: po.id }));
+    .filter(po => po.expectedDate)
+    .flatMap(po => poLines(po)
+      .filter(l => !rawMaterialId || l.rawMaterialId === rawMaterialId)
+      .filter(l => poLineOutstanding(po, l) > 0)
+      .map(l => ({ date: po.expectedDate, series: "expected", value: poLineOutstanding(po, l),
+                   rawMaterialId: l.rawMaterialId, poId: po.id, lineId: l.id })));
 }
 
 /* Quantity actually received, dated by each instalment. */
 function purchaseReceivedEvents(data, rawMaterialId) {
   const out = [];
   (data.purchaseOrders || []).forEach(po => {
-    if (rawMaterialId && po.rawMaterialId !== rawMaterialId) return;
+    const lines = poLines(po);
+    const first = lines.length ? lines[0] : null;
     (po.receipts || []).forEach(r => {
       if (!r.date) return;
+      const line = lines.find(l => l.id === r.lineId) || first;
+      const matId = line ? line.rawMaterialId : "";
+      if (rawMaterialId && matId !== rawMaterialId) return;
       out.push({ date: r.date, series: "received", value: Number(r.qty) || 0,
-                 rawMaterialId: po.rawMaterialId, poId: po.id, lotId: r.lotId });
+                 rawMaterialId: matId, poId: po.id, lineId: line ? line.id : "", lotId: r.lotId });
     });
   });
   return out;
@@ -11855,6 +12015,38 @@ function PurchaseOrderModal({ record, onClose }) {
       </div>
 
       <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>
+        Lines ({(r.lines || []).length})
+      </div>
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5, marginBottom: 16 }}>
+        <thead>
+          <tr style={{ textAlign: "left", color: "#7A8079" }}>
+            <th style={{ padding: "4px 6px" }}>Material</th>
+            <th style={{ padding: "4px 6px" }}>Containers</th>
+            <th style={{ padding: "4px 6px", textAlign: "right" }}>Quantity</th>
+            <th style={{ padding: "4px 6px", textAlign: "right" }}>Unit cost</th>
+            <th style={{ padding: "4px 6px", textAlign: "right" }}>Line total</th>
+            <th style={{ padding: "4px 6px", textAlign: "right" }}>Outstanding</th>
+          </tr>
+        </thead>
+        <tbody>
+          {(r.lines || []).map(l => (
+            <tr key={l.line.id} style={{ borderTop: "1px solid #EEF0EA" }}>
+              <td style={{ padding: "5px 6px" }}>{l.materialName}
+                {l.materialSku && <span style={{ color: "#9AA09A" }}> · {l.materialSku}</span>}</td>
+              <td style={{ padding: "5px 6px" }}>{l.containers || "\u2014"}</td>
+              <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>{fmtNum(l.qty)} {l.unit}</td>
+              <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>{money(l.unitCost)}</td>
+              <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>{money(l.value)}</td>
+              <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>{fmtNum(l.outstanding)}</td>
+            </tr>
+          ))}
+          {(r.lines || []).length === 0 && (
+            <tr><td colSpan={6} style={{ padding: "6px", color: "#9AA09A" }}>Nothing on this order.</td></tr>
+          )}
+        </tbody>
+      </table>
+
+      <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>
         Deliveries ({r.receipts.length})
       </div>
       {r.receipts.length === 0 && (
@@ -12181,7 +12373,7 @@ function ForecastTab({ data, horizon, setHorizon, onOpenOrder }) {
                       padding: 14, marginTop: 14 }}>
           <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 8 }}>Open orders</div>
           {openOrders
-            .filter(r => !rawFilter || r.po.rawMaterialId === rawFilter)
+            .filter(r => !rawFilter || (r.lines || []).some(l => l.line.rawMaterialId === rawFilter))
             .sort((a, b) => String(a.expectedDate).localeCompare(String(b.expectedDate)))
             .map(r => (
               <div key={r.po.id}

@@ -194,8 +194,30 @@ transaction logic is duplicated.
     tote, case of 12/24). The earlier placeholder of 1 unit per container made
     orders read as "24,000 × 55 gal drum" for 24,000 kg.
   - `mrp/test/purchase-planning.test.mjs` — 53 assertions.
-- *Step 2 (next)* — MRP UI: container/total-cost fields on the order, and a
-  suggested-orders panel to review, raise and place.
+- *Step 1b — orders hold several lines (done).* An order routinely covers
+  several materials from one supplier, and just as often **the same material in
+  two container sizes**, which the warehouse receives and stores as separate
+  stock. So material, quantity, cost and container moved off the order header
+  onto a `purchase_order_lines` child — mirroring how `sales_orders` already
+  carries its products.
+  - Receipts now name the line they satisfy (`purchase_receipts.lineId`), so one
+    size arriving does not close another. `poOrderedQty`, `poLineOutstanding`
+    and `poLineReceivedQty` aggregate; `poOutstanding`/`poReceivedQty`/
+    `poDerivedStatus` keep their old contracts, which is why the 96 existing
+    purchasing assertions survived the change untouched.
+  - `normalizePurchaseOrders` migrates any order written in the old shape into a
+    single line and attributes its receipts to it, then drops the legacy header
+    fields so a quantity only ever lives in one place.
+  - `raisePurchaseOrders` groups suggestions **one order per supplier** by
+    default (`groupBySupplier: false` to split), and the order is expected when
+    its slowest line is.
+  - `purchase_order_lines` had to be added to `IMPORT_ORDER` — the same trap
+    `packagings` hit: without it the lines exported fine and imported to nothing.
+- *Step 2 (in progress)* — MRP UI. The order modal now lists its lines
+  (material, containers, quantity, unit cost, line total, outstanding) and the
+  purchasing tab's material filter matches on any line. **Still to do: the
+  suggested-orders panel** to review a forecast, raise the orders and place
+  them.
 - *Step 3* — `/api/catalog` exposes receivable orders; warehouse receiving
   quotes one.
 - *Step 4* — the pending-receipt queue and its idempotency ledger (the careful

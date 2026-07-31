@@ -20,10 +20,19 @@ function plant() {
     onOrder:0, notes:'', composition:[], lots:[] });
   return d;
 }
+// An order carries its material, quantity and cost on a line. These fixtures
+// still name them at the top level for brevity, so the helper routes them onto
+// a single line - which is the shape a one-material order has anyway.
 const po = (d, over) => {
-  const row = { id:'PO1', reference:'PO-1', rawMaterialId:'RM1', supplier:'Acme',
-    orderDate:'2026-01-01', qty:1000, unitCost:4.5, expectedDate:'2026-02-01',
-    status:'Ordered', notes:'', receipts:[], ...over };
+  const o = { qty:1000, unitCost:4.5, rawMaterialId:'RM1', packagingId:'', containerCount:0, ...over };
+  const row = { id:'PO1', reference:'PO-1', supplier:'Acme',
+    orderDate:'2026-01-01', expectedDate:'2026-02-01',
+    status:'Ordered', notes:'', receipts:[],
+    lines:[{ id:'L1', rawMaterialId:o.rawMaterialId, qty:o.qty, unitCost:o.unitCost,
+             packagingId:o.packagingId, containerCount:o.containerCount, notes:'' }],
+    ...over };
+  delete row.qty; delete row.unitCost; delete row.rawMaterialId;
+  delete row.packagingId; delete row.containerCount;
   d.purchaseOrders.push(row);
   return row;
 };

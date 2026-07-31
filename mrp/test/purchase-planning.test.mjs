@@ -5,7 +5,8 @@
 import { seedData, repo, tx, suggestPurchaseOrders,
          unitsPerContainer, packagingLabel, qtyFromContainers, containersFromQty,
          poTotalCost, poContainerSummary, poPackaging, rawStockOnHand,
-         nextPoReference, poOutstanding, poReceivedQty, openOrderQty } from '/tmp/core.mjs';
+         nextPoReference, poOutstanding, poReceivedQty, openOrderQty,
+         poOrderedQty, poLineOutstanding, poDerivedStatus } from '/tmp/core.mjs';
 
 let pass = 0, fail = 0;
 const ok = (n, c, x) => { if (c) { pass++; console.log('  PASS  ' + n); }
@@ -36,9 +37,11 @@ ok('either half alone still reads', packagingLabel({ size: '', packageType: 'dru
 ok('no packaging reads as nothing', packagingLabel(null) === '');
 
 console.log('\n--- what an order is worth ---');
-ok('total is quantity x unit cost', poTotalCost({ qty: 400, unitCost: 2.5 }) === 1000);
-ok('a missing cost is zero, not NaN', poTotalCost({ qty: 400 }) === 0);
-ok('an empty order is worth nothing', poTotalCost({}) === 0);
+ok('total is the sum of the lines', poTotalCost({ lines: [{ qty: 400, unitCost: 2.5 }] }) === 1000);
+ok('several lines add up',
+   poTotalCost({ lines: [{ qty: 400, unitCost: 2.5 }, { qty: 100, unitCost: 3 }] }) === 1300);
+ok('a missing cost is zero, not NaN', poTotalCost({ lines: [{ qty: 400 }] }) === 0);
+ok('an order with no lines is worth nothing', poTotalCost({ lines: [] }) === 0 && poTotalCost({}) === 0);
 
 console.log('\n--- the forecast ---');
 {
@@ -49,7 +52,7 @@ console.log('\n--- the forecast ---');
   const raw = D.rawMaterials[0];
   raw.lots.forEach(l => { l.qty = 0; });
   raw.onOrder = 0;
-  D.purchaseOrders = D.purchaseOrders.filter(po => po.rawMaterialId !== raw.id);
+  D.purchaseOrders = D.purchaseOrders.filter(po => !(po.lines || []).some(l => l.rawMaterialId === raw.id));
 
   const rows = suggestPurchaseOrders(D, { today: '2026-07-31' });
   ok('a material below its reorder point is suggested', rows.some(r => r.rawMaterialId === raw.id));
@@ -67,17 +70,84 @@ console.log('\n--- the forecast ---');
   // Raising the orders should satisfy the forecast that produced them.
   const before = D.purchaseOrders.length;
   const { created } = tx.raisePurchaseOrders(D, rows);
-  ok('one order per suggestion', created.length === rows.length && D.purchaseOrders.length === before + rows.length);
+  ok('the suggestions are raised as lines across the new orders',
+     created.reduce((n, po) => n + (po.lines || []).length, 0) === rows.length);
+  ok('orders are grouped, never more than one per suggestion',
+     created.length <= rows.length && D.purchaseOrders.length === before + created.length);
   ok('orders are raised as drafts, not silently placed', created.every(po => po.status === 'Draft'));
   ok('every reference is unique',
      new Set(D.purchaseOrders.map(p => p.reference)).size === D.purchaseOrders.length);
-  ok('the order carries the container and how many', created.every(po => po.packagingId && po.containerCount > 0));
-  ok('the ordered quantity is receivable in full', created.every(po => poOutstanding(po) === po.qty));
+  ok('every line carries its container and how many',
+     created.every(po => (po.lines || []).length > 0 && po.lines.every(l => l.packagingId && l.containerCount > 0)));
+  ok('the ordered quantity is receivable in full',
+     created.every(po => Math.abs(poOutstanding(po) - po.lines.reduce((s, l) => s + l.qty, 0)) < 0.001));
   ok('nothing is received yet', created.every(po => poReceivedQty(po) === 0));
   ok('the order now counts as on order for the material', openOrderQty(D, raw.id) >= row.qty - 0.001);
   ok('the forecast no longer asks for what is now on order',
      !suggestPurchaseOrders(D, { today: '2026-07-31' }).some(r => r.rawMaterialId === raw.id));
   ok('the order reads with its container count', /^\d+ × /.test(poContainerSummary(D, created[0])));
+}
+
+console.log('\n--- one order, several lines ---');
+{
+  // The case that motivated lines: the same material ordered in two container
+  // sizes, which the warehouse receives and stores as separate stock.
+  const D = seedData();
+  const raw = D.rawMaterials[0];
+  const [small, large] = [
+    { id: 'pk-small', sku: raw.sku + '-SM', packageType: 'sack', size: '60 kg', unitsPerPackage: 60, packagesPerSlot: 12, isDefault: true },
+    { id: 'pk-large', sku: raw.sku + '-LG', packageType: 'tote', size: '1000 kg', unitsPerPackage: 1000, packagesPerSlot: 1, isDefault: false }
+  ];
+  raw.packagings = [small, large];
+  // Clear the seed's own orders for this material so the figures below are
+  // about these two lines and nothing else.
+  D.purchaseOrders = D.purchaseOrders.filter(po => !(po.lines || []).some(l => l.rawMaterialId === raw.id));
+
+  const { created } = tx.raisePurchaseOrders(D, [
+    { rawMaterialId: raw.id, supplier: 'Acme', qty: 600, unitCost: 5, packagingId: 'pk-small', containerCount: 10, expectedDate: '2026-09-01' },
+    { rawMaterialId: raw.id, supplier: 'Acme', qty: 3000, unitCost: 4.5, packagingId: 'pk-large', containerCount: 3, expectedDate: '2026-09-08' }
+  ]);
+  ok('both sizes land on one order for the supplier', created.length === 1 && created[0].lines.length === 2);
+  const po = created[0];
+  ok('each line keeps its own container', po.lines[0].packagingId === 'pk-small' && po.lines[1].packagingId === 'pk-large');
+  ok('each line keeps its own price', po.lines[0].unitCost === 5 && po.lines[1].unitCost === 4.5);
+  ok('ordered quantity is the sum of the lines', poOrderedQty(po) === 3600);
+  ok('order value is the sum of the lines', Math.abs(poTotalCost(po) - (600 * 5 + 3000 * 4.5)) < 0.001);
+  ok('the order is expected when its slowest line is', po.expectedDate === '2026-09-08');
+  ok('the summary names both containers',
+     /10 × 60 kg sack/.test(poContainerSummary(D, po)) && /3 × 1000 kg tote/.test(poContainerSummary(D, po)));
+  ok('both lines count toward what is on order', Math.abs(openOrderQty(D, raw.id) - 3600) < 0.001);
+
+  // Receiving is per line, so one size arriving does not close the other.
+  tx.placePurchaseOrder(D, { purchaseOrderId: po.id });
+  const res = tx.receiveAgainstOrder(D, { purchaseOrderId: po.id, lineId: po.lines[1].id, qty: 3000, lotNumber: 'TOTE-1' });
+  ok('a named line can be received', res.ok === true && res.line.id === po.lines[1].id);
+  ok('the lot is priced from that line, not the other', res.lot.unitCost === 4.5);
+  ok('that line is settled', poLineOutstanding(po, po.lines[1]) === 0);
+  ok('the other line is untouched', poLineOutstanding(po, po.lines[0]) === 600);
+  ok('the order as a whole is only part received', poDerivedStatus(po) === 'Part received');
+  ok('and stays receivable', tx.receivablePurchaseOrders(D).some(p => p.id === po.id));
+
+  tx.receiveAgainstOrder(D, { purchaseOrderId: po.id, lineId: po.lines[0].id, qty: 600, lotNumber: 'SACK-1' });
+  ok('receiving the rest completes the order', poDerivedStatus(po) === 'Received');
+  ok('each delivery is attributed to its own line',
+     po.receipts.length === 2 && new Set(po.receipts.map(r => r.lineId)).size === 2);
+  ok('two separate stock lots were created',
+     raw.lots.filter(l => ['TOTE-1', 'SACK-1'].includes(l.lotNumber)).length === 2);
+}
+
+console.log('\n--- a delivery need not name a line ---');
+{
+  const D = seedData();
+  const raw = D.rawMaterials[0];
+  const { created } = tx.raisePurchaseOrders(D, [
+    { rawMaterialId: raw.id, supplier: 'Solo', qty: 100, unitCost: 2 }
+  ]);
+  const po = created[0];
+  tx.placePurchaseOrder(D, { purchaseOrderId: po.id });
+  const res = tx.receiveAgainstOrder(D, { purchaseOrderId: po.id, qty: 40, lotNumber: 'X' });
+  ok('a single-line order receives without ceremony', res.ok === true);
+  ok('and the receipt is still attributed to the line', po.receipts[0].lineId === po.lines[0].id);
 }
 
 console.log('\n--- raising is defensive ---');
@@ -108,10 +178,10 @@ console.log('\n--- receiving against the order still works end to end ---');
   const raw = D.rawMaterials[0];
   raw.lots.forEach(l => { l.qty = 0; });
   raw.onOrder = 0;
-  D.purchaseOrders = D.purchaseOrders.filter(po => po.rawMaterialId !== raw.id);
+  D.purchaseOrders = D.purchaseOrders.filter(po => !(po.lines || []).some(l => l.rawMaterialId === raw.id));
   const rows = suggestPurchaseOrders(D, { today: '2026-07-31' }).filter(r => r.rawMaterialId === raw.id);
   const po = tx.raisePurchaseOrders(D, rows).created[0];
-  const half = po.qty / 2;
+  const half = po.lines[0].qty / 2;
 
   ok('a draft order is not receivable until it is placed',
      !tx.receivablePurchaseOrders(D).some(p => p.id === po.id));
@@ -124,7 +194,7 @@ console.log('\n--- receiving against the order still works end to end ---');
   ok('it creates a stock lot', !!first.lot && first.lot.qty === half);
   ok('the order shows part received', po.status === 'Part received');
   ok('the balance is still outstanding', Math.abs(poOutstanding(po) - half) < 0.001);
-  ok('the lot is priced from the order', first.lot.unitCost === po.unitCost);
+  ok('the lot is priced from the line', first.lot.unitCost === po.lines[0].unitCost);
 
   const second = tx.receiveAgainstOrder(D, { purchaseOrderId: po.id, date: '2026-08-09', qty: half, lotNumber: 'DOCK-2' });
   ok('the balance can be received', second.ok === true);
@@ -132,7 +202,8 @@ console.log('\n--- receiving against the order still works end to end ---');
   ok('nothing is left outstanding', poOutstanding(po) === 0);
   ok('each delivery is its own receipt', (po.receipts || []).length === 2);
   ok('every receipt points at the lot it created', (po.receipts || []).every(r => !!r.lotId));
-  ok('the stock landed on the material', rawStockOnHand(D.rawMaterials.find(r => r.id === raw.id)) >= po.qty - 0.001);
+  ok('the stock landed on the material',
+     rawStockOnHand(D.rawMaterials.find(r => r.id === raw.id)) >= po.lines[0].qty - 0.001);
   ok('a completed order drops out of the receivable list',
      !tx.receivablePurchaseOrders(D).some(p => p.id === po.id));
 }
