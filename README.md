@@ -12,6 +12,11 @@ A single platform combining two existing applications over one shared backend,
   reconciliation counts, roles/permissions, and QR label generation. Vanilla
   HTML/JS. Seeds **Business Unit 2** (to be named).
 - **Backend** (`api/`) — Vercel serverless functions over Postgres (Neon).
+  Multi-tenant by Business Unit: `/api/business-units` (list/create/rename/delete),
+  `/api/state?bu=&module=` (per-BU per-module data), `/api/global?key=` (shared
+  data such as the physical warehouse map). Needs a `POSTGRES_URL` env var (the
+  Vercel/Neon Storage integration provides it); tables are auto-created on first
+  request and seeded with **Evoia** (BU1) and **Liventia** (BU2).
 
 > Status: **Phase 0 — baseline assembled.** Both modules are present as-is over a
 > clean structure with the MRP test gate wired and passing. Integration work

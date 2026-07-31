@@ -1,64 +1,61 @@
-// EVWB shared inventory database endpoint.
-// Stores the entire app "state" object as one JSON row in Postgres (Neon,
-// connected via the Vercel Storage integration). This keeps the live
-// inventory data separate from the app code, so redeploying the app never
-// touches real inventory data, and every location/device reads and writes
-// the same shared record.
+// Per-Business-Unit, per-module state endpoint.
 //
-// GET  /api/state  -> { data: <state object or null>, updatedAt: <ISO string or null> }
-// POST /api/state   body: { data: <state object> } -> { ok: true }
+// Stores a module's app "state" object as one JSON row, scoped to a Business
+// Unit, so the live inventory data stays separate from the app code (redeploying
+// never touches data) and every device reads/writes the same shared record for
+// that BU.
 //
-// Note: this endpoint has no authentication of its own. Access control for
-// who can view/edit inventory is still enforced client-side in the app (same
-// as before this change). Anyone with the deployment URL and this route path
-// could technically read or write state directly. Flagged as a known
-// limitation, not a new regression introduced by this change.
+//   GET  /api/state?bu=<id>&module=<mrp|warehouse>
+//        -> { data: <state object or null>, updatedAt: <ISO string or null> }
+//   POST /api/state?bu=<id>&module=<mrp|warehouse>
+//        body { data: <state object> } -> { ok: true }
+//
+// Back-compat: with no query params this resolves to the legacy target
+// (Business Unit 2 "Liventia", warehouse module) so the pre-tenancy warehouse
+// build keeps working until the app shell passes bu/module explicitly (Phase 2).
+//
+// Note: this endpoint has no authentication of its own. Access control for who
+// may view/edit inventory is deferred to the downstream security developer and
+// belongs at this API layer. Anyone with the deployment URL and this route could
+// currently read or write state directly. Flagged as a known, intentional gap
+// for the sanitized-data build — not a regression.
 
-const { sql } = require('@vercel/postgres');
+'use strict';
 
-const ROW_ID = 'main';
-
-async function ensureTable() {
-  await sql`
-    CREATE TABLE IF NOT EXISTS app_state (
-      id text PRIMARY KEY,
-      data jsonb NOT NULL,
-      updated_at timestamptz NOT NULL DEFAULT now()
-    )
-  `;
-}
+const db = require('./_db');
+const T = require('./_tenancy');
 
 module.exports = async function handler(req, res) {
   try {
-    await ensureTable();
+    await db.ensureSchema();
+
+    const bu = req.query.bu || T.LEGACY_DEFAULT_BU;
+    const module = req.query.module || T.LEGACY_DEFAULT_MODULE;
+
+    if (!T.validateModule(module)) {
+      return res.status(400).json({ error: `Unknown module "${module}"` });
+    }
+    if (!(await db.unitExists(bu))) {
+      return res.status(404).json({ error: `Unknown business unit "${bu}"` });
+    }
 
     if (req.method === 'GET') {
-      const { rows } = await sql`SELECT data, updated_at FROM app_state WHERE id = ${ROW_ID}`;
-      if (rows.length === 0) {
-        return res.status(200).json({ data: null, updatedAt: null });
-      }
-      return res.status(200).json({ data: rows[0].data, updatedAt: rows[0].updated_at });
+      return res.status(200).json(await db.getModuleState(bu, module));
     }
 
     if (req.method === 'POST') {
-      const body = req.body || {};
-      const data = body.data;
+      const data = (req.body || {}).data;
       if (!data || typeof data !== 'object') {
         return res.status(400).json({ error: 'Missing or invalid "data" in request body' });
       }
-      const json = JSON.stringify(data);
-      await sql`
-        INSERT INTO app_state (id, data, updated_at)
-        VALUES (${ROW_ID}, ${json}::jsonb, now())
-        ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()
-      `;
+      await db.setModuleState(bu, module, data);
       return res.status(200).json({ ok: true });
     }
 
     res.setHeader('Allow', 'GET, POST');
     return res.status(405).json({ error: 'Method not allowed' });
   } catch (err) {
-    console.error('EVWB /api/state error:', err);
+    console.error('EVOIA /api/state error:', err);
     return res.status(500).json({ error: String((err && err.message) || err) });
   }
 };

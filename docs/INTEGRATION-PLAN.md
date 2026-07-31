@@ -12,9 +12,11 @@ roadmap, and the open questions.
    modules** over it (no full rewrite of either into the other's stack).
 3. **Tenancy:** the platform is **multi-tenant by Business Unit (BU)**.
    - BU 1 = **Evoia** — seeded from the MRP dataset.
-   - BU 2 = *(to be named)* — seeded from the Warehouse SSB/SOS dataset.
-   - Users can **add and name BU 3+**.
+   - BU 2 = **Liventia** — seeded from the Warehouse SSB/SOS dataset.
+   - Users can **add and name BU 3+**, and **every BU name is editable** (rename).
    - A global BU selector scopes the whole app to one BU at a time.
+   - **Physical space is shared (Option A, confirmed):** one global warehouse
+     map; pallets/inventory are per-BU, tagged and filterable on that map.
 4. **Auth:** intentionally **deferred**. Build on sanitized data. Endpoints are
    structured so an auth middleware slots in cleanly for the downstream security
    developer. `/api/state` currently has no authentication — see "Handoff to
@@ -27,22 +29,15 @@ pallets, and history are its own. Both modules operate on the **currently
 selected BU's** data. BU 1 happens to arrive rich in MRP data and BU 2 rich in
 warehouse data, but architecturally every BU can use both modules.
 
-### Open decision — shared vs. isolated physical space  ⚠️ NEEDS CONFIRMATION
+### Shared physical space — Option A (CONFIRMED)
 
-The brief says the BUs are "operating from **the same space**." That implies the
-**physical warehouse map** (zones, racks, floor coordinates) is a **shared,
-global** layout, while the **inventory that sits in it** is per-BU.
+The BUs operate from **the same space**, so the **physical warehouse map** (zones,
+racks, floor coordinates) is a **shared, global** layout, while the **inventory
+that sits in it** is per-BU: every pallet/lot is tagged with its owning BU; the
+map shows all pallets and the BU selector filters/highlights one BU's stock. This
+answers "whose pallet is in A1?" and prevents two BUs being assigned the same slot.
 
-- **Option A — shared map, per-BU inventory (recommended, matches the brief):**
-  one physical layout; every pallet/lot is tagged with its owning BU; the map
-  shows all pallets and the BU selector filters/highlights one BU's stock.
-  Answers "whose pallet is in A1?" and prevents two BUs being assigned the same
-  slot.
-- **Option B — fully isolated:** each BU has its own separate map/space. Simpler
-  data model, but doesn't reflect a shared building and can't detect cross-BU
-  slot conflicts.
-
-Proposed scoping under Option A:
+Scoping under Option A:
 
 | Data | Scope |
 |---|---|
@@ -122,9 +117,9 @@ canonical lot/batch key both sides read and write.
 
 ## Open questions for the product owner
 
-1. **Shared vs. isolated physical space** (see ⚠️ above). Recommend Option A.
-2. Confirm `warehouse/index.html` is canonical and `EVWB-REV172.html` can be
-   deleted.
-3. A name for **Business Unit 2**.
+1. ~~Shared vs. isolated physical space~~ — **resolved: Option A (shared).**
+2. ~~A name for Business Unit 2~~ — **resolved: Liventia (editable).**
+3. Confirm `warehouse/index.html` is canonical and `EVWB-REV172.html` can be
+   deleted (currently parked in `warehouse/archive/`).
 4. Are **item types / products** shared across BUs or fully per-BU? (Assumed
-   per-BU.)
+   per-BU. Physical *space* is shared; product catalogs are not.)
