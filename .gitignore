@@ -1,0 +1,25 @@
+# Vercel
+.vercel
+
+# Dependencies
+node_modules/
+
+# ...except the committed lucide-react stub the render suite resolves against
+# (empty <span> per icon, so the render tests need no real icon dependency).
+!mrp/test/rendertest/node_modules/
+!mrp/test/rendertest/node_modules/lucide-react/
+!mrp/test/rendertest/node_modules/lucide-react/index.js
+
+# Build / test scratch
+/tmp/
+mrp/test/rendertest/app.tsx
+mrp/test/rendertest/app.js
+mrp/test/rendertest/*.js.map
+
+# Source snapshots — kept in git history on the original patch branches,
+# not carried in the integrated tree (they duplicate the canonical files).
+*.zip
+
+# OS / editor
+.DS_Store
+*.swp

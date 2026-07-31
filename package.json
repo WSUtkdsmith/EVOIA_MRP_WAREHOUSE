@@ -1,0 +1,18 @@
+{
+  "name": "evoia-mrp-warehouse",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Integrated MRP + Warehouse platform, multi-tenant by Business Unit. Vercel web app with a shared Postgres backend and two front-end modules.",
+  "scripts": {
+    "test": "SKIP_TSC=1 bash mrp/tools/run-tests.sh",
+    "test:full": "bash mrp/tools/run-tests.sh"
+  },
+  "dependencies": {
+    "@vercel/postgres": "^0.10.0"
+  },
+  "devDependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.5.4"
+  }
+}
