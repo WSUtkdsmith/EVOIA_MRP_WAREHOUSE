@@ -6931,13 +6931,16 @@ function LotsTable({ lots, unit, onRowClick, showRemove, onRemove, dateLabel, on
    Lots editor (admin, direct catalog editing) - lot number, date,
    quantity, and notes only.
 ----------------------------------------------------------------*/
-function LotsEditor({ lots, onChange, unit, dateLabel, qcComponents, data, itemType, itemId, update }) {
+function LotsEditor({ lots, onChange, packagings, shelfLifeDays, unit, dateLabel, qcComponents, data, itemType, itemId, update }) {
   dateLabel = dateLabel || "Date";
   const [detailLotId, setDetailLotId] = useState(null);
   const [consumeLotId, setConsumeLotId] = useState(null);
+  const defaultPackagingId = (Array.isArray(packagings) && (packagings.find(p => p.isDefault) || packagings[0]) || {}).id || "";
   const addLot = () => onChange([...lots, { id: uid(), lotNumber: "", date: todayStr(), qty: 0,
     producedQty: "", unitCost: "", batchId: "", processId: "",
-    notes: "", sources: [], actualEquipment: [], actualLabor: [], qcChecks: [], usedDate: "", consumedDate: "" }]);
+    notes: "", sources: [], actualEquipment: [], actualLabor: [], qcChecks: [], usedDate: "", consumedDate: "",
+    packagingId: defaultPackagingId, expirationDate: "", productionDate: "", arrivalDate: "",
+    origin: "", mfg: "", orderRef: "", containerCount: "" }]);
   const updateLotById = (lotId, patch) => onChange(lots.map(l => l.id === lotId ? { ...l, ...patch } : l));
   const removeLotById = (lotId) => onChange(lots.filter(l => l.id !== lotId));
   const detailLot = detailLotId ? lots.find(l => l.id === detailLotId) : null;
@@ -6955,6 +6958,7 @@ function LotsEditor({ lots, onChange, unit, dateLabel, qcComponents, data, itemT
         <LotDetailModal
           data={data} itemType={itemType} itemId={itemId}
           lot={detailLot} unit={unit} dateLabel={dateLabel} qcComponents={qcComponents}
+          packagings={packagings} shelfLifeDays={shelfLifeDays}
           onSave={(patch) => { updateLotById(detailLotId, patch); setDetailLotId(null); }}
           onClose={() => setDetailLotId(null)}
         />
@@ -6976,9 +6980,17 @@ function LotsEditor({ lots, onChange, unit, dateLabel, qcComponents, data, itemT
 // hands the patch back up to the parent LotsEditor's own draft - matching
 // how the surrounding catalog modals already stage changes until their
 // own Save button is clicked.
-function LotDetailModal({ data, itemType, itemId, lot, unit, dateLabel, qcComponents, onSave, onClose }) {
+function LotDetailModal({ data, itemType, itemId, lot, unit, dateLabel, qcComponents, packagings, shelfLifeDays, onSave, onClose }) {
   const [f, setF] = useState(structuredClone(lot));
   const set = (k, v) => setF(prev => ({ ...prev, [k]: v }));
+  const pkgList = Array.isArray(packagings) ? packagings : [];
+  const addLotDays = (iso, n) => {
+    if (!iso || !n) return "";
+    const d = new Date(iso + "T00:00:00Z");
+    if (isNaN(d.getTime())) return "";
+    d.setUTCDate(d.getUTCDate() + Number(n));
+    return d.toISOString().slice(0, 10);
+  };
   const [uploadStatus, setUploadStatus] = useState("idle");
   const [uploadError, setUploadError] = useState("");
 
@@ -7031,6 +7043,42 @@ function LotDetailModal({ data, itemType, itemId, lot, unit, dateLabel, qcCompon
         <Field label="Consumed date" hint="Auto-set once this lot's quantity reaches zero"><input type="date" style={inputStyle} value={f.consumedDate || ""} onChange={e => set("consumedDate", e.target.value)} /></Field>
       </div>
       <Field label="Notes" span={2}><input style={inputStyle} value={f.notes} onChange={e => set("notes", e.target.value)} placeholder="Supplier ref, QC observations…" /></Field>
+
+      <div style={{ borderTop: "1px solid #EEF0EA", marginTop: 14, paddingTop: 14 }}>
+        <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8 }}>Warehouse / physical</div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+          <Field label="Packaging" hint="Which storable SKU / container this lot is">
+            <select style={inputStyle} value={f.packagingId || ""} onChange={e => set("packagingId", e.target.value)}>
+              <option value="">—</option>
+              {pkgList.map(p => <option key={p.id} value={p.id}>{[p.sku, p.size, p.packageType].filter(Boolean).join(" · ")}</option>)}
+            </select>
+          </Field>
+          <Field label="Production date">
+            <input type="date" style={inputStyle} value={f.productionDate || ""} onChange={e => {
+              const productionDate = e.target.value;
+              setF(prev => {
+                const next = { ...prev, productionDate };
+                if (productionDate && !prev.expirationDate && shelfLifeDays) next.expirationDate = addLotDays(productionDate, shelfLifeDays);
+                return next;
+              });
+            }} />
+          </Field>
+          <Field label="Arrival date"><input type="date" style={inputStyle} value={f.arrivalDate || ""} onChange={e => set("arrivalDate", e.target.value)} /></Field>
+          <Field label="Expiration date" hint={shelfLifeDays ? "Production date + " + shelfLifeDays + " day shelf life" : "Enter or compute from production date"}>
+            <div style={{ display: "flex", gap: 6 }}>
+              <input type="date" style={inputStyle} value={f.expirationDate || ""} onChange={e => set("expirationDate", e.target.value)} />
+              {shelfLifeDays && f.productionDate && (
+                <button type="button" onClick={() => set("expirationDate", addLotDays(f.productionDate, shelfLifeDays))}
+                  style={{ fontSize: 11, padding: "0 8px", borderRadius: 6, border: "1px solid #D7DAD3", background: "#fff", color: "#5B6470", cursor: "pointer", whiteSpace: "nowrap" }}>Auto</button>
+              )}
+            </div>
+          </Field>
+          <Field label="Origin / source"><input style={inputStyle} value={f.origin || ""} onChange={e => set("origin", e.target.value)} placeholder="Supplier or plant" /></Field>
+          <Field label="Manufacturer"><input style={inputStyle} value={f.mfg || ""} onChange={e => set("mfg", e.target.value)} placeholder="e.g. LV, EV" /></Field>
+          <Field label="Order ref"><input style={inputStyle} value={f.orderRef || ""} onChange={e => set("orderRef", e.target.value)} placeholder="PO / SO number" /></Field>
+          <Field label="Container count" hint="How many containers in this lot"><input type="number" style={inputStyle} value={f.containerCount ?? ""} onChange={e => set("containerCount", e.target.value === "" ? "" : (parseFloat(e.target.value) || 0))} /></Field>
+        </div>
+      </div>
 
       <div style={{ borderTop: "1px solid #EEF0EA", marginTop: 14, paddingTop: 14 }}>
         <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8 }}>Attachment</div>
@@ -8571,7 +8619,7 @@ function RawMaterialModal({ data, id, onClose, update }) {
 
       <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 14 }}>
         <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 10 }}>Lots on hand</div>
-        <LotsEditor lots={f.lots} onChange={(lots) => set("lots", lots)} unit={f.unit} dateLabel="Received" qcComponents={qcComponentCandidates(data, f.composition)} data={data} itemType="raw" itemId={id} update={update} />
+        <LotsEditor lots={f.lots} onChange={(lots) => set("lots", lots)} packagings={f.packagings} shelfLifeDays={f.shelfLifeDays} unit={f.unit}dateLabel="Received" qcComponents={qcComponentCandidates(data, f.composition)} data={data} itemType="raw" itemId={id} update={update} />
       </div>
 
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
@@ -8794,7 +8842,7 @@ function IntermediateProductModal({ data, id, onClose, update }) {
         <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 10 }}>
           For manual stock corrections. To log a real production batch with sourcing and actual time, use "Log batch" from the Processes tab instead.
         </div>
-        <LotsEditor lots={f.lots} onChange={(lots) => set("lots", lots)} unit={f.unit} dateLabel="Recorded" qcComponents={qcComponentCandidates(data, f.autoComposition ? computeEffectiveComposition(data, "intermediate", id) : f.composition)} data={data} itemType="intermediate" itemId={id} update={update} />
+        <LotsEditor lots={f.lots} onChange={(lots) => set("lots", lots)} packagings={f.packagings} shelfLifeDays={f.shelfLifeDays} unit={f.unit}dateLabel="Recorded" qcComponents={qcComponentCandidates(data, f.autoComposition ? computeEffectiveComposition(data, "intermediate", id) : f.composition)} data={data} itemType="intermediate" itemId={id} update={update} />
       </div>
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
         <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
@@ -8864,7 +8912,7 @@ function FinishedGoodModal({ data, id, onClose, update }) {
         <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 10 }}>
           For manual stock corrections. To log a real production or repackaging batch with sourcing and actual time, use "Log batch" from the Processes tab instead.
         </div>
-        <LotsEditor lots={f.lots} onChange={(lots) => set("lots", lots)} unit={f.unit} dateLabel="Recorded" qcComponents={qcComponentCandidates(data, f.autoComposition ? computeEffectiveComposition(data, "finished", id) : f.composition)} data={data} itemType="finished" itemId={id} update={update} />
+        <LotsEditor lots={f.lots} onChange={(lots) => set("lots", lots)} packagings={f.packagings} shelfLifeDays={f.shelfLifeDays} unit={f.unit}dateLabel="Recorded" qcComponents={qcComponentCandidates(data, f.autoComposition ? computeEffectiveComposition(data, "finished", id) : f.composition)} data={data} itemType="finished" itemId={id} update={update} />
       </div>
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
         <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
@@ -10084,7 +10132,7 @@ function WasteStreamModal({ data, id, onClose, update }) {
           <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 10 }}>
             Normally populated automatically when a batch is logged against a process that consumes this component. Editable here for manual corrections.
           </div>
-          <LotsEditor lots={f.lots} onChange={(lots) => set("lots", lots)} unit={f.unit} dateLabel="Generated" />
+          <LotsEditor lots={f.lots} onChange={(lots) => set("lots", lots)} packagings={f.packagings} shelfLifeDays={f.shelfLifeDays} unit={f.unit}dateLabel="Generated" />
         </div>
       )}
 

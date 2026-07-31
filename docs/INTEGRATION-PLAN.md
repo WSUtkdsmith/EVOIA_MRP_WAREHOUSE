@@ -112,8 +112,14 @@ canonical lot/batch key both sides read and write.
     and a reusable `PackagingsEditor` (add/remove packagings, set the default).
     Verified by a server-render smoke test (react-dom/server) of every modal in
     add and edit mode plus the new components; logic gate 879, bundle rebuilt.
-  - *Step 2b (next)* — lot-level fields in `LotsEditor` (packaging selector,
-    production/arrival dates, computed expiry, origin/mfg/order-ref).
+  - *Step 2b — lot UI (done).* `LotDetailModal` gained a "Warehouse / physical"
+    section: packaging selector (the item's storable SKUs), production/arrival
+    dates, expiration (auto-computed from production date + shelf life, with an
+    Auto button, editable), and origin/mfg/order-ref/container-count. New lots
+    default to the item's default packaging. `packagings`/`shelfLifeDays` thread
+    from each modal draft through `LotsEditor`. Render-smoke verified.
+  - *Follow-up:* the dedicated `ReceivingModal` quick-receive flow could set
+    these on receipt too (lots are already editable via the catalog modals).
   - *Step 3* — warehouse reads the unified catalog to slot MRP items on the
     shared map.
 - **Phase 4 — Polish + handoff.** Address inherited MRP gaps (process-flow SVG,
