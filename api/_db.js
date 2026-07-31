@@ -18,6 +18,19 @@
 
 'use strict';
 
+// Some Vercel/Neon Storage integrations expose the Postgres connection string
+// under a name other than POSTGRES_URL (e.g. DATABASE_URL, POSTGRES_PRISMA_URL).
+// @vercel/postgres reads POSTGRES_URL by default, so alias a known alternative
+// into it when POSTGRES_URL itself is unset. This only fills a gap — it never
+// overrides an explicit POSTGRES_URL — so it cannot break the standard setup.
+if (!process.env.POSTGRES_URL) {
+  const alt = process.env.POSTGRES_PRISMA_URL
+    || process.env.DATABASE_URL
+    || process.env.POSTGRES_URL_NON_POOLING
+    || process.env.DATABASE_URL_UNPOOLED;
+  if (alt) process.env.POSTGRES_URL = alt;
+}
+
 const { sql } = require('@vercel/postgres');
 const T = require('./_tenancy');
 
