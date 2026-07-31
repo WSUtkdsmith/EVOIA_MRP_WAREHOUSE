@@ -27,8 +27,13 @@ A single platform combining two existing applications over one shared backend,
 ## Layout
 
 ```
+index.html                     # App shell: Business Unit selector + module launcher
 api/
-  state.js                     # Vercel /api/state endpoint (Postgres-backed)
+  _tenancy.js  _db.js          # tenancy helpers (pure) + SQL layer
+  business-units.js            # /api/business-units (list/create/rename/delete)
+  state.js                     # /api/state?bu=&module= (per-BU per-module data)
+  global.js                    # /api/global?key= (shared data, e.g. the map)
+  test/tenancy.test.js         # pure-logic tenancy tests
 mrp/
   mrp-console.jsx              # MRP application (React, single file)
   HANDOFF.md  AUDIT.md  CHANGELOG.md

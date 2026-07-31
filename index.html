@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Evoia — MRP + Warehouse</title>
+<style>
+:root{
+  --green:#2f6f43; --green-dark:#1f4f31; --green-soft:#e4f3ea;
+  --bg:#f5faf7; --panel:#ffffff; --line:#d5e3da; --text:#24342b; --muted:#66746c;
+  --amber:#d97500; --radius:16px;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:Segoe UI,Arial,sans-serif;color:var(--text);
+  background:linear-gradient(#f8fbf9,#edf6f1);min-height:100vh}
+.topbar{position:sticky;top:0;z-index:20;background:rgba(255,255,255,.96);
+  border-bottom:1px solid var(--line);box-shadow:0 2px 14px rgba(30,50,40,.06);
+  padding:14px 22px;display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}
+.brand .kicker{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--green);font-weight:900}
+.brand h1{font-size:24px;margin:2px 0 0}
+.bu{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.bu label{font-size:13px;font-weight:800;color:#51635a;text-transform:uppercase;letter-spacing:.08em}
+select,input{font:inherit;border:1px solid #ccdad2;border-radius:10px;padding:9px 10px;background:#fff;color:var(--text)}
+select{min-width:190px;font-weight:800}
+.btn{border:1px solid var(--line);background:#fff;border-radius:10px;padding:9px 12px;font-weight:800;color:var(--text);cursor:pointer}
+.btn.primary{background:var(--green);border-color:var(--green);color:#fff}
+.btn.small{padding:6px 9px;font-size:13px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+main{max-width:1040px;margin:0 auto;padding:26px 22px}
+.status{font-size:13px;color:var(--muted);margin:0 0 18px}
+.status .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);margin-right:6px;vertical-align:middle}
+.status.offline .dot{background:var(--amber)}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:18px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+  box-shadow:0 10px 28px rgba(31,64,45,.10);padding:22px;display:flex;flex-direction:column;gap:12px}
+.card h2{margin:0;font-size:20px}
+.card .tag{align-self:flex-start;font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.06em;
+  border-radius:999px;padding:3px 10px}
+.tag.live{background:var(--green-soft);color:var(--green-dark)}
+.tag.pending{background:#fff3e0;color:var(--amber)}
+.card p{margin:0;color:var(--muted);line-height:1.4;font-size:15px;flex:1}
+.card .go{display:flex;gap:10px;align-items:center}
+.mini{font-size:12.5px;color:var(--muted)}
+footer{max-width:1040px;margin:0 auto;padding:8px 22px 40px;color:var(--muted);font-size:12.5px}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand">
+    <div class="kicker">Evoia</div>
+    <h1>MRP + Warehouse</h1>
+  </div>
+  <div class="bu">
+    <label for="buSelect">Business Unit</label>
+    <select id="buSelect" aria-label="Select business unit"></select>
+    <button class="btn small" id="renameBu" title="Rename this business unit">Rename</button>
+    <button class="btn small primary" id="addBu" title="Add a business unit">+ Add</button>
+  </div>
+</div>
+
+<main>
+  <p class="status" id="status"><span class="dot"></span><span id="statusText">Loading business units…</span></p>
+  <div class="cards">
+    <section class="card">
+      <span class="tag live">Live</span>
+      <h2>Warehouse</h2>
+      <p>Physical warehouse map, pallet putaway &amp; picking, receiving/shipping,
+         reconciliation counts, damage capture and QR labels. Scoped to the
+         selected business unit; the physical space is shared across units.</p>
+      <div class="go">
+        <a class="btn primary" id="openWarehouse" href="#">Open Warehouse →</a>
+      </div>
+    </section>
+
+    <section class="card">
+      <span class="tag pending">Build pending</span>
+      <h2>MRP Console</h2>
+      <p>Purchasing, multi-stage production with lot genealogy, finite-capacity
+         scheduling, sales orders and lot-level costing. Comes online once its
+         React build step is wired for Vercel (Phase 2b).</p>
+      <div class="go">
+        <button class="btn" id="openMrp" disabled>Open MRP →</button>
+        <span class="mini">React module — transpile step in progress</span>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer>
+  Auth is intentionally deferred for the sanitized-data build; every module and
+  API endpoint is currently open. — <span id="buCount"></span>
+</footer>
+
+<script>
+// ---------------------------------------------------------------------------
+// Pure helpers (no DOM) — resolve the active BU from URL / storage / list.
+// ---------------------------------------------------------------------------
+var SELECTED_KEY = 'evoiaSelectedBU';
+// Fallback used only when /api/business-units is unreachable (e.g. no database
+// in a local/preview run), so the shell still renders and is demoable.
+var FALLBACK_UNITS = [{id:'evoia',name:'Evoia',seq:1},{id:'liventia',name:'Liventia',seq:2}];
+
+function resolveSelectedBu(units, urlBu, storedBu){
+  var ids = units.map(function(u){return u.id;});
+  if(urlBu && ids.indexOf(urlBu) !== -1) return urlBu;
+  if(storedBu && ids.indexOf(storedBu) !== -1) return storedBu;
+  return units.length ? units[0].id : null;
+}
+function moduleUrl(base, bu){
+  return base + (bu ? ('?bu=' + encodeURIComponent(bu)) : '');
+}
+
+// ---------------------------------------------------------------------------
+// Shell wiring
+// ---------------------------------------------------------------------------
+var state = { units: [], selected: null, online: false };
+function $(id){ return document.getElementById(id); }
+
+function urlParam(name){
+  try { return new URLSearchParams(location.search).get(name); } catch(e){ return null; }
+}
+function getStored(){ try { return localStorage.getItem(SELECTED_KEY); } catch(e){ return null; } }
+function setStored(v){ try { localStorage.setItem(SELECTED_KEY, v); } catch(e){} }
+
+async function loadUnits(){
+  try {
+    var resp = await fetch('/api/business-units');
+    if(!resp.ok) throw new Error('HTTP ' + resp.status);
+    var body = await resp.json();
+    state.units = (body && body.units) || [];
+    state.online = true;
+  } catch(e){
+    console.warn('business-units unreachable, using fallback:', e);
+    state.units = FALLBACK_UNITS.slice();
+    state.online = false;
+  }
+  state.selected = resolveSelectedBu(state.units, urlParam('bu'), getStored());
+  render();
+}
+
+function render(){
+  var sel = $('buSelect');
+  sel.innerHTML = '';
+  state.units.forEach(function(u){
+    var o = document.createElement('option');
+    o.value = u.id; o.textContent = u.name;
+    if(u.id === state.selected) o.selected = true;
+    sel.appendChild(o);
+  });
+  if(state.selected) setStored(state.selected);
+
+  var status = $('status'), text = $('statusText');
+  if(state.online){
+    status.className = 'status';
+    text.textContent = 'Connected to shared backend — ' + state.units.length + ' business unit(s).';
+  } else {
+    status.className = 'status offline';
+    text.textContent = 'Backend not reachable — showing seed units (Evoia, Liventia). Connect Postgres to go live.';
+  }
+  $('buCount').textContent = state.units.length + ' business unit(s)';
+
+  var wh = $('openWarehouse');
+  wh.href = moduleUrl('warehouse/index.html', state.selected);
+}
+
+$('buSelect').addEventListener('change', function(e){
+  state.selected = e.target.value;
+  setStored(state.selected);
+  render();
+});
+
+$('addBu').addEventListener('click', async function(){
+  var name = prompt('Name for the new business unit:');
+  if(name == null) return;
+  name = name.trim();
+  if(!name) return;
+  if(!state.online){ alert('Adding a business unit needs the backend (Postgres) connected.'); return; }
+  try {
+    var resp = await fetch('/api/business-units', {
+      method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:name})
+    });
+    var body = await resp.json();
+    if(!resp.ok) throw new Error(body.error || ('HTTP ' + resp.status));
+    state.selected = body.unit && body.unit.id;
+    await loadUnits();
+  } catch(e){ alert('Could not add business unit: ' + e.message); }
+});
+
+$('renameBu').addEventListener('click', async function(){
+  if(!state.selected) return;
+  var current = (state.units.find(function(u){return u.id===state.selected;})||{}).name || '';
+  var name = prompt('Rename business unit:', current);
+  if(name == null) return;
+  name = name.trim();
+  if(!name || name === current) return;
+  if(!state.online){ alert('Renaming needs the backend (Postgres) connected.'); return; }
+  try {
+    var resp = await fetch('/api/business-units?id=' + encodeURIComponent(state.selected), {
+      method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({name:name})
+    });
+    var body = await resp.json();
+    if(!resp.ok) throw new Error(body.error || ('HTTP ' + resp.status));
+    await loadUnits();
+  } catch(e){ alert('Could not rename business unit: ' + e.message); }
+});
+
+loadUnits();
+</script>
+</body>
+</html>

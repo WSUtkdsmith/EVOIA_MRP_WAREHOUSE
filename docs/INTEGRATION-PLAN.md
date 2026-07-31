@@ -80,10 +80,17 @@ canonical lot/batch key both sides read and write.
   `/api/business-units` (list / create / rename) and BU scoping on data
   endpoints. Migrate the MRP off `window.storage` onto the API. Structure for a
   later auth middleware.
-- **Phase 2 — App shell + BU selector.** One top-level shell hosting both modules
-  with a global Business Unit selector. Seed BU 1 (Evoia / MRP) and BU 2
-  (warehouse). Resolve the render-suite build so the full ~1,397-test gate runs
-  in CI.
+- **Phase 2a — App shell + BU selector (done).** Root `index.html` shell with a
+  global Business Unit selector (add / rename, backed by `/api/business-units`)
+  and launch cards per module. Graceful fallback to seed units when the backend
+  is unreachable. Warehouse wired to be BU-aware (`?bu=` → `/api/state?bu=&module=
+  warehouse`, per-BU localStorage key). Pure shell/warehouse helpers verified.
+- **Phase 2b — MRP on Vercel (next).** The MRP is 14.4k lines of React JSX using
+  `window.storage`; it cannot run in a browser as-is. Add a lightweight build
+  step (recommend **esbuild**: JSX → one bundle, no framework churn) and redirect
+  its `window.storage` reads/writes to `/api/state?bu=&module=mrp`. Then enable
+  the MRP launch card and resolve the render-suite build so the full ~1,397-test
+  gate runs in CI.
 - **Phase 3 — Unify the inventory spine.** Make MRP lots and warehouse pallet
   lines two views of the same stock; connect receiving/shipping across modules
   on the shared map.
@@ -119,7 +126,7 @@ canonical lot/batch key both sides read and write.
 
 1. ~~Shared vs. isolated physical space~~ — **resolved: Option A (shared).**
 2. ~~A name for Business Unit 2~~ — **resolved: Liventia (editable).**
-3. Confirm `warehouse/index.html` is canonical and `EVWB-REV172.html` can be
-   deleted (currently parked in `warehouse/archive/`).
-4. Are **item types / products** shared across BUs or fully per-BU? (Assumed
-   per-BU. Physical *space* is shared; product catalogs are not.)
+3. ~~Delete `EVWB-REV172.html`?~~ — **resolved: keep in `warehouse/archive/` as a
+   reference build.**
+4. ~~Item types / products shared or per-BU?~~ — **resolved: per-BU** (physical
+   space is shared; product catalogs are not).
