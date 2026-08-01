@@ -14542,6 +14542,15 @@ function buildPalletFromPoLine(poLine,order,opts){
    whether or not the MRP has been told yet. Counting pending receipts is the
    point: two people receiving the same delivery an hour apart should see the
    second one as already booked. */
+/* Whether a booking has been recorded in the MRP. The MRP's ledger is the
+   single source of truth for that, so the warehouse reads it rather than
+   trusting its own pending flag, which can only ever be a local guess. */
+function mrpReceiptApplied(line,appliedIds){
+  if(!line) return false;
+  if(Array.isArray(appliedIds) && appliedIds.indexOf(line.id)!==-1) return true;
+  return line.mrpReceiptStatus==='applied';
+}
+
 function mrpPoLineReceived(pallets,poLineId){
   let qty=0; const palletIds=[]; let pending=0;
   (pallets||[]).forEach(p=>{

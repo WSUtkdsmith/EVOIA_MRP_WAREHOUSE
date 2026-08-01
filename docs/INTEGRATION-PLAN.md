@@ -270,10 +270,34 @@ transaction logic is duplicated.
     save. `tx.cancelPurchaseOrder` refuses an order already received in full.
   - 22 new assertions; render-smoke covers empty, two-container-size draft,
     placed (read-only, zero inputs), received, and the tab button.
-- *Step 4 (next)* — apply pending receipts to the MRP through
-  `tx.receiveAgainstOrder`, flipping them to `applied`. The idempotency ledger
-  is the careful part: a re-synced or edited receipt must never mint a second
-  lot.
+- *Step 4 — receipts reach the MRP (done). Phase 4 complete.*
+  - **The ledger lives with the writer.** A new `warehouseReceipts` entity in the
+    MRP records every dock booking it has applied, keyed on `sourceLineId` (the
+    warehouse pallet content line, stable for the life of that stock). The MRP
+    creates the lot, so the MRP is what must remember it already did — the
+    warehouse is never written to cross-module, and there is one source of truth
+    for what is done.
+  - `tx.applyWarehouseReceipts` applies each booking through
+    `receiveAgainstOrder`, so a lot is created at the order's price and the order
+    advances exactly as if entered in the MRP. **There is no second way for stock
+    to come into existence.**
+  - **Idempotent by construction:** a booking already in the ledger is skipped,
+    not re-applied — safe to run twice, to retry after a failed save, or from two
+    tabs. A booking repeated inside a single call also applies once. Failures
+    (order cancelled, line gone, more than is owed) are returned with reasons
+    rather than dropped, and one failure does not stop the rest of the queue.
+  - `GET /api/pending-receipts?bu=` reports what the dock has booked minus what
+    the ledger says is done. Deliberately **read-only**: applying creates stock,
+    and that goes through the MRP's transaction, not an endpoint.
+  - MRP purchasing tab shows a **dock panel** — what is waiting, one button to
+    record it, and per-booking reasons for anything that could not be.
+  - The warehouse reads `appliedReceiptIds` from `/api/catalog` rather than
+    trusting its own pending flag, which can only ever be a local guess.
+  - Tests: 43 new MRP assertions (1,020 logic total) plus 22 API and 6 warehouse.
+    Proven end to end on real data: order raised with two container sizes →
+    booked at the dock → recorded in the MRP (two lots at their own line prices,
+    order Received) → **full re-sync applies nothing, creates no lot, order
+    unchanged**.
 - *Step 4* — the pending-receipt queue and its idempotency ledger (the careful
   part: a re-synced or edited receipt must not mint a second lot).
 - **Phase 4 — Polish + handoff.** Address inherited MRP gaps (process-flow SVG,

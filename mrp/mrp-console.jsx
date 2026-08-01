@@ -740,6 +740,34 @@ const SCHEMA = {
     }
   },
 
+  /* Deliveries booked in at the dock and applied here.
+
+     The warehouse books a delivery the moment it lands, because the pallet
+     is real and has to be pickable. Telling the MRP is a separate step, so
+     something has to remember which of those bookings have already been
+     applied - otherwise a re-sync, a retry, or two people pressing Apply
+     mints a second stock lot and quietly inflates both inventory and cost.
+
+     That ledger lives here, with the side that does the writing, rather
+     than in the warehouse: the MRP is what creates the lot, so the MRP is
+     what must know it already did. `sourceLineId` is the warehouse pallet
+     content line, which is stable for the life of that stock, and it is the
+     natural key - one booking can only ever be applied once. */
+  warehouseReceipts: {
+    table: "warehouse_receipts",
+    label: "Warehouse receipt",
+    pk: "id",
+    naturalKey: "sourceLineId",
+    columns: {
+      id: "str", sourceLineId: "str!", palletId: "str",
+      purchaseOrderId: "ref:purchaseOrders", purchaseOrderLineId: "str",
+      orderRef: "str", batch: "str", qty: "num!",
+      receivedAt: "date", appliedAt: "date", lotId: "str", notes: "str"
+    },
+    embeds: {},
+    children: {}
+  },
+
   salesOrders: {
     table: "sales_orders",
     label: "Sales order",
@@ -1262,7 +1290,7 @@ const IMPORT_ORDER = [
   "components", "operating_calendars", "calendar_closures", "calendar_overrides",
   "equipment", "customers", "waste_streams", "processes",
   "composition", "packagings", "process_inputs", "process_equipment", "process_outputs",
-  "maintenance", "production_targets", "purchase_orders", "purchase_order_lines",
+  "maintenance", "production_targets", "purchase_orders", "purchase_order_lines", "warehouse_receipts",
   "sales_orders", "sales_order_lines", "fulfilment_cancellations",
   "production_schedule", "schedule_revisions",
   "lots", "lot_sources", "lot_actual_equipment", "lot_actual_labor", "lot_qc_checks",
@@ -2014,6 +2042,71 @@ const tx = {
     if (expectedDate) po.expectedDate = expectedDate;
     po.status = "Ordered";
     return { ok: true, po };
+  },
+
+  /* Apply deliveries booked at the dock to the MRP.
+
+     Each booking is applied through receiveAgainstOrder, so a lot is
+     created at the order's price and the order advances exactly as it
+     would if the receipt had been entered here - there is no second,
+     parallel way for stock to come into existence.
+
+     Idempotent by construction: a booking whose sourceLineId is already in
+     the ledger is skipped, not re-applied. That is what makes this safe to
+     run twice, to retry after a failed save, or to run from two tabs at
+     once. Applying is all-or-nothing per booking - a booking that cannot be
+     applied (its order was cancelled, the line is gone, it would overrun
+     what is still owed) is reported back rather than silently dropped, so
+     the dock can be told why. */
+  applyWarehouseReceipts(db, bookings) {
+    if (!Array.isArray(db.warehouseReceipts)) db.warehouseReceipts = [];
+    const seen = new Set(db.warehouseReceipts.map(r => r.sourceLineId));
+    const applied = [], skipped = [], failed = [];
+
+    (bookings || []).forEach(b => {
+      if (!b || !b.sourceLineId) return;
+      if (seen.has(b.sourceLineId)) { skipped.push({ booking: b, reason: "Already applied" }); return; }
+
+      const po = b.purchaseOrderId ? repo.find(db, "purchaseOrders", b.purchaseOrderId) : null;
+      if (!po) { failed.push({ booking: b, reason: "That purchase order no longer exists." }); return; }
+      if (po.status === "Cancelled") { failed.push({ booking: b, reason: "That order was cancelled." }); return; }
+
+      const line = poLines(po).find(l => l.id === b.purchaseOrderLineId);
+      if (!line) { failed.push({ booking: b, reason: "That order line no longer exists." }); return; }
+
+      const qty = Number(b.qty) || 0;
+      if (qty <= 0) { failed.push({ booking: b, reason: "Nothing to receive." }); return; }
+      if (qty > poLineOutstanding(po, line) + 0.0001) {
+        failed.push({ booking: b, reason: "More than that line still owes." });
+        return;
+      }
+
+      const res = tx.receiveAgainstOrder(db, {
+        purchaseOrderId: po.id, lineId: line.id, qty,
+        date: b.receivedAt || todayStr(),
+        lotNumber: b.batch || po.reference,
+        notes: "Booked in at the dock" + (b.palletId ? " on " + b.palletId : "")
+      });
+      if (!res.ok) { failed.push({ booking: b, reason: res.error }); return; }
+
+      const ledger = repo.create(db, "warehouseReceipts", {
+        sourceLineId: b.sourceLineId,
+        palletId: b.palletId || "",
+        purchaseOrderId: po.id,
+        purchaseOrderLineId: line.id,
+        orderRef: po.reference || "",
+        batch: b.batch || "",
+        qty,
+        receivedAt: b.receivedAt || todayStr(),
+        appliedAt: todayStr(),
+        lotId: res.lot.id,
+        notes: ""
+      });
+      seen.add(b.sourceLineId);
+      applied.push({ booking: b, lot: res.lot, ledger });
+    });
+
+    return { ok: failed.length === 0, applied, skipped, failed };
   },
 
   /* Create or amend a purchase order by hand.
@@ -3735,7 +3828,7 @@ function seedData() {
     schedule: schedule.map(normalizeScheduleEntry),
     equipment, maintenance, customers, components, wasteStreams, shipments,
     operatingCalendars, productionTargets, purchaseOrders, salesOrders,
-    fulfilmentCancellations
+    fulfilmentCancellations, warehouseReceipts: []
   });
 }
 
@@ -4007,6 +4100,7 @@ function normalizeData(raw) {
       wasteStreams: (Array.isArray(raw.wasteStreams) ? raw.wasteStreams : []).map(w => migrateWasteStream(w)),
       shipments: normalizeShipments(raw.shipments),
       purchaseOrders: normalizePurchaseOrders(raw.purchaseOrders),
+      warehouseReceipts: Array.isArray(raw.warehouseReceipts) ? raw.warehouseReceipts : [],
       salesOrders: normalizeSalesOrders(raw.salesOrders),
       fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [],
       operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars),
@@ -4079,7 +4173,7 @@ function normalizeData(raw) {
   const shipments = normalizeShipments(raw.shipments);
 
   const migrated = migrateCompositionToComponents(rawMaterials, intermediateProducts, finishedGoods, raw.components);
-  return backfillRowIds({ rawMaterials: migrated.rawMaterials, intermediateProducts: migrated.intermediateProducts, finishedGoods: migrated.finishedGoods, components: migrated.components, wasteStreams, processes, schedule, equipment, maintenance, customers, shipments, productionTargets, purchaseOrders: normalizePurchaseOrders(raw.purchaseOrders), salesOrders: normalizeSalesOrders(raw.salesOrders), fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [], operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars), seedVersion: raw.seedVersion || "" });
+  return backfillRowIds({ rawMaterials: migrated.rawMaterials, intermediateProducts: migrated.intermediateProducts, finishedGoods: migrated.finishedGoods, components: migrated.components, wasteStreams, processes, schedule, equipment, maintenance, customers, shipments, productionTargets, purchaseOrders: normalizePurchaseOrders(raw.purchaseOrders), warehouseReceipts: Array.isArray(raw.warehouseReceipts) ? raw.warehouseReceipts : [], salesOrders: normalizeSalesOrders(raw.salesOrders), fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [], operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars), seedVersion: raw.seedVersion || "" });
 }
 
 /* ---------------------------------------------------------------
@@ -12459,6 +12553,102 @@ function ProcurementCalendar({ data, month, setMonth, mode, rawFilter, onOpenOrd
   );
 }
 
+/* Deliveries booked at the dock, waiting to be recorded here.
+
+   The warehouse books a delivery the moment it lands, because the pallet
+   is real and has to be pickable straight away. This is the other half of
+   that: what the dock has taken in that the MRP has not yet been told
+   about, and the one button that tells it.
+
+   Applying goes through tx.applyWarehouseReceipts, which is idempotent on
+   the booking id - so pressing this twice, or from two tabs, cannot mint a
+   second lot. Anything that could not be applied is listed with its
+   reason rather than disappearing. */
+function DockReceiptsPanel({ data, update }) {
+  const [state, setState] = useState({ status: "idle", pending: [], applied: [] });
+  const [result, setResult] = useState(null);
+
+  const load = async () => {
+    setState(s => ({ ...s, status: "loading" }));
+    try {
+      const bu = (typeof window !== "undefined" && window.EVOIA_BU) || "evoia";
+      const resp = await fetch("/api/pending-receipts?bu=" + encodeURIComponent(bu));
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      const body = await resp.json();
+      setState({ status: "ready", pending: body.pending || [], applied: body.applied || [] });
+    } catch (e) {
+      setState({ status: "error", pending: [], applied: [] });
+    }
+  };
+
+  useEffect(() => { load(); }, [data.warehouseReceipts]);
+
+  const apply = () => {
+    let res = null;
+    update(d => { res = tx.applyWarehouseReceipts(d, state.pending); return d; });
+    setResult(res);
+    load();
+  };
+
+  if (state.status === "error") {
+    return (
+      <div style={{ padding: "10px 14px", marginBottom: 14, borderRadius: 8, fontSize: 13,
+                    background: "#FCF4F3", border: "1px solid #E3B9B2" }}>
+        Could not reach the dock. Deliveries booked at the warehouse cannot be recorded until the
+        connection is back. <Btn variant="secondary" onClick={load}>Retry</Btn>
+      </div>
+    );
+  }
+  if (!state.pending.length && !result) return null;
+
+  return (
+    <div style={{ padding: "10px 14px", marginBottom: 14, borderRadius: 8, fontSize: 13,
+                  background: state.pending.length ? "#FFF9EF" : "#F1F6F2",
+                  border: "1px solid " + (state.pending.length ? "#E8D5A8" : "#CFE0D3") }}>
+      {state.pending.length > 0 && (
+        <div style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
+          <div><b>{state.pending.length}</b> delivery(ies) booked at the dock, not yet recorded here</div>
+          <div style={{ color: "#8C6B45" }}>
+            Recording them creates the stock lots and credits the orders.
+          </div>
+          <Btn onClick={apply}>Record {state.pending.length} delivery(ies)</Btn>
+        </div>
+      )}
+
+      {state.pending.map(p => (
+        <div key={p.sourceLineId} style={{ display: "flex", gap: 14, flexWrap: "wrap",
+                                           fontSize: 12.5, color: "#5B6470", padding: "2px 0" }}>
+          <span><b>{p.orderRef || "—"}</b></span>
+          <span>batch {p.batch || "—"}</span>
+          <span className="mono">{fmtNum(p.qty)}</span>
+          <span>on {p.palletId || "—"}</span>
+          <span>{fmtDate(p.receivedAt)}</span>
+        </div>
+      ))}
+
+      {result && (
+        <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid rgba(0,0,0,.08)" }}>
+          {result.applied.length > 0 && (
+            <div style={{ color: "#2E7D5B" }}>
+              Recorded {result.applied.length} delivery(ies) — stock lots created and orders credited.
+            </div>
+          )}
+          {result.skipped.length > 0 && (
+            <div style={{ color: "#5B6470" }}>
+              {result.skipped.length} already recorded, left alone.
+            </div>
+          )}
+          {result.failed.map((f, i) => (
+            <div key={i} style={{ color: "#A32D2D" }}>
+              {f.booking.orderRef || f.booking.sourceLineId}: {f.reason}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* Reorder forecast -> purchase orders.
 
    The forecast only ever suggests. Everything here is reviewable before
@@ -12760,6 +12950,8 @@ function ForecastTab({ data, horizon, setHorizon, onOpenOrder, onNewOrder, updat
           <Btn onClick={onNewOrder}><Plus size={15} />New purchase order</Btn>
         </div>
       </div>
+
+      <DockReceiptsPanel data={data} update={update} />
 
       <div style={{
         display: "flex", gap: 20, flexWrap: "wrap", alignItems: "center",

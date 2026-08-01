@@ -201,5 +201,11 @@ eq(C.deriveReceivableOrders({ purchaseOrders: [null] }), [], 'a null order is sk
 ok(C.RECEIVABLE_STATUSES.indexOf('Ordered') >= 0 && C.RECEIVABLE_STATUSES.indexOf('Draft') === -1,
    'the receivable statuses are placed ones only');
 
+eq(C.appliedReceiptIds({ warehouseReceipts: [{ sourceLineId: 'a' }, { sourceLineId: 'b' }] }), ['a', 'b'],
+   'the ledger reports which dock bookings it has recorded');
+eq(C.appliedReceiptIds({ warehouseReceipts: [{ sourceLineId: '' }, null] }), [],
+   'blank and null ledger rows are ignored');
+eq(C.appliedReceiptIds(null), [], 'no MRP data means nothing recorded');
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

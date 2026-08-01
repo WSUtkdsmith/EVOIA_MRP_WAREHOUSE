@@ -257,6 +257,14 @@ function deriveReceivableOrders(mrpData) {
   return out.sort((a, b) => String(a.expectedDate).localeCompare(String(b.expectedDate)));
 }
 
+// Which dock bookings the MRP has recorded. The warehouse reads this to show a
+// receipt as applied rather than tracking that itself — the ledger has one home.
+function appliedReceiptIds(mrpData) {
+  const data = mrpData && typeof mrpData === 'object' ? mrpData : {};
+  const rows = Array.isArray(data.warehouseReceipts) ? data.warehouseReceipts : [];
+  return rows.map((r) => r && r.sourceLineId).filter(Boolean);
+}
+
 // The MRP stores its whole dataset as a JSON string under this key in the
 // module's key/value blob (see mrp/index.html's window.storage shim).
 const MRP_DATA_KEY = 'mrp_console_data';
@@ -271,6 +279,7 @@ function extractMrpData(moduleState) {
 
 module.exports = {
   ITEM_TYPES,
+  appliedReceiptIds,
   RECEIVABLE_STATUSES,
   deriveReceivableOrders,
   EXPIRING_SOON_DAYS,

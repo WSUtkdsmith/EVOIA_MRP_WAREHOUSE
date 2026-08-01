@@ -43,6 +43,7 @@ module.exports = async function handler(req, res) {
       hasMrpData: !!mrpData,
       ...derived,
       purchaseOrders,
+      appliedReceiptIds: catalog.appliedReceiptIds(mrpData),
       counts: { ...derived.counts, receivableOrders: purchaseOrders.length },
     });
   } catch (err) {

@@ -28,10 +28,10 @@ function extract(name) {
 }
 
 const NAMES = ['mrpPlacementIndex', 'mrpLotPlacement', 'mrpContentLine', 'buildPalletFromMrpLot',
-               'mrpReceiptLine', 'buildPalletFromPoLine', 'mrpPoLineReceived'];
+               'mrpReceiptLine', 'buildPalletFromPoLine', 'mrpPoLineReceived', 'mrpReceiptApplied'];
 const src = NAMES.map(extract).join('\n');
 const { mrpPlacementIndex, mrpLotPlacement, mrpContentLine, buildPalletFromMrpLot,
-        mrpReceiptLine, buildPalletFromPoLine, mrpPoLineReceived } =
+        mrpReceiptLine, buildPalletFromPoLine, mrpPoLineReceived, mrpReceiptApplied } =
   new Function(src + '; return {' + NAMES.join(',') + '};')();
 
 let passed = 0, failed = 0;
@@ -185,6 +185,15 @@ const ORDER = { poId: 'po1', reference: 'PO-1', supplier: 'Acme', expectedDate: 
 // A hand-built pallet is not MRP stock and must not be counted against an order.
 eq(mrpPoLineReceived([pallet('EV9', [{ quantityOriginal: 99 }])], 'L1').qty, 0,
    'pallets with no order link are ignored');
+
+// The MRP's ledger is the authority on whether a booking has been recorded.
+eq(mrpReceiptApplied({ id: 'l1' }, ['l1']), true, 'the ledger says it is recorded');
+eq(mrpReceiptApplied({ id: 'l1' }, ['other']), false, 'a booking the ledger does not know is not recorded');
+eq(mrpReceiptApplied({ id: 'l1' }, []), false, 'an empty ledger records nothing');
+eq(mrpReceiptApplied({ id: 'l1', mrpReceiptStatus: 'applied' }, null),
+   true, 'with no ledger to consult the local mark is the fallback');
+eq(mrpReceiptApplied({ id: 'l1', mrpReceiptStatus: 'pending' }, null), false, 'pending stays pending');
+eq(mrpReceiptApplied(null, ['l1']), false, 'no line is not recorded');
 
 console.log(`\n  ${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);
