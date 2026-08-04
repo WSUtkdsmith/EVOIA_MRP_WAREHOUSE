@@ -35,15 +35,38 @@ function effective(selector) {
 }
 const px = (v) => parseInt(v, 10) || 0;
 
-// Height is set by content for these boxes; this is the drawn height of a zone
-// with a title and one row of slots (padding + title + slot + padding).
-const ZONE_H = 100;
-function rect(selector, fallbackH) {
+// A zone's drawn height comes from its grid, not from a guess. Assuming one row
+// is what let a 3-row Build Slot (690-907) read as 100px tall and hide a real
+// overlap. padding + title + rows*slot + gaps.
+const SLOT_H = px((CSS.match(/--slot-h:\s*([^;]+);/) || [])[1]) || 54;
+const GAP = px((CSS.match(/--slot-gap:\s*([^;]+);/) || [])[1]) || 6;
+const TITLE_H = 23;
+
+function gridRows(gridSelector) {
+  const g = effective(gridSelector)['grid-template-rows'] || '';
+  const m = g.match(/repeat\((\d+)/);
+  if (m) return Number(m[1]);
+  // No explicit rows: derive from how many cells the app puts in how many
+  // columns, which is what the browser does implicitly.
+  return null;
+}
+
+function zoneHeight(zoneSel, gridSel, cellCount) {
+  const e = effective(zoneSel);
+  if (px(e.height)) return px(e.height);
+  const pad = px(e.padding) * 2;
+  const cols = (() => {
+    const g = effective(gridSel)['grid-template-columns'] || '';
+    const m = g.match(/repeat\((\d+)/);
+    return m ? Number(m[1]) : 1;
+  })();
+  const rows = gridRows(gridSel) || Math.ceil((cellCount || cols) / cols);
+  return pad + TITLE_H + rows * SLOT_H + Math.max(0, rows - 1) * GAP;
+}
+
+function rect(selector, h) {
   const e = effective(selector);
-  return {
-    x: px(e.left), y: px(e.top),
-    w: px(e.width), h: px(e.height) || fallbackH || ZONE_H,
-  };
+  return { x: px(e.left), y: px(e.top), w: px(e.width), h: px(e.height) || h || 100 };
 }
 
 let passed = 0, failed = 0;
@@ -56,11 +79,14 @@ const canvas = effective('mapCanvas');
 const CW = px(canvas.width), CH = px(canvas.height);
 ok(CW > 0 && CH > 0, 'the map canvas has a size', CW + 'x' + CH);
 
+// Cell counts match what the app renders into each zone.
 const zones = {
   stagingZone: rect('stagingZone'),
-  buildZone: rect('buildZone'),
-  transitZone: rect('transitZone'),
-  inProcessZone: rect('inProcessZone'),
+  plantStorageZone: rect('plantStorageZone'),
+  buildZone: rect('buildZone', zoneHeight('buildZone', 'buildGrid', 6)),
+  transitZone: rect('transitZone', zoneHeight('transitZone', 'transitGrid', 6)),
+  // No grid: a title, a count and a note.
+  inProcessZone: rect('inProcessZone', 90),
 };
 
 // The boxes must not sit on top of one another.
