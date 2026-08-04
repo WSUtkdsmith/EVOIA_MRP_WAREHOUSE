@@ -49,6 +49,13 @@ through the phase notes below and easy to lose.
   it becomes a queued order file and goes in via Receive Order. The first cut let
   it bypass staging, putaway, labels, damage capture and signature; that was a
   real error and was corrected. Do not add a second door to receiving.
+- **Parsing is not running, and unit tests are not startup.** Removing a
+  superseded receive path also removed `submitMrpPlacement`, which `init()` still
+  wired to a form. The file parsed, every extracted-function test passed, and the
+  app was **dead on load** — `init()` threw on the first missing name, so no zone
+  rendered and the map came up empty. `warehouse/test/startup.test.js` now checks
+  every startup handler, every element it is wired to, and every renderer in the
+  dispatch table; it fails if a definition is deleted while a reference survives.
 - **`IMPORT_ORDER` is a hardcoded list and has caught us twice.** Any new child
   table must be registered there or it will export correctly and import to
   nothing. Bit `packagings`, then `purchase_order_lines`. The CSV round-trip test

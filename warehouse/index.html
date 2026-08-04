@@ -14883,6 +14883,36 @@ function openMrpPlacement(lotId){
   $('mrpPlaceDialog').showModal();
 }
 let mrpPlaceLotId='';
+function submitMrpPlacement(e){
+  e.preventDefault();
+  const lot=((mrpCatalog&&mrpCatalog.lots)||[]).find(l=>l.lotId===mrpPlaceLotId);
+  if(!lot) return;
+  const err=$('mrpPlaceError'); err.textContent='';
+  const palletId=$('mrpPlacePalletId').value.trim().toUpperCase();
+  const qty=Number($('mrpPlaceQty').value)||0;
+  const loc=$('mrpPlaceLocation').value;
+  if(!palletId) { err.textContent='Pallet ID is required.'; return; }
+  if(state.pallets.some(p=>p.palletId===palletId)) { err.textContent='That pallet ID already exists.'; return; }
+  if(qty<=0) { err.textContent='Enter a quantity greater than zero.'; return; }
+  const pallet=buildPalletFromMrpLot(lot,{
+    palletId,qty,mfg:$('mrpPlaceMfg').value,
+    locationType:loc?'rack':'floor',location:loc,now:now()
+  });
+  if(loc){
+    const check=canMoveToLocation(palletId,loc,pallet);
+    if(!check.ok){ err.textContent=check.msg; return; }
+  }
+  state.pallets.push(pallet);
+  bump(pallet.mfg,palletId);
+  hist(palletId,'Created','Placed from MRP lot '+lot.lotNumber+' at '+locationText(pallet));
+  addReceiptLog(pallet);
+  save();
+  $('mrpPlaceDialog').close();
+  render();
+  renderMrpCatalog();
+  toast(`Placed ${formatNum(qty)} from lot ${lot.lotNumber} on ${palletId}.`);
+}
+
 /* Put an MRP purchase order into the receiving queue.
 
    This deliberately does not receive anything. It drops the order into the
