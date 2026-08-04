@@ -64,6 +64,9 @@ async function openAttachment(attachment) {
 }
 
 const todayStr = () => new Date().toISOString().slice(0, 10);
+// Full instant, not a date. A batch run is measured in minutes, so the clock
+// has to keep them.
+const nowStamp = () => new Date().toISOString();
 const addDays = (dateStr, n) => {
   const d = new Date(dateStr + "T00:00:00");
   d.setDate(d.getDate() + n);
@@ -567,7 +570,16 @@ const SCHEMA = {
     pk: "id",
     naturalKey: "sku",
     columns: {
-      id: "str", name: "str!", sku: "str", productionTimeHours: "num", notes: "str"
+      id: "str", name: "str!", sku: "str", productionTimeHours: "num", notes: "str",
+      // The controlling SOP for this operation. Stored the same way a lot's
+      // scanned batch record is - the file lives in window.storage under
+      // sopKey, and the rest is what the UI needs to name and open it without
+      // fetching the file itself. sopVersion is free text on purpose: which
+      // revision is current is the quality system's business, not ours, and
+      // guessing a format would be worse than recording what the operator was
+      // actually working to.
+      sopKey: "str", sopFileName: "str", sopFileType: "str", sopFileSize: "num",
+      sopVersion: "str", sopUploadedAt: "date"
     },
     embeds: {},
     children: {
@@ -859,6 +871,43 @@ const SCHEMA = {
         lotRefs: { lotId: { companion: "returnedLotNumber" } }
       }
     }
+  },
+
+  /* A clock on a production run.
+
+     Batch time used to be typed in after the fact, from memory or from a note
+     on a clipboard, which makes actual-vs-planned an estimate dressed up as a
+     measurement. This is the same shape the warehouse already uses for order
+     timing: start, stop, and a corrections path that will not let a time be
+     changed without saying why.
+
+     No child tables on purpose. The correction history is two flat columns
+     (the original start and finish) plus the reason, which is enough to show
+     what was changed and why - and it keeps this out of IMPORT_ORDER's way,
+     which has caught us twice already. */
+  batchRuns: {
+    table: "batch_runs",
+    label: "Batch run",
+    pk: "id",
+    naturalKey: "reference",
+    columns: {
+      id: "str", reference: "str!", processId: "ref:processes!",
+      status: "enum:Running|Finished|Cancelled!",
+      startedAt: "str!", finishedAt: "str",
+      startedBy: "str", finishedBy: "str",
+      operatorCount: "num",
+      // Set when the times were typed rather than clocked - either the whole
+      // run recorded after the fact, or a clocked run corrected afterwards.
+      // The reason is required by the transaction, not merely by the form.
+      manual: "bool", manualReason: "str",
+      originalStartedAt: "str", originalFinishedAt: "str",
+      // Filled once the run is logged as a batch, so a run and the lots it
+      // produced can be read back together.
+      batchId: "str",
+      notes: "str"
+    },
+    embeds: {},
+    children: {}
   },
 
   salesOrders: {
@@ -1386,6 +1435,8 @@ const IMPORT_ORDER = [
   "maintenance", "production_targets", "purchase_orders", "purchase_order_lines", "warehouse_receipts",
   "material_requests", "material_request_lines",
   "material_returns", "material_return_lines",
+  // After processes: a run points at one.
+  "batch_runs",
   "sales_orders", "sales_order_lines", "fulfilment_cancellations",
   "production_schedule", "schedule_revisions",
   "lots", "lot_sources", "lot_actual_equipment", "lot_actual_labor", "lot_qc_checks",
@@ -1885,13 +1936,20 @@ const tx = {
   /* Log a production batch: create output lots, draw down the source
      lots that fed them, and accrue any computed waste. Returns the
      created lots so the caller can offer labels for them. */
-  logProductionBatch(db, { processId, date, notes, sources, outputs, actualEquipment, actualLabor, wasteAllocations }) {
+  logProductionBatch(db, { processId, date, notes, sources, outputs, actualEquipment, actualLabor, wasteAllocations, runId }) {
     const created = [];
     const proc = repo.find(db, "processes", processId);
     if (!proc) return created;
     // One identity for the whole run, so its outputs can be read back as a
     // single batch record rather than as unrelated lots.
     const batchId = uid();
+
+    // Close the clock against this batch. Stamped before the lots are made so
+    // a run cannot be claimed by two batches even if the second one fails
+    // partway through - and only if it is really this process's run, since a
+    // stale id in a form is not authority to close someone else's clock.
+    const run = runId ? repo.find(db, "batchRuns", runId) : null;
+    if (run && run.processId === processId && !run.batchId) run.batchId = batchId;
 
     (outputs || []).forEach(entry => {
       if (!(entry.qty > 0)) return;
@@ -2320,6 +2378,97 @@ const tx = {
     line.lineStatus = "Accepted";
     ret.status = materialReturnStatus(ret);
     return { ok: true, return: ret, line, lot };
+  },
+
+  /* --------------------------------------------------------------
+     Batch run clock.
+
+     Actual production time was typed in after the fact, which makes
+     actual-vs-planned an estimate wearing a measurement's clothes. This
+     clocks it instead, following the timing model the warehouse already
+     runs on orders.
+  ----------------------------------------------------------------*/
+
+  /* One clock per process. A second Start while one is running is a
+     mis-click far more often than it is two genuine concurrent runs of
+     the same process, and silently opening a second would quietly
+     double the hours that land on the batch. */
+  startBatchRun(db, { processId, startedBy, operatorCount, notes, startedAt }) {
+    const proc = repo.find(db, "processes", processId);
+    if (!proc) return { ok: false, error: "That process no longer exists." };
+    const open = activeBatchRun(db, processId);
+    if (open) return { ok: false, error: "A run of " + proc.name + " is already clocked in - finish it first." };
+    const run = repo.create(db, "batchRuns", {
+      reference: nextBatchRunRef(db), processId,
+      status: "Running", startedAt: startedAt || nowStamp(), finishedAt: "",
+      startedBy: startedBy || "", finishedBy: "",
+      operatorCount: Math.max(1, Number(operatorCount) || 1),
+      manual: false, manualReason: "", originalStartedAt: "", originalFinishedAt: "",
+      batchId: "", notes: notes || ""
+    });
+    return { ok: true, run };
+  },
+
+  finishBatchRun(db, { runId, finishedBy, finishedAt }) {
+    const run = repo.find(db, "batchRuns", runId);
+    if (!run) return { ok: false, error: "That run no longer exists." };
+    if (run.status !== "Running") return { ok: false, error: "That run is not clocked in." };
+    const stamp = finishedAt || nowStamp();
+    if (runElapsedMs({ ...run, finishedAt: stamp }) < 0) {
+      return { ok: false, error: "A run cannot finish before it started." };
+    }
+    run.finishedAt = stamp;
+    run.finishedBy = finishedBy || "";
+    run.status = "Finished";
+    return { ok: true, run };
+  },
+
+  /* Recording or correcting the times by hand.
+
+     Reality does not wait for anyone to press a button: the clock gets
+     forgotten at the start of a run, or left going over lunch. Both are
+     normal, and a system that cannot express them gets worked around
+     instead of used. So the times can be typed - but never silently.
+     The reason is enforced here rather than in the form, and the clocked
+     times are kept so the correction can be seen for what it is. */
+  setBatchRunTimes(db, { runId, startedAt, finishedAt, reason, by, operatorCount }) {
+    const run = repo.find(db, "batchRuns", runId);
+    if (!run) return { ok: false, error: "That run no longer exists." };
+    if (!String(reason || "").trim()) {
+      return { ok: false, error: "Recording or correcting a time by hand needs a reason." };
+    }
+    if (!startedAt) return { ok: false, error: "A start time is required." };
+    if (finishedAt && new Date(finishedAt) < new Date(startedAt)) {
+      return { ok: false, error: "A run cannot finish before it started." };
+    }
+    // Keep the clocked times the first time they are overridden, not on
+    // every subsequent edit - otherwise the second correction erases the
+    // evidence of the first.
+    if (!run.manual) {
+      run.originalStartedAt = run.startedAt || "";
+      run.originalFinishedAt = run.finishedAt || "";
+    }
+    run.startedAt = startedAt;
+    run.finishedAt = finishedAt || "";
+    run.status = finishedAt ? "Finished" : "Running";
+    run.manual = true;
+    run.manualReason = String(reason).trim();
+    if (by) run.finishedBy = by;
+    if (operatorCount != null && operatorCount !== "") {
+      run.operatorCount = Math.max(1, Number(operatorCount) || 1);
+    }
+    return { ok: true, run };
+  },
+
+  cancelBatchRun(db, { runId, reason }) {
+    const run = repo.find(db, "batchRuns", runId);
+    if (!run) return { ok: false, error: "That run no longer exists." };
+    if (run.status === "Finished" && run.batchId) {
+      return { ok: false, error: "That run has already been logged as a batch." };
+    }
+    run.status = "Cancelled";
+    if (reason) run.notes = String(reason).trim();
+    return { ok: true, run };
   },
 
   /* Clearing custody without a return: material scrapped on the line, a
@@ -4188,7 +4337,7 @@ function seedData() {
     equipment, maintenance, customers, components, wasteStreams, shipments,
     operatingCalendars, productionTargets, purchaseOrders, salesOrders,
     fulfilmentCancellations, warehouseReceipts: [],
-    materialRequests: [], materialReturns: []
+    materialRequests: [], materialReturns: [], batchRuns: []
   });
 }
 
@@ -4463,6 +4612,7 @@ function normalizeData(raw) {
       warehouseReceipts: Array.isArray(raw.warehouseReceipts) ? raw.warehouseReceipts : [],
       materialRequests: Array.isArray(raw.materialRequests) ? raw.materialRequests : [],
       materialReturns: Array.isArray(raw.materialReturns) ? raw.materialReturns : [],
+      batchRuns: Array.isArray(raw.batchRuns) ? raw.batchRuns : [],
       salesOrders: normalizeSalesOrders(raw.salesOrders),
       fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [],
       operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars),
@@ -4535,7 +4685,7 @@ function normalizeData(raw) {
   const shipments = normalizeShipments(raw.shipments);
 
   const migrated = migrateCompositionToComponents(rawMaterials, intermediateProducts, finishedGoods, raw.components);
-  return backfillRowIds({ rawMaterials: migrated.rawMaterials, intermediateProducts: migrated.intermediateProducts, finishedGoods: migrated.finishedGoods, components: migrated.components, wasteStreams, processes, schedule, equipment, maintenance, customers, shipments, productionTargets, purchaseOrders: normalizePurchaseOrders(raw.purchaseOrders), warehouseReceipts: Array.isArray(raw.warehouseReceipts) ? raw.warehouseReceipts : [], materialRequests: Array.isArray(raw.materialRequests) ? raw.materialRequests : [], materialReturns: Array.isArray(raw.materialReturns) ? raw.materialReturns : [], salesOrders: normalizeSalesOrders(raw.salesOrders), fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [], operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars), seedVersion: raw.seedVersion || "" });
+  return backfillRowIds({ rawMaterials: migrated.rawMaterials, intermediateProducts: migrated.intermediateProducts, finishedGoods: migrated.finishedGoods, components: migrated.components, wasteStreams, processes, schedule, equipment, maintenance, customers, shipments, productionTargets, purchaseOrders: normalizePurchaseOrders(raw.purchaseOrders), warehouseReceipts: Array.isArray(raw.warehouseReceipts) ? raw.warehouseReceipts : [], materialRequests: Array.isArray(raw.materialRequests) ? raw.materialRequests : [], materialReturns: Array.isArray(raw.materialReturns) ? raw.materialReturns : [], batchRuns: Array.isArray(raw.batchRuns) ? raw.batchRuns : [], salesOrders: normalizeSalesOrders(raw.salesOrders), fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [], operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars), seedVersion: raw.seedVersion || "" });
 }
 
 /* ---------------------------------------------------------------
@@ -5724,6 +5874,92 @@ function inProcessLots(data) {
     });
   });
   return out.sort((a, b) => String(a.since).localeCompare(String(b.since)));
+}
+
+/* ------------------------------------------------------------------
+   Batch run clock.
+
+   Elapsed time is derived, never stored: a stored duration and a stored
+   pair of timestamps can disagree, and then nobody knows which is true.
+   The timestamps are the record.
+----------------------------------------------------------------*/
+function runElapsedMs(run, asOf) {
+  if (!run || !run.startedAt) return 0;
+  const start = new Date(run.startedAt).getTime();
+  if (!isFinite(start)) return 0;
+  const endRaw = run.finishedAt || asOf || null;
+  const end = endRaw ? new Date(endRaw).getTime() : Date.now();
+  if (!isFinite(end)) return 0;
+  return end - start;
+}
+
+function runElapsedHours(run, asOf) {
+  return Math.round((runElapsedMs(run, asOf) / 3600000) * 100) / 100;
+}
+
+function fmtDuration(ms) {
+  const n = Math.max(0, Math.round(Number(ms) || 0));
+  const h = Math.floor(n / 3600000), m = Math.floor((n % 3600000) / 60000);
+  return h ? h + "h " + String(m).padStart(2, "0") + "m" : m + "m";
+}
+
+function activeBatchRun(data, processId) {
+  return ((data && data.batchRuns) || []).find(r =>
+    r && r.status === "Running" && (!processId || r.processId === processId)) || null;
+}
+
+/* A finished run waiting to be written up as a batch. This is what the
+   batch log picks its hours out of, so a run that has already been logged
+   is not offered again. */
+function unloggedBatchRuns(data, processId) {
+  return ((data && data.batchRuns) || [])
+    .filter(r => r && r.status === "Finished" && !r.batchId
+                 && (!processId || r.processId === processId))
+    .sort((a, b) => String(b.finishedAt).localeCompare(String(a.finishedAt)));
+}
+
+function nextBatchRunRef(data) {
+  const used = ((data && data.batchRuns) || []).map(r => String(r.reference || ""));
+  let n = used.length + 1;
+  for (;;) {
+    const ref = "RUN-" + String(n).padStart(4, "0");
+    if (used.indexOf(ref) === -1) return ref;
+    n++;
+  }
+}
+
+/* The clock's answer to "how long did this take", split the way the batch
+   log needs it.
+
+   Equipment and labour are not the same number and never were. A machine
+   running for two hours is two equipment-hours however many people were
+   watching it; two operators on that same run is four labour-hours. Typing
+   both by hand is exactly where that distinction used to get lost. */
+function runHoursForBatch(run, equipmentCount) {
+  const hours = runElapsedHours(run);
+  const operators = Math.max(1, Number(run && run.operatorCount) || 1);
+  return {
+    elapsedHours: hours,
+    equipmentHoursEach: hours,
+    equipmentHoursTotal: Math.round(hours * Math.max(0, Number(equipmentCount) || 0) * 100) / 100,
+    operators,
+    laborHoursEach: hours,
+    laborHoursTotal: Math.round(hours * operators * 100) / 100
+  };
+}
+
+/* Does this process have a controlling document, and what is it? Returned
+   as one object so a call site never has to know the column layout. */
+function processSop(process) {
+  if (!process || !process.sopKey) return null;
+  return {
+    key: process.sopKey,
+    fileName: process.sopFileName || "SOP",
+    fileType: process.sopFileType || "",
+    fileSize: Number(process.sopFileSize) || 0,
+    version: process.sopVersion || "",
+    uploadedAt: process.sopUploadedAt || ""
+  };
 }
 
 /* ------------------------------------------------------------------
@@ -8793,7 +9029,7 @@ export default function App() {
             onInventory={(id) => setModal({ type: "inventoryCard", itemType: "raw", id })} />
         )}
         {tab === "processes" && view === "admin" && (
-          <ProcessesTab data={data} search={search} setSearch={setSearch}
+          <ProcessesTab data={data} search={search} setSearch={setSearch} update={update}
             onAdd={() => setModal({ type: "process", id: null })}
             onEdit={(id) => setModal({ type: "process", id })}
             onDelete={removeProcess}
@@ -8877,7 +9113,7 @@ export default function App() {
             onReceive={(rawId) => setModal({ type: "receive", id: rawId })} />
         )}
         {tab === "opprocesses" && view === "operator" && (
-          <OperatorProcessesTab data={data} search={search} setSearch={setSearch}
+          <OperatorProcessesTab data={data} search={search} setSearch={setSearch} update={update}
             onLogBatch={(processId) => setModal({ type: "batchlog", kind: null, id: processId })} />
         )}
         {tab === "opintermediates" && view === "operator" && (
@@ -10108,7 +10344,7 @@ function FinishedGoodModal({ data, id, onClose, update }) {
 /* ---------------------------------------------------------------
    Processes (recipes: typed inputs -> equipment -> typed outputs)
 ----------------------------------------------------------------*/
-function ProcessesTab({ data, search, setSearch, onAdd, onEdit, onDelete, onLogBatch }) {
+function ProcessesTab({ data, search, setSearch, onAdd, onEdit, onDelete, onLogBatch, update }) {
   const rows = data.processes.filter(p => !search || p.name.toLowerCase().includes(search.toLowerCase()) || p.sku.toLowerCase().includes(search.toLowerCase()));
   return (
     <div>
@@ -10116,7 +10352,7 @@ function ProcessesTab({ data, search, setSearch, onAdd, onEdit, onDelete, onLogB
         action={<div style={{ display: "flex", gap: 10 }}><SearchBox value={search} onChange={setSearch} placeholder="Search processes…" /><Btn onClick={onAdd}><Plus size={15} />Add process</Btn></div>} />
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
         {rows.map(p => (
-          <ProcessCard key={p.id} process={p} data={data} onEdit={() => onEdit(p.id)} onDelete={() => onDelete(p.id)} onLogBatch={() => onLogBatch(p.id)} />
+          <ProcessCard key={p.id} process={p} data={data} update={update} onEdit={() => onEdit(p.id)} onDelete={() => onDelete(p.id)} onLogBatch={() => onLogBatch(p.id)} />
         ))}
         {rows.length === 0 && <div style={{ color: "#8A9099", padding: 24 }}>No processes yet.</div>}
       </div>
@@ -10124,7 +10360,239 @@ function ProcessesTab({ data, search, setSearch, onAdd, onEdit, onDelete, onLogB
   );
 }
 
-function ProcessCard({ process, data, onEdit, onDelete, onLogBatch }) {
+/* Live elapsed time. Ticks once a second only while something is actually
+   running, so a page full of idle process cards is not re-rendering for
+   nothing. */
+function useRunningClock(active) {
+  const [, tick] = useState(0);
+  useEffect(() => {
+    if (!active) return undefined;
+    const t = setInterval(() => tick(n => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [active]);
+}
+
+/* Start / Finish, plus the way out when the clock was not pressed.
+
+   The manual path is not a grudging fallback - the clock gets forgotten at
+   the start of a run and left going over lunch, and a system that cannot
+   say so gets worked around rather than used. It is allowed, it is
+   recorded, and it asks why. */
+function BatchRunControl({ process, data, update, compact }) {
+  const run = activeBatchRun(data, process.id);
+  const pending = unloggedBatchRuns(data, process.id);
+  const [starting, setStarting] = useState(false);
+  const [editing, setEditing] = useState(null);   // a run being corrected/typed
+  const [err, setErr] = useState("");
+  useRunningClock(!!run);
+
+  const go = (fn) => {
+    let res = null;
+    update(d => { res = fn(d); return d; });
+    setErr(res && res.ok === false ? (res.error || "That did not work.") : "");
+    return res;
+  };
+
+  const planned = Number(process.productionTimeHours) || 0;
+  const elapsed = run ? runElapsedMs(run) : 0;
+  const over = planned > 0 && run && elapsed > planned * 3600000;
+
+  return (
+    <div style={{ marginBottom: compact ? 8 : 12 }}>
+      {run ? (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap",
+                      background: over ? "#F6E6C8" : "#F1F6F2",
+                      border: "1px solid " + (over ? "#C99A3A" : "#CFE0D3"),
+                      borderRadius: 8, padding: "8px 10px" }}>
+          <span style={{ fontSize: 11, fontWeight: 700, textTransform: "uppercase",
+                         letterSpacing: 0.4, color: over ? "#7A5205" : "#2E7D5B" }}>Running</span>
+          <span className="mono" style={{ fontSize: 15, fontWeight: 700 }}>{fmtDuration(elapsed)}</span>
+          <span style={{ fontSize: 11.5, color: "#8A9099" }}>
+            {run.reference}{run.startedBy ? " · " + run.startedBy : ""}
+            {run.operatorCount > 1 ? " · " + run.operatorCount + " operators" : ""}
+            {planned > 0 ? " · planned " + fmtNum(planned) + "h" : ""}
+          </span>
+          <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+            <Btn onClick={() => go(d => tx.finishBatchRun(d, { runId: run.id }))}
+              style={{ padding: "5px 12px", fontSize: 12 }}>Finish</Btn>
+            <Btn variant="secondary" onClick={() => { setErr(""); setEditing(run); }}
+              style={{ padding: "5px 10px", fontSize: 12 }}>Edit times</Btn>
+          </span>
+        </div>
+      ) : (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+          <Btn onClick={() => setStarting(true)} style={{ padding: "5px 12px", fontSize: 12 }}>Start batch</Btn>
+          <Btn variant="secondary" onClick={() => { setErr(""); setEditing({ processId: process.id }); }}
+            style={{ padding: "5px 10px", fontSize: 12 }}>Record times</Btn>
+          {pending.length > 0 && (
+            <span style={{ fontSize: 11.5, color: "#2E7D5B", fontWeight: 600 }}>
+              {pending.length} finished run{pending.length === 1 ? "" : "s"} not yet logged
+            </span>
+          )}
+        </div>
+      )}
+
+      {err && <div style={{ fontSize: 11.5, color: "#8A2E20", marginTop: 5, fontWeight: 600 }}>{err}</div>}
+
+      {starting && <StartBatchRunModal process={process} update={update} onClose={() => setStarting(false)} />}
+      {editing && <BatchRunTimesModal process={process} run={editing.id ? editing : null}
+        update={update} onClose={() => setEditing(null)} />}
+    </div>
+  );
+}
+
+function StartBatchRunModal({ process, update, onClose }) {
+  const [f, setF] = useState({ startedBy: "", operatorCount: 1, notes: "" });
+  const [err, setErr] = useState("");
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+  const submit = () => {
+    let res = null;
+    update(d => {
+      res = tx.startBatchRun(d, { processId: process.id, startedBy: f.startedBy,
+        operatorCount: f.operatorCount, notes: f.notes });
+      return d;
+    });
+    if (res && res.ok) onClose(); else setErr((res && res.error) || "Could not start the run.");
+  };
+  return (
+    <Modal title={"Start batch — " + process.name} onClose={onClose}>
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 12 }}>
+        The clock starts now and runs until you press Finish. Its elapsed time fills in the actual
+        equipment and labour hours when this batch is logged, so nobody has to remember them afterwards.
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
+        <Field label="Started by"><input style={inputStyle} value={f.startedBy} onChange={e => set("startedBy", e.target.value)} /></Field>
+        <Field label="Operators on the run">
+          <input type="number" min="1" step="1" style={inputStyle} value={f.operatorCount}
+            onChange={e => set("operatorCount", parseInt(e.target.value, 10) || 1)} />
+        </Field>
+      </div>
+      <div style={{ fontSize: 11, color: "#8A9099", marginBottom: 10 }}>
+        Operators multiply labour hours but not equipment hours — two people on a two-hour run is four
+        labour hours and still two equipment hours.
+      </div>
+      <Field label="Notes"><input style={inputStyle} value={f.notes} onChange={e => set("notes", e.target.value)} /></Field>
+      {err && <div style={{ fontSize: 12, color: "#8A2E20", marginTop: 8, fontWeight: 600 }}>{err}</div>}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
+        <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+        <Btn onClick={submit}>Start clock</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+/* Typing the times: either a run nobody clocked, or a correction to one that
+   was. Both need a reason, and the transaction enforces that — the form is
+   not the only thing standing in the way. */
+const toLocalInput = (iso) => {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (!isFinite(d.getTime())) return "";
+  const pad = n => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+    + "T" + pad(d.getHours()) + ":" + pad(d.getMinutes());
+};
+const fromLocalInput = (v) => v ? new Date(v).toISOString() : "";
+
+function BatchRunTimesModal({ process, run, update, onClose }) {
+  const correcting = !!run;
+  const [f, setF] = useState(() => ({
+    startedAt: toLocalInput(run ? run.startedAt : nowStamp()),
+    finishedAt: toLocalInput(run ? run.finishedAt : ""),
+    operatorCount: (run && run.operatorCount) || 1,
+    by: "", reason: ""
+  }));
+  const [err, setErr] = useState("");
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+
+  const preview = f.startedAt && f.finishedAt
+    ? runElapsedMs({ startedAt: fromLocalInput(f.startedAt), finishedAt: fromLocalInput(f.finishedAt) })
+    : null;
+
+  const submit = () => {
+    let res = null;
+    update(d => {
+      // A run that was never clocked has to exist before its times can be
+      // set, so create it at the stated start rather than at "now" — otherwise
+      // the record would say it began when it was typed up.
+      let target = run;
+      if (!target) {
+        const started = tx.startBatchRun(d, { processId: process.id, startedBy: f.by,
+          operatorCount: f.operatorCount, startedAt: fromLocalInput(f.startedAt) });
+        if (!started.ok) { res = started; return d; }
+        target = started.run;
+      }
+      res = tx.setBatchRunTimes(d, {
+        runId: target.id, startedAt: fromLocalInput(f.startedAt),
+        finishedAt: fromLocalInput(f.finishedAt), reason: f.reason, by: f.by,
+        operatorCount: f.operatorCount
+      });
+      return d;
+    });
+    if (res && res.ok) onClose(); else setErr((res && res.error) || "Could not record the times.");
+  };
+
+  return (
+    <Modal title={(correcting ? "Correct times — " : "Record times — ") + process.name} onClose={onClose}>
+      <div style={{ fontSize: 12.5, color: "#7A5205", background: "#F6E6C8", border: "1px solid #C99A3A",
+                    borderRadius: 8, padding: "10px 12px", marginBottom: 12 }}>
+        {correcting
+          ? "The clocked times are kept alongside this correction, so the change can be seen for what it is."
+          : "For a run nobody clocked — the button was missed, or the batch was worked from paper. Recorded as entered by hand, not as measured."}
+        {" "}A reason is required.
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
+        <Field label="Started"><input type="datetime-local" style={inputStyle} value={f.startedAt} onChange={e => set("startedAt", e.target.value)} /></Field>
+        <Field label="Finished (leave blank to keep running)"><input type="datetime-local" style={inputStyle} value={f.finishedAt} onChange={e => set("finishedAt", e.target.value)} /></Field>
+        <Field label="Operators on the run">
+          <input type="number" min="1" step="1" style={inputStyle} value={f.operatorCount}
+            onChange={e => set("operatorCount", parseInt(e.target.value, 10) || 1)} />
+        </Field>
+        <Field label="Recorded by"><input style={inputStyle} value={f.by} onChange={e => set("by", e.target.value)} /></Field>
+      </div>
+      {preview != null && (
+        <div style={{ fontSize: 12.5, marginBottom: 10 }}>
+          <span style={{ color: "#8A9099" }}>Elapsed: </span>
+          <span className="mono" style={{ fontWeight: 700 }}>{fmtDuration(preview)}</span>
+          {preview < 0 && <span style={{ color: "#8A2E20", fontWeight: 600 }}> — finish is before start</span>}
+        </div>
+      )}
+      <Field label="Reason (required)">
+        <input style={inputStyle} value={f.reason} onChange={e => set("reason", e.target.value)}
+          placeholder={correcting ? "e.g. clock left running through the break" : "e.g. clock not started — times from the batch sheet"} />
+      </Field>
+      {err && <div style={{ fontSize: 12, color: "#8A2E20", marginTop: 8, fontWeight: 600 }}>{err}</div>}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
+        <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+        <Btn onClick={submit} style={{ opacity: f.reason.trim() && f.startedAt ? 1 : 0.5 }}>Save times</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+/* The controlling document for an operation, shown where the work is done.
+   A link, not a viewer: the file goes back out the way it came in. */
+function SopBadge({ process, compact }) {
+  const sop = processSop(process);
+  if (!sop) {
+    return compact ? null : (
+      <div style={{ fontSize: 11.5, color: "#B87510", marginBottom: 8 }}>No SOP attached to this process.</div>
+    );
+  }
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8, fontSize: 12 }}>
+      <ClipboardList size={12} color="#1F6F78" />
+      <button type="button" onClick={() => openAttachment(sop)}
+        style={{ background: "none", border: "none", color: "#1F6F78", textDecoration: "underline",
+                 cursor: "pointer", fontSize: 12, padding: 0, textAlign: "left" }}>
+        {sop.fileName}
+      </button>
+      {sop.version && <Badge tone="info">{sop.version}</Badge>}
+    </div>
+  );
+}
+
+function ProcessCard({ process, data, update, onEdit, onDelete, onLogBatch }) {
   return (
     <div style={{ background: "#fff", border: "1px solid #E2E4DD", borderRadius: 10, padding: 16 }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
@@ -10137,6 +10605,11 @@ function ProcessCard({ process, data, onEdit, onDelete, onLogBatch }) {
           <IconBtn onClick={onEdit} title="Edit"><Pencil size={13} /></IconBtn>
           <IconBtn onClick={onDelete} title="Delete" danger><Trash2 size={13} /></IconBtn>
         </div>
+      </div>
+
+      <div style={{ marginTop: 10 }}>
+        <SopBadge process={process} />
+        <BatchRunControl process={process} data={data} update={update} />
       </div>
 
       <div style={{ margin: "10px 0", fontSize: 12 }}>
@@ -10204,10 +10677,76 @@ function ProcessCard({ process, data, onEdit, onDelete, onLogBatch }) {
   );
 }
 
+/* Attach the controlling SOP to a process.
+
+   Same storage path as a scanned batch record, so there is one attachment
+   mechanism rather than two. Replacing a document does not delete the old
+   one from storage: a superseded SOP is exactly the thing a batch logged
+   last month was worked to, and destroying it to save a few hundred KB
+   would be trading an audit trail for nothing. */
+function SopField({ f, set }) {
+  const [status, setStatus] = useState("idle");   // idle | uploading | error
+  const [err, setErr] = useState("");
+  const sop = processSop(f);
+
+  const upload = async (file) => {
+    if (!file) return;
+    setStatus("uploading"); setErr("");
+    try {
+      const up = await uploadAttachment(file);
+      set("sopKey", up.key);
+      set("sopFileName", up.fileName);
+      set("sopFileType", up.fileType);
+      set("sopFileSize", up.fileSize);
+      set("sopUploadedAt", todayStr());
+      setStatus("idle");
+    } catch (e) {
+      setStatus("error");
+      setErr(e.message || "Upload failed.");
+    }
+  };
+
+  const clear = () => {
+    ["sopKey", "sopFileName", "sopFileType", "sopUploadedAt"].forEach(k => set(k, ""));
+    set("sopFileSize", 0);
+  };
+
+  return (
+    <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 14, marginBottom: 16 }}>
+      <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 4 }}>Standard operating procedure</div>
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 10 }}>
+        The controlling document for this operation. It is shown on the process card and in the operator
+        view, so whoever runs the batch can open it from where they are working (max {Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)}MB).
+      </div>
+      {sop ? (
+        <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+          <Badge tone="good">Attached</Badge>
+          <button type="button" onClick={() => openAttachment(sop)}
+            style={{ background: "none", border: "none", color: "#1F6F78", textDecoration: "underline",
+                     cursor: "pointer", fontSize: 12.5, padding: 0 }}>{sop.fileName}</button>
+          {sop.uploadedAt && <span style={{ fontSize: 11.5, color: "#8A9099" }}>added {fmtDate(sop.uploadedAt)}</span>}
+          <Btn variant="ghost" onClick={clear} style={{ padding: "4px 8px", fontSize: 12 }}>Remove</Btn>
+        </div>
+      ) : (
+        <input type="file" accept="application/pdf,image/*,.doc,.docx" disabled={status === "uploading"}
+          onChange={e => upload(e.target.files && e.target.files[0])} style={{ fontSize: 12.5, marginBottom: 10 }} />
+      )}
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        <Field label="Version / revision" hint="Free text — whatever your quality system calls it">
+          <input style={inputStyle} value={f.sopVersion || ""} onChange={e => set("sopVersion", e.target.value)} placeholder="e.g. Rev C" />
+        </Field>
+      </div>
+      {status === "uploading" && <div style={{ fontSize: 11.5, color: "#8A9099" }}>Uploading…</div>}
+      {status === "error" && <div style={{ fontSize: 11.5, color: "#8A2E20" }}>{err}</div>}
+    </div>
+  );
+}
+
 function ProcessModal({ data, id, onClose, update }) {
   const existing = id ? getProcess(data, id) : null;
   const [f, setF] = useState(existing ? structuredClone(existing) : {
-    name: "", sku: "", productionTimeHours: 24, notes: "", inputs: [], equipment: [], outputs: []
+    name: "", sku: "", productionTimeHours: 24, notes: "", inputs: [], equipment: [], outputs: [],
+    sopKey: "", sopFileName: "", sopFileType: "", sopFileSize: 0, sopVersion: "", sopUploadedAt: ""
   });
   const set = (k, v) => setF(prev => ({ ...prev, [k]: v }));
 
@@ -10254,6 +10793,8 @@ function ProcessModal({ data, id, onClose, update }) {
         <Field label="Batch production time (hours)" hint="Decimals ok, e.g. 6.5"><input type="number" step="0.1" style={inputStyle} value={f.productionTimeHours} onChange={e => set("productionTimeHours", parseFloat(e.target.value) || 0)} /></Field>
         <Field label="Notes" span={2}><input style={inputStyle} value={f.notes} onChange={e => set("notes", e.target.value)} placeholder="Process notes" /></Field>
       </div>
+
+      <SopField f={f} set={set} />
 
       <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 14, marginBottom: 16 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
@@ -16292,10 +16833,22 @@ function BatchLogModal({ data, kind, processId, onClose, update }) {
   const equipmentOptions = process ? (process.equipment || []).map(e => getEquipment(data, e.equipmentId)).filter(Boolean) : [];
   const plannedHours = process ? process.productionTimeHours : 0;
 
+  // The most recent finished run nobody has written up yet. If the clock was
+  // used, its elapsed time is the actual time and there is nothing to type.
+  const pendingRuns = process ? unloggedBatchRuns(data, process.id) : [];
+  const [runId, setRunId] = useState(() => (pendingRuns[0] ? pendingRuns[0].id : ""));
+  const run = pendingRuns.find(r => r.id === runId) || null;
+  const runHours = run ? runHoursForBatch(run, equipmentOptions.length) : null;
+
   const [f, setF] = useState(() => {
     const batchLotNumber = process ? suggestBatchLotNumber(data, process, todayStr()) : "";
+    const first = pendingRuns[0] || null;
+    // Clocked time wins over planned time. Planned is a forecast; the clock is
+    // what happened, and defaulting to the forecast is how "actual" hours
+    // quietly became a copy of the plan.
+    const hours = first ? runElapsedHours(first) : plannedHours;
     return {
-      date: todayStr(),
+      date: first && first.startedAt ? String(first.startedAt).slice(0, 10) : todayStr(),
       notes: "",
       outputs: outputs.map(o => {
         const composition = computeEffectiveComposition(data, o.itemType, o.itemId);
@@ -16308,10 +16861,33 @@ function BatchLogModal({ data, kind, processId, onClose, update }) {
       // the first lot of any kind would preselect warehouse stock and open
       // the modal already in breach.
       sources: sourceGroups.map(g => ({ id: uid(), groupKey: g.key, lotId: g.available[0] ? g.available[0].id : "", qty: g.plannedQty })),
-      actualEquipment: (process ? process.equipment : []).map(eq => ({ id: uid(), equipmentId: eq.equipmentId, hours: plannedHours })),
-      actualLabor: []
+      actualEquipment: (process ? process.equipment : []).map(eq => ({ id: uid(), equipmentId: eq.equipmentId, hours })),
+      // One labour row per operator on the run, each carrying the elapsed
+      // time. Two people on a two-hour run is four labour hours, and that
+      // only comes out right if they are separate rows.
+      actualLabor: first
+        ? Array.from({ length: Math.max(1, Number(first.operatorCount) || 1) },
+            () => ({ id: uid(), operatorName: first.startedBy || "", hours: runElapsedHours(first) }))
+        : []
     };
   });
+
+  // Switching to a different run re-fills the hours from it; anything already
+  // typed into those rows was derived from the old run, so keeping it would be
+  // worse than replacing it.
+  const useRun = (id) => {
+    setRunId(id);
+    const r = pendingRuns.find(x => x.id === id);
+    setF(prev => ({
+      ...prev,
+      date: r && r.startedAt ? String(r.startedAt).slice(0, 10) : prev.date,
+      actualEquipment: prev.actualEquipment.map(e => ({ ...e, hours: r ? runElapsedHours(r) : plannedHours })),
+      actualLabor: r
+        ? Array.from({ length: Math.max(1, Number(r.operatorCount) || 1) },
+            () => ({ id: uid(), operatorName: r.startedBy || "", hours: runElapsedHours(r) }))
+        : prev.actualLabor
+    }));
+  };
   const [printableLots, setPrintableLots] = useState(null);
   const [attachment, setAttachment] = useState(null);
   const [attachmentStatus, setAttachmentStatus] = useState("idle"); // idle | uploading | done | error
@@ -16426,7 +17002,7 @@ function BatchLogModal({ data, kind, processId, onClose, update }) {
       created = tx.logProductionBatch(d, {
         processId, date: f.date, notes: f.notes, sources: f.sources, outputs: f.outputs,
         actualEquipment: f.actualEquipment, actualLabor: f.actualLabor,
-        wasteAllocations: wastePreview
+        wasteAllocations: wastePreview, runId
       });
     });
     setPrintableLots(created);
@@ -16668,11 +17244,60 @@ function BatchLogModal({ data, kind, processId, onClose, update }) {
       <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 12 }}>
         <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 4 }}>Actual production time <span style={{ fontWeight: 500, color: "#8A9099" }}>(planned {fmtNum(plannedHours)}h)</span></div>
 
+        {pendingRuns.length > 0 ? (
+          <div style={{ background: "#F1F6F2", border: "1px solid #CFE0D3", borderRadius: 8,
+                        padding: "10px 12px", margin: "8px 0 12px" }}>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginBottom: 6 }}>
+              <span style={{ fontSize: 12, color: "#5B6470" }}>Timed run</span>
+              {pendingRuns.length > 1 ? (
+                <select style={{ ...inputStyle, width: "auto", minWidth: 260 }} value={runId} onChange={e => useRun(e.target.value)}>
+                  {pendingRuns.map(r => (
+                    <option key={r.id} value={r.id}>
+                      {r.reference} · {fmtDuration(runElapsedMs(r))} · finished {fmtDate(String(r.finishedAt).slice(0, 10))}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <span className="mono" style={{ fontSize: 13, fontWeight: 700 }}>{run ? run.reference : "—"}</span>
+              )}
+              {run && <span className="mono" style={{ fontSize: 15, fontWeight: 700 }}>{fmtDuration(runElapsedMs(run))}</span>}
+              {run && run.manual && <Badge tone="warn">Times entered by hand</Badge>}
+            </div>
+            {run && (
+              <div style={{ fontSize: 11.5, color: "#5B6470" }}>
+                {runHours.operators} operator{runHours.operators === 1 ? "" : "s"} · {fmtNum(runHours.laborHoursTotal)} labour hours
+                {equipmentOptions.length > 0 ? " · " + fmtNum(runHours.equipmentHoursTotal) + " equipment hours across " + equipmentOptions.length + " unit(s)" : ""}
+                {plannedHours > 0 && (
+                  <span style={{ color: runHours.elapsedHours > plannedHours ? "#B87510" : "#2E7D5B", fontWeight: 600 }}>
+                    {" · "}{runHours.elapsedHours > plannedHours ? "over" : "under"} plan by {fmtNum(Math.abs(runHours.elapsedHours - plannedHours))}h
+                  </span>
+                )}
+              </div>
+            )}
+            {run && run.manual && run.manualReason && (
+              <div style={{ fontSize: 11.5, color: "#7A5205", marginTop: 4 }}>{run.manualReason}</div>
+            )}
+            <div style={{ fontSize: 11, color: "#8A9099", marginTop: 6 }}>
+              Hours below are filled from the clock. Editing them here does not change the run —
+              correct the run itself from the process card if the times are wrong.
+            </div>
+          </div>
+        ) : (
+          <div style={{ background: "#FFF9EF", border: "1px solid #E8D5A8", borderRadius: 8,
+                        padding: "10px 12px", margin: "8px 0 12px", fontSize: 11.5, color: "#7A5205" }}>
+            No timed run for this process. Hours below default to the plan, which makes actual-vs-planned
+            agree by construction — use <b>Start batch</b> on the process card, or <b>Record times</b> if the
+            run has already happened.
+          </div>
+        )}
+
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "8px 0 4px" }}>
           <div style={{ fontSize: 12, color: "#5B6470" }}>Equipment hours</div>
           <Btn variant="ghost" onClick={addActualEquipment} style={{ padding: "4px 8px", fontSize: 12 }}><Plus size={12} />Add</Btn>
         </div>
-        <div style={{ fontSize: 11, color: "#8A9099", marginBottom: 6 }}>One row per equipment on this process, pre-filled with the planned batch time — adjust to actual hours.</div>
+        <div style={{ fontSize: 11, color: "#8A9099", marginBottom: 6 }}>
+          One row per equipment on this process, pre-filled from {run ? "the timed run" : "the planned batch time"} — adjust if it differed.
+        </div>
         {equipmentOptions.length === 0 && <div style={{ fontSize: 11.5, color: "#B87510" }}>No equipment defined for this process yet.</div>}
         {f.actualEquipment.map((e, idx) => (
           <div key={e.id} style={{ display: "grid", gridTemplateColumns: "1fr 0.6fr 28px", gap: 6, marginBottom: 6 }}>
@@ -16827,7 +17452,7 @@ function OperatorReceivingTab({ data, search, setSearch, onReceive }) {
   );
 }
 
-function OperatorProcessCard({ process, data, onLogBatch }) {
+function OperatorProcessCard({ process, data, update, onLogBatch }) {
   const recentLots = process.outputs.flatMap(o => {
     const item = getCatalogItem(data, o.itemType, o.itemId);
     return item ? (item.lots || []).map(l => ({ ...l, outputName: item.name, outputUnit: item.unit })) : [];
@@ -16841,6 +17466,13 @@ function OperatorProcessCard({ process, data, onLogBatch }) {
           <div className="mono" style={{ fontSize: 11, color: "#8A9099", marginTop: 2 }}>{process.sku} · planned {fmtNum(process.productionTimeHours)}h</div>
         </div>
         <Btn onClick={onLogBatch} style={{ padding: "7px 12px", fontSize: 12.5 }}><Plus size={14} />Log batch</Btn>
+      </div>
+
+      {/* The clock and the controlling document, on the card the operator
+          actually works from — the SOP is no use filed under admin. */}
+      <div style={{ marginTop: 10 }}>
+        <SopBadge process={process} />
+        <BatchRunControl process={process} data={data} update={update} />
       </div>
 
       <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 10, marginTop: 10, marginBottom: 10 }}>
@@ -16901,14 +17533,14 @@ function OperatorProcessCard({ process, data, onLogBatch }) {
   );
 }
 
-function OperatorProcessesTab({ data, search, setSearch, onLogBatch }) {
+function OperatorProcessesTab({ data, search, setSearch, onLogBatch, update }) {
   const rows = data.processes.filter(p => !search || p.name.toLowerCase().includes(search.toLowerCase()) || p.sku.toLowerCase().includes(search.toLowerCase()));
   return (
     <div>
       <PageHeader tabKey="opprocesses" subtitle="Run a batch against an existing process — recipes (inputs, equipment, outputs) are managed by admin"
         action={<SearchBox value={search} onChange={setSearch} placeholder="Search processes…" />} />
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-        {rows.map(p => <OperatorProcessCard key={p.id} process={p} data={data} onLogBatch={() => onLogBatch(p.id)} />)}
+        {rows.map(p => <OperatorProcessCard key={p.id} process={p} data={data} update={update} onLogBatch={() => onLogBatch(p.id)} />)}
         {rows.length === 0 && <div style={{ color: "#8A9099", padding: 24 }}>No processes defined yet — ask admin to set one up.</div>}
       </div>
     </div>

@@ -80,6 +80,23 @@ through the phase notes below and easy to lose.
   its export list from the test's own `A.<name>` references, so a renamed
   component fails the bundle loudly instead of testing nothing. **A committed test
   with an uncommitted build step is worse than no test** — it reads as coverage.
+- **Batch time is clocked, not typed — and the clock is not the only guard.**
+  The batch log used to pre-fill actual hours with the *planned* hours, so
+  leaving the field alone made actual-vs-planned agree by construction; the
+  variance report was measuring the form's default. A batch run now carries
+  `startedAt`/`finishedAt` and elapsed time is **derived, never stored** — a
+  stored duration and a stored pair of timestamps can disagree, and then nobody
+  knows which is true. Times can still be typed, because the clock does get
+  forgotten at the start of a run and left going over lunch, but
+  `setBatchRunTimes` **requires a reason** and keeps the clocked times beside the
+  correction. Do not "simplify" that by storing a duration, and do not make the
+  reason optional — a system that cannot express a forgotten clock gets worked
+  around rather than used.
+- **Equipment hours and labour hours are different numbers.** A machine running
+  two hours is two equipment-hours however many people watched it; two operators
+  on that run is four labour-hours. `runHoursForBatch` derives both from one
+  elapsed time and the run's operator count. Typing both by hand is exactly where
+  that distinction used to get lost.
 - **Ownership split, MRP vs warehouse:** the MRP owns the lot (produced quantity,
   cost, genealogy); the warehouse owns placement (pallet, slot, working quantity
   for picking). Where the two disagree the difference is **shown, not

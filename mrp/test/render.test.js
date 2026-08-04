@@ -1062,6 +1062,128 @@ console.log('\n--- material balance: shown, never reconciled ---');
      h.includes('has not been accounted for'));
 }
 
+console.log('\n--- the batch run clock ---');
+{
+  const D6 = A.seedData();
+  D6.batchRuns = [];
+  const proc = D6.processes[0];
+
+  const idle = tryRender('run0', React.createElement(A.BatchRunControl, {
+    process: proc, data: D6, update: noop }));
+  ok('the clock control renders with nothing running', !idle.err, idle.err);
+  const ih = (idle.html || '').replace(/<!-- -->/g, '');
+  ok('it offers to start a batch', ih.includes('Start batch'));
+  ok('and a way in for a run nobody clocked', ih.includes('Record times'));
+
+  const r = A.tx.startBatchRun(D6, { processId: proc.id, startedBy: 'AB', operatorCount: 2 }).run;
+  const running = tryRender('run1', React.createElement(A.BatchRunControl, {
+    process: proc, data: D6, update: noop }));
+  const rh = (running.html || '').replace(/<!-- -->/g, '');
+  ok('a running clock says so', rh.includes('Running'));
+  ok('naming the run and who started it', rh.includes(r.reference) && rh.includes('AB'));
+  ok('and offers Finish rather than Start', rh.includes('Finish') && !rh.includes('Start batch'));
+  ok('with a way to correct the times', rh.includes('Edit times'));
+
+  A.tx.finishBatchRun(D6, { runId: r.id,
+    finishedAt: new Date(new Date(r.startedAt).getTime() + 2 * 3600000).toISOString() });
+  const done = (tryRender('run2', React.createElement(A.BatchRunControl, {
+    process: proc, data: D6, update: noop })).html || '').replace(/<!-- -->/g, '');
+  ok('a finished run is flagged as waiting to be logged', done.includes('not yet logged'));
+
+  const start = tryRender('run3', React.createElement(A.StartBatchRunModal, {
+    process: proc, update: noop, onClose: noop }));
+  ok('the start dialog renders', !start.err, start.err);
+  const sh = (start.html || '').replace(/<!-- -->/g, '');
+  ok('it asks how many operators, because labour hours depend on it',
+     sh.includes('Operators on the run'));
+  ok('and explains why that is not the same as equipment hours',
+     sh.includes('multiply labour hours but not equipment hours'));
+
+  const times = tryRender('run4', React.createElement(A.BatchRunTimesModal, {
+    process: proc, run: null, update: noop, onClose: noop }));
+  ok('the manual-times dialog renders', !times.err, times.err);
+  const th = (times.html || '').replace(/<!-- -->/g, '');
+  ok('it demands a reason', th.includes('Reason (required)'));
+  ok('and says the times are recorded as entered, not measured',
+     th.includes('entered by hand, not as measured'));
+
+  const corr = (tryRender('run5', React.createElement(A.BatchRunTimesModal, {
+    process: proc, run: r, update: noop, onClose: noop })).html || '').replace(/<!-- -->/g, '');
+  ok('correcting an existing run says the clocked times are kept',
+     corr.includes('clocked times are kept'));
+}
+
+console.log('\n--- the batch log takes its hours from the clock ---');
+{
+  const D6 = A.seedData();
+  D6.batchRuns = [];
+  const proc = D6.processes.find(p => (p.equipment || []).length > 0) || D6.processes[0];
+
+  // Without a run the hours default to the plan, which is how "actual" time
+  // quietly became a copy of the forecast. Say so rather than looking measured.
+  const noRun = (tryRender('bl3', React.createElement(A.BatchLogModal, {
+    data: D6, kind: null, processId: proc.id, onClose: noop, update: noop })).html || '')
+    .replace(/<!-- -->/g, '');
+  ok('with no timed run the batch log says the hours are the plan',
+     noRun.includes('No timed run for this process'));
+  ok('and names the honest consequence',
+     noRun.includes('agree by construction'));
+
+  const r = A.tx.startBatchRun(D6, { processId: proc.id, operatorCount: 2 }).run;
+  A.tx.finishBatchRun(D6, { runId: r.id,
+    finishedAt: new Date(new Date(r.startedAt).getTime() + 2 * 3600000).toISOString() });
+
+  const withRun = tryRender('bl4', React.createElement(A.BatchLogModal, {
+    data: D6, kind: null, processId: proc.id, onClose: noop, update: noop }));
+  ok('the batch log renders with a run attached', !withRun.err, withRun.err);
+  const wh = (withRun.html || '').replace(/<!-- -->/g, '');
+  ok('the run is named', wh.includes(r.reference));
+  ok('its elapsed time is shown', wh.includes('2h 00m'));
+  ok('and the two hour figures are reported separately',
+     wh.includes('labour hours') && wh.includes('equipment hours'));
+  ok('with actual measured against plan', /over plan by|under plan by/.test(wh));
+  ok('and it is said that editing here does not rewrite the run',
+     wh.includes('does not change the run'));
+}
+
+console.log('\n--- the SOP travels with the operation ---');
+{
+  const D6 = A.seedData();
+  D6.batchRuns = [];
+  const proc = D6.processes[0];
+
+  const none = (tryRender('sop0', React.createElement(A.SopBadge, { process: proc })).html || '')
+    .replace(/<!-- -->/g, '');
+  ok('a process with no SOP says so rather than showing nothing',
+     none.includes('No SOP attached'));
+
+  const withSop = { ...proc, sopKey: 'lot_attachment:abc', sopFileName: 'SOP-014.pdf', sopVersion: 'Rev C' };
+  const badge = (tryRender('sop1', React.createElement(A.SopBadge, { process: withSop })).html || '')
+    .replace(/<!-- -->/g, '');
+  ok('an attached SOP is named', badge.includes('SOP-014.pdf'));
+  ok('with its revision, so it is clear which one was worked to', badge.includes('Rev C'));
+
+  const field = tryRender('sop2', React.createElement(A.SopField, { f: withSop, set: noop }));
+  ok('the SOP editor renders', !field.err, field.err);
+  const fh = (field.html || '').replace(/<!-- -->/g, '');
+  ok('it explains where the document will show up',
+     fh.includes('operator view') || fh.includes('process card'));
+  ok('and treats the revision as free text, not a format to guess',
+     fh.includes('whatever your quality system calls it'));
+
+  // The operator card is where the work happens, so both belong on it.
+  const fs = require('fs');
+  const path = require('path');
+  const SRC = fs.readFileSync(path.join(__dirname, '..', 'mrp-console.jsx'), 'utf8');
+  const at = SRC.indexOf('function OperatorProcessCard(');
+  const next = SRC.indexOf('\nfunction ', at + 10);
+  const body = SRC.slice(at, next > 0 ? next : SRC.length);
+  ok('the operator card carries the SOP — filed under admin it is no use',
+     body.includes('<SopBadge'));
+  ok('and the clock, so the run is timed where it is run',
+     body.includes('<BatchRunControl'));
+}
+
 console.log('\n============================');
 console.log('  ' + pass + ' passed, ' + fail + ' failed');
 console.log('============================\n');
