@@ -13264,7 +13264,11 @@ function DockReceiptsPanel({ data, update }) {
             {" — not yet recorded here"}
           </div>
           <div style={{ color: "#8C6B45" }}>
-            Recording creates the stock lots, credits the orders and moves custody.
+            {state.pending.length > 0 && state.moves.length > 0
+              ? "Recording creates the stock lots, credits the orders and moves custody."
+              : state.pending.length > 0
+                ? "Recording creates the stock lots and credits the orders."
+                : "Recording marks the picks staged, so they can be taken into custody, and closes the put-aways."}
           </div>
           <Btn onClick={apply}>Record {state.pending.length + state.moves.length} item(s)</Btn>
         </div>
@@ -13295,7 +13299,7 @@ function DockReceiptsPanel({ data, update }) {
         <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid rgba(0,0,0,.08)" }}>
           {result.applied.length > 0 && (
             <div style={{ color: "#2E7D5B" }}>
-              Recorded {result.applied.length} delivery(ies) — stock lots created and orders credited.
+              Recorded {result.applied.length} item(s). Picks are now staged — take custody of them below.
             </div>
           )}
           {result.skipped.length > 0 && (
@@ -15777,6 +15781,15 @@ function MaterialFlowTab({ data, update }) {
       <PageHeader tabKey="materialFlow"
         subtitle="Material requested from the warehouse, material the line is holding, and whether what went out matches what came back"
         action={<Btn onClick={() => setRaising(true)}><Plus size={14} />New material request</Btn>} />
+
+      {/* The floor moves before this side hears about it, so a request the
+          warehouse has already picked still reads Pending until the pick is
+          recorded — and Take custody is gated on Staged. This panel is what
+          records it, so it belongs on the same screen as the request list; it
+          was previously only on the purchasing tab, which left no way to
+          receive a staged pallet from here at all. Self-hiding when there is
+          nothing outstanding. */}
+      <DockReceiptsPanel data={data} update={update} />
 
       <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
         {tab("requests", "Requests", requests.filter(r => r.status === "Requested" || r.status === "Staged").length)}

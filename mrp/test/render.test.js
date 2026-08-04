@@ -921,6 +921,32 @@ console.log('\n--- material flow: the MRP half of the handshake ---');
   ok('the tab still renders once material is out', !held.err, held.err);
 }
 
+console.log('\n--- the pick can actually be received from where it is listed ---');
+{
+  // The floor moves before the MRP hears about it, so a request the warehouse
+  // has already picked reads Pending here until DockReceiptsPanel records it —
+  // and Take custody is gated on Staged. When that panel lived only on the
+  // purchasing tab there was no way to receive a staged pallet from Material
+  // flow at all: the list and the thing that populates it were on two screens.
+  //
+  // The panel renders null until its fetch resolves, which never happens under
+  // renderToString, so this is a source-level wiring check rather than a markup
+  // one — same reasoning as the warehouse's startup test.
+  const fs = require('fs');
+  const path = require('path');
+  const SRC = fs.readFileSync(path.join(__dirname, '..', 'mrp-console.jsx'), 'utf8');
+  const tabAt = SRC.indexOf('function MaterialFlowTab(');
+  ok('the material flow tab is in the source', tabAt > 0);
+  // Bound the search at the next top-level function so this cannot pass on a
+  // match that belongs to some later component.
+  const nextFn = SRC.indexOf('\nfunction ', tabAt + 10);
+  const body = SRC.slice(tabAt, nextFn > 0 ? nextFn : SRC.length);
+  ok('and it carries the panel that records what the warehouse has picked',
+     body.includes('<DockReceiptsPanel'));
+  ok('the panel is still on the purchasing side too — receiving deliveries did not move',
+     (SRC.match(/<DockReceiptsPanel/g) || []).length >= 2);
+}
+
 console.log('\n--- in process is a custody statement, with an exception ---');
 {
   const D5 = A.seedData();
