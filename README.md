@@ -18,10 +18,12 @@ A single platform combining two existing applications over one shared backend,
   Vercel/Neon Storage integration provides it); tables are auto-created on first
   request and seeded with **Evoia** (BU1) and **Liventia** (BU2).
 
-> Status: **Phase 0 — baseline assembled.** Both modules are present as-is over a
-> clean structure with the MRP test gate wired and passing. Integration work
-> (shared backend, Business Unit tenancy, unified inventory) is planned in
-> `docs/INTEGRATION-PLAN.md` and has not started. Authentication is intentionally
+> Status: **Phases 0–4 complete.** Both modules run on Vercel over a shared
+> Postgres backend, scoped by Business Unit. The inventory spine is unified —
+> the warehouse reads the MRP's catalog and can place its stock — and receiving
+> is single-entry: the MRP raises and places a purchase order, the warehouse
+> receives it through its normal Receive Order flow, and the delivery is
+> recorded back in the MRP exactly once. Authentication is intentionally
 > deferred to a downstream security developer; the app runs on sanitized data.
 
 ## Layout
@@ -47,13 +49,20 @@ warehouse/
   CHANGELOG.md
   archive/EVWB-REV172.html     # older snapshot, pending confirmation it can go
 docs/
-  INTEGRATION-PLAN.md          # architecture + phased roadmap + open decisions
+  INTEGRATION-PLAN.md          # architecture, roadmap, and ⚑ Flags for implementation
+  PHASE3-CATALOG-GAPS.md       # catalog gap analysis + agreed schema delta
 ```
+
+> **Before this runs a real operation**, read **⚑ Flags for implementation** at
+> the top of `docs/INTEGRATION-PLAN.md`. It lists what is blocking (no auth; the
+> go-live seed runs **warehouse → MRP**, not the other way; placement needs a
+> bulk path), the design decisions that must not be "fixed" by mistake, and the
+> known gaps and debt.
 
 ## Running the MRP test gate
 
 ```bash
-npm test          # 12 logic suites (node only) — 829 assertions
+npm test          # 15 MRP logic suites + API and warehouse suites — 1,212 assertions
 npm run test:full # + tsc syntax check; render suite is run separately
 ```
 

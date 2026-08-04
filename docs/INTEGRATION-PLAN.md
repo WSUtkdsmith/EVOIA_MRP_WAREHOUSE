@@ -22,6 +22,76 @@ roadmap, and the open questions.
    developer. `/api/state` currently has no authentication — see "Handoff to
    security" below.
 
+## ⚑ Flags for implementation
+
+Everything that must be decided, built or checked before this runs a real
+operation. Kept in one place deliberately — these were otherwise scattered
+through the phase notes below and easy to lose.
+
+### Blocking before real data
+
+| # | Flag | Why it matters |
+|---|---|---|
+| 1 | **No authentication anywhere.** Every endpoint is open; anyone with the URL can read or write. | Fine for the sanitized build, unacceptable with real inventory and costs. Owned by the downstream security developer — see *Handoff to security*. Client-side `rolePermissions` is **not** a boundary. |
+| 2 | **Go-live seeding runs warehouse → MRP, not MRP → warehouse.** Not built. | At go-live the **warehouse is the source of truth for what is on the floor**; the MRP starts empty. The seeded demo is the opposite way round (MRP rich, warehouse empty), which is an artifact of the sample data, not the real shape. Onboarding needs a one-time path that reads existing pallets and creates the matching MRP lots (batch, expiry, quantity, location already known) so the MRP starts life agreeing with the floor. Same ledger/idempotency shape as Phase 4 step 4, pointed the other way. |
+| 3 | **Placement does not scale by hand.** | 442 in-stock lots in the seed alone. Whichever direction the initial load runs, it needs a bulk/CSV path — nobody is clicking Place 442 times. |
+
+### Design notes to preserve (so they are not "fixed" by mistake)
+
+- **`Place` is not a receiving bypass, and should not be routed through putaway.**
+  It acts only on lots that **already exist** in the MRP; receiving creates lots
+  that do not. The two sets are disjoint by construction. The warehouse itself
+  already accepts stock existing without a putaway cycle —
+  `saveManufacturedBatch` sets `pendingPutaway = false`. Place's ongoing role is
+  **production output**: a lot comes off the line and needs a home, and nothing
+  else owns that event (`saveManufacturedBatch` covers only empty-tote → filled).
+- **Receiving an MRP order *is* routed through the normal flow**, deliberately —
+  it becomes a queued order file and goes in via Receive Order. The first cut let
+  it bypass staging, putaway, labels, damage capture and signature; that was a
+  real error and was corrected. Do not add a second door to receiving.
+- **`IMPORT_ORDER` is a hardcoded list and has caught us twice.** Any new child
+  table must be registered there or it will export correctly and import to
+  nothing. Bit `packagings`, then `purchase_order_lines`. The CSV round-trip test
+  is what caught both — keep it.
+- **Ownership split, MRP vs warehouse:** the MRP owns the lot (produced quantity,
+  cost, genealogy); the warehouse owns placement (pallet, slot, working quantity
+  for picking). Where the two disagree the difference is **shown, not
+  reconciled** — "over-placed" is a visible state, not a silent clamp. A real
+  two-way quantity sync needs conflict rules nobody has specified.
+
+### Functional gaps (known, not blocking)
+
+- **Shipping/despatch is not unified** the way receiving now is — the reverse of
+  Phase 4 remains for outbound.
+- **Drag-to-place on the map**, and **multi-slot footprints** from
+  `packagesPerSlot` (captured and displayed, but does not yet reserve positions).
+- **Storage rules global vs per-BU** is still TBD in the scoping table.
+- Purchase orders are **single-supplier**; grouping is per supplier by design.
+
+### Technical debt
+
+- **`@vercel/postgres@0.10.0` is deprecated** in favour of Neon's native SDK.
+  Works today; migrate before it stops being patched.
+- **The render suite (~400 assertions) is not in CI** — only the 1,020 logic
+  assertions and the API/warehouse suites run. It is the suite that catches
+  undefined names and components wired to props that do not exist.
+- **`mrp/app.bundle.js` is a committed build artifact.** A Vercel build step
+  should generate it instead, so source and bundle cannot drift.
+- **Catalog payload is ~480 KB** for 762 lots. Fine now; if it grows the fix is
+  server-side filtering/paging, not client-side trimming.
+
+### Inherited MRP gaps (from the original `AUDIT.md`, still open)
+
+- Process flow diagram is not legible (derivation sound, SVG layout is the problem).
+- **Conversion cost is not priced** — labour and equipment hours are recorded and
+  displayed but not costed, so every margin in the app is material-only.
+- A despatch can draw on **only one lot**.
+- `calendar_overrides` ships with no seed rows, so the feature is undemonstrated.
+- Two regions are **reconstructions rather than original builds** and deserve a
+  read before they become retained code: `processGraph` / `coverageSummary`, and
+  `CONTINUOUS_CALENDAR` / `defaultCalendar` / `calendarFor`.
+
+
 ## What a "Business Unit" means here (proposed)
 
 A BU is a **tenant**: an independent business whose inventory, lots, orders,
