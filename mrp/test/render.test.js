@@ -1084,11 +1084,37 @@ console.log('\n--- the batch run clock ---');
   ok('and offers Finish rather than Start', rh.includes('Finish') && !rh.includes('Start batch'));
   ok('with a way to correct the times', rh.includes('Edit times'));
 
+  ok('and a way to throw away a clock started by mistake', rh.includes('Discard'));
+
   A.tx.finishBatchRun(D6, { runId: r.id,
     finishedAt: new Date(new Date(r.startedAt).getTime() + 2 * 3600000).toISOString() });
   const done = (tryRender('run2', React.createElement(A.BatchRunControl, {
     process: proc, data: D6, update: noop })).html || '').replace(/<!-- -->/g, '');
   ok('a finished run is flagged as waiting to be logged', done.includes('not yet logged'));
+  // Listed, not just counted — a false start that was also stopped is still a
+  // false start, and it has to be removable.
+  ok('and is listed by reference', done.includes(r.reference));
+  ok('with its elapsed time', done.includes('2h 00m'));
+  ok('and can be discarded from there', done.includes('Discard'));
+
+  const shortRun = { id: 'x', reference: 'RUN-0099', status: 'Running',
+    startedAt: new Date(Date.now() - 30000).toISOString(), finishedAt: '', startedBy: 'AB' };
+  const disc = tryRender('run6', React.createElement(A.DiscardBatchRunModal, {
+    process: proc, run: shortRun, update: noop, onClose: noop }));
+  ok('the discard dialog renders', !disc.err, disc.err);
+  const dh = (disc.html || '').replace(/<!-- -->/g, '');
+  ok('a mis-click needs no justification', dh.includes('Reason (optional)'));
+  ok('and it says the run is kept rather than deleted', dh.includes('keeps its reference'));
+  ok('the safe way out is the plain one', dh.includes('Keep it'));
+
+  // A long run is far more likely to be real work than a mis-click, so say so
+  // before it is thrown away — losing it loses the only record of the job.
+  const longRun = { ...shortRun, startedAt: new Date(Date.now() - 3 * 3600000).toISOString() };
+  const lh = (tryRender('run7', React.createElement(A.DiscardBatchRunModal, {
+    process: proc, run: longRun, update: noop, onClose: noop })).html || '').replace(/<!-- -->/g, '');
+  ok('discarding a substantial run warns that the time is real',
+     lh.includes('log it as a batch instead'));
+  ok('while a 30-second one does not nag', !dh.includes('log it as a batch instead'));
 
   const start = tryRender('run3', React.createElement(A.StartBatchRunModal, {
     process: proc, update: noop, onClose: noop }));

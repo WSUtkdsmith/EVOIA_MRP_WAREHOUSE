@@ -199,19 +199,49 @@ console.log('\n--- the run and the batch it produced ---');
      }).length === 1);
 }
 
-console.log('\n--- cancelling ---');
+console.log('\n--- discarding a false start ---');
 {
+  // Pressing Start by mistake, or on the wrong process, has to be undoable or
+  // the junk run sits in the list for ever and the clock stays occupied.
   const { D, proc } = plant();
-  const r = tx.startBatchRun(D, { processId: proc.id }).run;
-  ok('a run can be abandoned', tx.cancelBatchRun(D, { runId: r.id, reason: 'wrong process' }).ok === true);
+  const r = tx.startBatchRun(D, { processId: proc.id, notes: 'morning run' }).run;
+  ok('a running clock can be discarded', tx.cancelBatchRun(D, { runId: r.id, reason: 'wrong process' }).ok === true);
   ok('and stops being the active clock', activeBatchRun(D, proc.id) === null);
-  ok('and is not offered to the batch log', unloggedBatchRuns(D, proc.id).length === 0);
+  ok('so the process can be started again straight away',
+     tx.startBatchRun(D, { processId: proc.id }).ok === true);
+  ok('the run is kept, not deleted — the reference has no unexplained gap',
+     (D.batchRuns || []).some(x => x.id === r.id && x.status === 'Cancelled'));
+  ok('why it went is recorded when given', /wrong process/.test(r.notes));
+  ok('and whatever was noted at the start survives it', /morning run/.test(r.notes));
 
-  const r2 = tx.startBatchRun(D, { processId: proc.id }).run;
-  tx.finishBatchRun(D, { runId: r2.id, finishedAt: at(r2, 1) });
-  r2.batchId = 'someBatch';
-  ok('a run already written up as a batch cannot be cancelled out from under it',
-     tx.cancelBatchRun(D, { runId: r2.id }).ok === false);
+  // A mis-click is not something anyone should have to justify in writing.
+  const { D: D0, proc: p0 } = plant();
+  const r0 = tx.startBatchRun(D0, { processId: p0.id }).run;
+  ok('no reason is needed to discard', tx.cancelBatchRun(D0, { runId: r0.id }).ok === true);
+  ok('discarding twice is refused rather than silently repeated',
+     tx.cancelBatchRun(D0, { runId: r0.id }).ok === false);
+  ok('an unknown run cannot be discarded', tx.cancelBatchRun(D0, { runId: 'nope' }).ok === false);
+
+  // A false start that was also stopped is still a false start.
+  const { D: D1, proc: p1 } = plant();
+  const r1 = tx.startBatchRun(D1, { processId: p1.id }).run;
+  tx.finishBatchRun(D1, { runId: r1.id, finishedAt: at(r1, 0.05) });
+  ok('a finished run is still discardable', tx.cancelBatchRun(D1, { runId: r1.id }).ok === true);
+  ok('and stops being offered to the batch log', unloggedBatchRuns(D1, p1.id).length === 0);
+
+  // Once the hours are on the lots the run is no longer ours to throw away.
+  const { D: D2, proc: p2 } = plant();
+  const r2 = tx.startBatchRun(D2, { processId: p2.id }).run;
+  tx.finishBatchRun(D2, { runId: r2.id, finishedAt: at(r2, 1) });
+  tx.logProductionBatch(D2, {
+    processId: p2.id, date: '2026-08-12', notes: '', sources: [],
+    outputs: [{ outputId: p2.outputs[0].id, lotNumber: 'LOGGED-1', qty: 4, qcChecks: [] }],
+    actualEquipment: [], actualLabor: [], runId: r2.id
+  });
+  const refused = tx.cancelBatchRun(D2, { runId: r2.id });
+  ok('a run already written up as a batch cannot be discarded', refused.ok === false);
+  ok('and says why', /already been logged/.test(refused.error));
+  ok('it stays Finished rather than being half-changed', r2.status === 'Finished');
 }
 
 console.log('\n--- references ---');

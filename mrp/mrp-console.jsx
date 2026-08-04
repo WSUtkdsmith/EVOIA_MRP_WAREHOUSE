@@ -2460,14 +2460,31 @@ const tx = {
     return { ok: true, run };
   },
 
+  /* Throwing away a run that measured nothing - a mis-click, or Start pressed
+     on the wrong process.
+
+     Not the same act as correcting one, and deliberately not the same bar:
+     setBatchRunTimes demands a reason because it changes a recorded
+     measurement, whereas this says the measurement never meant anything.
+     Making someone justify a mis-click in writing teaches them to leave junk
+     runs lying around instead, so the reason is optional here.
+
+     A status change, not a delete: the run keeps its reference so a gap in
+     the numbering is explainable rather than suspicious. Once a run has been
+     written up as a batch its hours are on the lots, and it is no longer
+     ours to throw away. */
   cancelBatchRun(db, { runId, reason }) {
     const run = repo.find(db, "batchRuns", runId);
     if (!run) return { ok: false, error: "That run no longer exists." };
-    if (run.status === "Finished" && run.batchId) {
+    if (run.status === "Cancelled") return { ok: false, error: "That run was already discarded." };
+    if (run.batchId) {
       return { ok: false, error: "That run has already been logged as a batch." };
     }
     run.status = "Cancelled";
-    if (reason) run.notes = String(reason).trim();
+    const why = String(reason || "").trim();
+    // Append rather than replace - whatever was noted at the start of the run
+    // is still the only account of what someone thought they were doing.
+    if (why) run.notes = run.notes ? run.notes + " · Discarded: " + why : "Discarded: " + why;
     return { ok: true, run };
   },
 
@@ -10382,7 +10399,8 @@ function BatchRunControl({ process, data, update, compact }) {
   const run = activeBatchRun(data, process.id);
   const pending = unloggedBatchRuns(data, process.id);
   const [starting, setStarting] = useState(false);
-  const [editing, setEditing] = useState(null);   // a run being corrected/typed
+  const [editing, setEditing] = useState(null);     // a run being corrected/typed
+  const [discarding, setDiscarding] = useState(null); // a run being thrown away
   const [err, setErr] = useState("");
   useRunningClock(!!run);
 
@@ -10417,6 +10435,8 @@ function BatchRunControl({ process, data, update, compact }) {
               style={{ padding: "5px 12px", fontSize: 12 }}>Finish</Btn>
             <Btn variant="secondary" onClick={() => { setErr(""); setEditing(run); }}
               style={{ padding: "5px 10px", fontSize: 12 }}>Edit times</Btn>
+            <Btn variant="ghost" onClick={() => { setErr(""); setDiscarding(run); }}
+              style={{ padding: "5px 10px", fontSize: 12 }}>Discard</Btn>
           </span>
         </div>
       ) : (
@@ -10424,11 +10444,31 @@ function BatchRunControl({ process, data, update, compact }) {
           <Btn onClick={() => setStarting(true)} style={{ padding: "5px 12px", fontSize: 12 }}>Start batch</Btn>
           <Btn variant="secondary" onClick={() => { setErr(""); setEditing({ processId: process.id }); }}
             style={{ padding: "5px 10px", fontSize: 12 }}>Record times</Btn>
-          {pending.length > 0 && (
-            <span style={{ fontSize: 11.5, color: "#2E7D5B", fontWeight: 600 }}>
-              {pending.length} finished run{pending.length === 1 ? "" : "s"} not yet logged
-            </span>
-          )}
+        </div>
+      )}
+
+      {/* Finished runs waiting to be written up. Listed rather than counted,
+          because a false start that was also stopped is still a false start
+          and there has to be a way to get rid of it. */}
+      {pending.length > 0 && (
+        <div style={{ marginTop: 8 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#7A8079", textTransform: "uppercase",
+                        letterSpacing: 0.3, marginBottom: 4 }}>
+            Finished, not yet logged
+          </div>
+          {pending.map(p => (
+            <div key={p.id} style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap",
+                                     fontSize: 12, padding: "3px 0" }}>
+              <span className="mono" style={{ fontWeight: 600 }}>{p.reference}</span>
+              <span className="mono">{fmtDuration(runElapsedMs(p))}</span>
+              <span style={{ color: "#8A9099" }}>{fmtDate(String(p.finishedAt).slice(0, 10))}</span>
+              {p.manual && <Badge tone="warn">by hand</Badge>}
+              <span style={{ marginLeft: "auto" }}>
+                <Btn variant="ghost" onClick={() => { setErr(""); setDiscarding(p); }}
+                  style={{ padding: "3px 8px", fontSize: 11.5 }}>Discard</Btn>
+              </span>
+            </div>
+          ))}
         </div>
       )}
 
@@ -10437,7 +10477,65 @@ function BatchRunControl({ process, data, update, compact }) {
       {starting && <StartBatchRunModal process={process} update={update} onClose={() => setStarting(false)} />}
       {editing && <BatchRunTimesModal process={process} run={editing.id ? editing : null}
         update={update} onClose={() => setEditing(null)} />}
+      {discarding && <DiscardBatchRunModal process={process} run={discarding}
+        update={update} onClose={() => setDiscarding(null)} />}
     </div>
+  );
+}
+
+/* Throwing away a run that measured nothing.
+
+   Distinct from correcting one, and deliberately not the same bar. Correcting
+   changes a recorded measurement, so setBatchRunTimes demands a reason.
+   Discarding says the measurement never meant anything - a mis-click, or Start
+   pressed on the wrong process - and making someone justify a mis-click in
+   writing is the kind of friction that teaches people to leave junk runs lying
+   around instead. So the reason is offered, not required.
+
+   It is a status change rather than a delete: the run keeps its reference, so
+   a gap in the numbering is explainable rather than suspicious. A run already
+   written up as a batch cannot be discarded at all - the transaction refuses,
+   because the hours are on the lots by then. */
+function DiscardBatchRunModal({ process, run, update, onClose }) {
+  const [reason, setReason] = useState("");
+  const [err, setErr] = useState("");
+  const running = run.status === "Running";
+  const elapsed = runElapsedMs(run);
+  // Long enough that real work probably happened. Not a rule - just worth
+  // saying out loud before it goes.
+  const substantial = elapsed > 15 * 60000;
+
+  const submit = () => {
+    let res = null;
+    update(d => { res = tx.cancelBatchRun(d, { runId: run.id, reason }); return d; });
+    if (res && res.ok) onClose(); else setErr((res && res.error) || "Could not discard the run.");
+  };
+
+  return (
+    <Modal title={"Discard " + run.reference} onClose={onClose}>
+      <div style={{ fontSize: 12.5, color: "#5B6470", marginBottom: 12 }}>
+        {process.name} · {running ? "running for " : "ran "}<b>{fmtDuration(elapsed)}</b>
+        {run.startedBy ? " · started by " + run.startedBy : ""}
+      </div>
+      <div style={{ fontSize: 12.5, color: "#7A5205", background: "#F6E6C8", border: "1px solid #C99A3A",
+                    borderRadius: 8, padding: "10px 12px", marginBottom: 12 }}>
+        {substantial
+          ? <>This run recorded <b>{fmtDuration(elapsed)}</b>. If that time was real work, log it as a batch
+             instead — discarding it loses the only record of how long the job took.</>
+          : <>For a clock started by mistake, or on the wrong process. The run stops counting and will not
+             be offered to the batch log.</>}
+        {" "}It keeps its reference rather than being deleted, so the numbering has no unexplained gap.
+      </div>
+      <Field label="Reason (optional)">
+        <input style={inputStyle} value={reason} onChange={e => setReason(e.target.value)}
+          placeholder="e.g. started on the wrong process" />
+      </Field>
+      {err && <div style={{ fontSize: 12, color: "#8A2E20", marginTop: 8, fontWeight: 600 }}>{err}</div>}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
+        <Btn variant="secondary" onClick={onClose}>Keep it</Btn>
+        <Btn onClick={submit}>Discard run</Btn>
+      </div>
+    </Modal>
   );
 }
 
