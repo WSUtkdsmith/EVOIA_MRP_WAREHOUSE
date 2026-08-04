@@ -59,6 +59,16 @@ through the phase notes below and easy to lose.
   reconciled** — "over-placed" is a visible state, not a silent clamp. A real
   two-way quantity sync needs conflict rules nobody has specified.
 
+### Next planned work
+
+- **Phase 5 — material flow (specced, not built).** See
+  `docs/PHASE5-MATERIAL-FLOW.md`. Gives WIP an owner: a 6-position To/From
+  Process zone, Material Request / Material Return documents, an In Process
+  custody flag, and an MRP-side material balance that reuses the existing waste
+  streams. Three open decisions are listed at the end of that spec — FEFO vs
+  named lot, what happens when all six positions are full, and whether produced
+  goods must pass through To/From.
+
 ### Functional gaps (known, not blocking)
 
 - **Shipping/despatch is not unified** the way receiving now is — the reverse of
@@ -381,6 +391,40 @@ transaction logic is duplicated.
 - **Phase 4 — Polish + handoff.** Address inherited MRP gaps (process-flow SVG,
   reconstructed regions, conversion-cost pricing, multi-lot shipments) by
   priority; hand the auth seam to the security developer.
+
+## Phase 5 — Material flow between Warehouse and Operations (specced, not built)
+
+The handshake between two separate entities. An MRP lot has `usedDate` and
+`consumedDate` but **no location**, so between "picked from the rack" and
+"consumed in a batch" material is physically real and organizationally nowhere.
+
+Full spec: **`docs/PHASE5-MATERIAL-FLOW.md`**. Decisions taken:
+
+- **In Process** = material received or produced that is **not under the direct
+  supervision of the warehouse manager**. A custody statement, not a location —
+  so it is a **viewable zone type with no positions**, never slotted.
+- **One zone gets built: To/From Process, 6 positions** (`TP1`–`TP6`), modelled
+  on Build Slot. The **only** place a Material Request or Return may populate —
+  one door between the entities. **Transit, not holding**: the position frees the
+  moment Operations marks the material received, so six throttles concurrent
+  handovers, not concurrent jobs. Reuses the receiving framework.
+- **Material Request** (Warehouse → Operations) and **Material Return**
+  (Operations → Warehouse). **Transfer Order is reserved** for movement between
+  warehouses, a later feature — do not conflate.
+- Returns carry a **`returnType`**: `leftover` (back to an existing lot and
+  pallet) or `output` (produced goods, creating a new lot). Leftovers display the
+  **original position** as a hint so material goes straight back where it came
+  from — a hint, not a reservation.
+- **In Process is a stored flag** set by the transactions, not hand-ticked, and
+  cleared only as an **exception with a recorded reason** (the `amendFrozenRun`
+  shape). It shows on issued raw lots, and on intermediates and finished goods
+  from production until a Return is placed.
+- **The material balance lives in the MRP**, not the warehouse:
+  `issued − (consumed + returned + waste) = discrepancy`. Consumption
+  (`lot_sources.qty`) and waste (`wasteAllocations` → waste streams) are
+  **already recorded**; only issued and returned are new. This also gives
+  `wasteEvents()` — flagged in the original audit as built-but-unsurfaced — its
+  first consumer.
 
 ## Housekeeping applied in Phase 0
 

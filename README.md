@@ -51,6 +51,7 @@ warehouse/
 docs/
   INTEGRATION-PLAN.md          # architecture, roadmap, and ⚑ Flags for implementation
   PHASE3-CATALOG-GAPS.md       # catalog gap analysis + agreed schema delta
+  PHASE5-MATERIAL-FLOW.md      # warehouse <-> operations handshake (specced)
 ```
 
 > **Before this runs a real operation**, read **⚑ Flags for implementation** at
