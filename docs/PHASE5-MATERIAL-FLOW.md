@@ -206,8 +206,15 @@ inProcessClearedReason: "str"     // set only via the exception path
    (`opts.materialFlow`), so the door cannot quietly become six more storage
    slots. 12 warehouse assertions cover it, including that `IN_PROCESS_LOCS`
    does **not** exist.
-3. **API** — `/api/material-flow?bu=` exposing open requests and returns, the
-   same read-only shape as `/api/pending-receipts`; application stays in the MRP.
+3. ~~**API**~~ — **done.** `GET /api/material-flow?bu=` returns the warehouse's
+   worklist: requests to pick (each pending line carrying its **FEFO suggestion
+   and alternatives**, so the picker can substitute without a second round
+   trip), returns to put away with their `returnType` and origin hint, what
+   Operations is holding (oldest out first — what has been away longest is what
+   to chase), the six positions with who holds each and which direction, and a
+   `doorFull` flag so a blocked pick is stated rather than inferred.
+   Read-only: staging, receiving and accepting all move custody and stay in the
+   MRP's transactions. `api/test/material-flow.test.js` — 39 assertions.
 4. **Warehouse UI** — requests to pick and stage, returns to put away, with the
    original-position hint on leftovers.
 5. **MRP UI** — raise requests, the In Process window, and the balance report.
