@@ -142,5 +142,103 @@ eq(F.deriveMaterialFlow({ materialRequests: [null] }).requests, [], 'a null requ
 }
 eq(F.TRANSIT_POSITIONS.length, 6, 'six positions, matching the warehouse');
 
+// --- the return leg: what the warehouse did that the MRP has not recorded ---
+//
+// There is no ledger here on purpose. The line's own status says whether the
+// action landed, so replay is decided by the MRP's data rather than by a list
+// the warehouse keeps about itself.
+const stagedPallet = (over) => ({
+  palletId: 'EV1', mrpFlowAction: 'stage', mrpRequestId: 'r1', mrpRequestLineId: 'L1',
+  mrpStagedLotId: 'B', transitLocation: 'TP1', mrpOriginLocation: 'M1A1',
+  contents: [{ quantityOriginal: 120, quantityCurrent: 120 }],
+  ...over,
+});
+const acceptPallet = (over) => ({
+  palletId: 'EV2', mrpFlowAction: 'accept', mrpReturnId: 'ret1', mrpReturnLineId: 'RL1',
+  mrpPutawayLocation: 'M1A1', contents: [{ quantityOriginal: 40 }],
+  ...over,
+});
+const withReturn = (lineStatus) => ({
+  materialReturns: [{ id: 'ret1', reference: 'RET-0001', returnType: 'leftover', status: 'Returned',
+    lines: [{ id: 'RL1', itemType: 'raw', itemId: 'rm1', lotId: 'B', qty: 40, lineStatus }] }],
+});
+
+{
+  const d = base();
+  d.materialRequests = [request()];   // L1 still Pending — the pick has not landed
+  const a = F.derivePendingMaterialActions({ pallets: [stagedPallet()] }, d);
+  eq(a.counts, { pending: 1, applied: 0, total: 1 }, 'a pick the MRP has not seen is pending');
+  const s = a.pending[0];
+  eq(s.kind, 'stage', 'named by what it does');
+  eq([s.requestId, s.lineId, s.lotId], ['r1', 'L1', 'B'], 'carrying which line and which lot');
+  eq(s.qty, 120, 'and how much left the rack');
+  eq([s.position, s.originLocation], ['TP1', 'M1A1'],
+     'with the door position and where it came from, so a leftover can go back');
+  eq([s.substituted, s.substitutionReason], [false, ''], 'FEFO taken as offered');
+}
+{
+  const d = base();
+  d.materialRequests = [request({ lines: [{ id: 'L1', itemType: 'raw', itemId: 'rm1', qty: 120, lotId: 'B', lineStatus: 'Staged', position: 'TP1' }] })];
+  const a = F.derivePendingMaterialActions({ pallets: [stagedPallet()] }, d);
+  eq(a.counts, { pending: 0, applied: 1, total: 1 },
+     'once the line is past Pending the same pallet reads as already recorded — no replay');
+  eq(a.applied[0].palletId, 'EV1', 'and is still reported, so the warehouse can clear its flag');
+
+  d.materialRequests[0].lines[0].lineStatus = 'Received';
+  eq(F.derivePendingMaterialActions({ pallets: [stagedPallet()] }, d).counts.applied, 1,
+     'a line Operations has already taken is likewise not re-staged');
+}
+{
+  const d = base();
+  d.materialRequests = [request({
+    lines: [{ id: 'L1', itemType: 'raw', itemId: 'rm1', qty: 120, lineStatus: 'Pending' }] })];
+  const a = F.derivePendingMaterialActions(
+    { pallets: [stagedPallet({ mrpStagedLotId: 'A', mrpSubstituted: true, mrpSubstitutionReason: 'B blocked behind pallet' })] }, d);
+  eq(a.pending[0].lotId, 'A', 'the picker took a different lot');
+  eq([a.pending[0].substituted, a.pending[0].substitutionReason],
+     [true, 'B blocked behind pallet'],
+     'and the override travels with its reason — a picker beating FEFO is signal, not noise');
+}
+{
+  const d = { ...base(), ...withReturn('Staged') };
+  const a = F.derivePendingMaterialActions({ pallets: [acceptPallet()] }, d);
+  eq(a.counts, { pending: 1, applied: 0, total: 1 }, 'a put-away the MRP has not seen is pending');
+  eq(a.pending[0].kind, 'accept', 'custody is coming back');
+  eq([a.pending[0].returnId, a.pending[0].lineId, a.pending[0].location],
+     ['ret1', 'RL1', 'M1A1'], 'naming the line and where it landed');
+
+  const d2 = { ...base(), ...withReturn('Accepted') };
+  eq(F.derivePendingMaterialActions({ pallets: [acceptPallet()] }, d2).counts,
+     { pending: 0, applied: 1, total: 1 }, 'an accepted line is not accepted twice');
+
+  const d3 = { ...base(), ...withReturn('Pending') };
+  eq(F.derivePendingMaterialActions({ pallets: [acceptPallet()] }, d3).counts.pending, 1,
+     'a return still Pending is offered — the MRP stages it on the way through');
+}
+{
+  const d = { ...base(), materialRequests: [request()], ...withReturn('Staged') };
+  const a = F.derivePendingMaterialActions({ pallets: [stagedPallet(), acceptPallet()] }, d);
+  eq(a.counts.pending, 2, 'both directions ride in one batch');
+  eq(a.pending.map((x) => x.kind), ['stage', 'accept'], 'each keeping its own kind');
+}
+
+// Anything that is not a flow pallet is not our business.
+eq(F.derivePendingMaterialActions(null, null).counts, { pending: 0, applied: 0, total: 0 },
+   'null state yields no actions');
+eq(F.derivePendingMaterialActions({ pallets: 'nonsense' }, base()).pending, [],
+   'malformed pallets ignored');
+eq(F.derivePendingMaterialActions({ pallets: [null, {}] }, base()).pending, [],
+   'a null or bare pallet is skipped');
+eq(F.derivePendingMaterialActions({ pallets: [{ palletId: 'EV9', locationType: 'rack', location: 'M1A1' }] }, base()).pending,
+   [], 'a hand-built pallet carries no flow action and is left alone');
+eq(F.derivePendingMaterialActions({ pallets: [stagedPallet({ mrpRequestLineId: '' })] }, base()).pending,
+   [], 'a stage action with no line to point at is not offered');
+{
+  // A line the MRP no longer has cannot be assumed applied, or the pick would
+  // vanish silently. Unknown means unrecorded.
+  const a = F.derivePendingMaterialActions({ pallets: [stagedPallet()] }, base());
+  eq(a.counts.pending, 1, 'a pick against an unknown line stays pending rather than disappearing');
+}
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

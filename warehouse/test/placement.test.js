@@ -29,10 +29,13 @@ function extract(name) {
 
 const NAMES = ['mrpPlacementIndex', 'mrpLotPlacement', 'mrpContentLine', 'buildPalletFromMrpLot',
                'mrpPoLineReceived', 'mrpReceiptApplied', 'mrpOrderToParsed', 'mrpOrderQueued',
-               'buildTransitPalletForRequest', 'transitPositionsHeld', 'pendingMaterialActions'];
+               'buildTransitPalletForRequest', 'transitPositionsHeld', 'pendingMaterialActions',
+               // pendingMaterialActions names a put-away by where it landed.
+               'locationText'];
 // Constants the extracted functions close over. Pulled from the file too, so a
 // rename fails here rather than silently testing a stale literal.
-const CONSTS = ['TRANSIT_ZONE', 'IN_PROCESS_ZONE', 'TRANSIT_LOCS'].map((n) => {
+const CONSTS = ['TRANSIT_ZONE', 'IN_PROCESS_ZONE', 'TRANSIT_LOCS',
+                'BARREL_LOCS', 'PLANT_LOCS', 'EMPTY_TOTE_LOCS', 'STAGING_ZONE', 'BUILD_ZONE'].map((n) => {
   const m = HTML.match(new RegExp('const ' + n + '=([^;]+);'));
   if (!m) throw new Error('constant not found in warehouse/index.html: ' + n);
   return 'const ' + n + '=' + m[1] + ';';
@@ -40,7 +43,8 @@ const CONSTS = ['TRANSIT_ZONE', 'IN_PROCESS_ZONE', 'TRANSIT_LOCS'].map((n) => {
 const src = CONSTS + '\n' + NAMES.map(extract).join('\n');
 const { mrpPlacementIndex, mrpLotPlacement, mrpContentLine, buildPalletFromMrpLot,
         mrpPoLineReceived, mrpReceiptApplied, mrpOrderToParsed, mrpOrderQueued,
-        buildTransitPalletForRequest, transitPositionsHeld, pendingMaterialActions } =
+        buildTransitPalletForRequest, transitPositionsHeld, pendingMaterialActions,
+        locationText } =
   new Function(src + '; return {' + NAMES.join(',') + '};')();
 
 let passed = 0, failed = 0;
@@ -243,6 +247,36 @@ const LOT_PICKED = { lotId: 'lotB', lotNumber: 'B', expirationDate: '2026-09-01'
   eq(pendingMaterialActions([a]).length, 0, 'once recorded it stops being pending — no double staging');
   eq(pendingMaterialActions([pallet('EV9', [])]).length, 0, 'an ordinary pallet is not a material-flow action');
   eq(pendingMaterialActions(null).length, 0, 'null pallets tolerated');
+}
+
+// The other direction: material put away off a return. Custody comes back to
+// the warehouse the moment the pallet lands, so the action is raised there and
+// the MRP is told after — the same way a pick is.
+{
+  const putAway = (over) => ({
+    palletId: 'EV7', mrpFlowStatus: 'pending', mrpFlowAction: 'accept',
+    mrpReturnId: 'ret1', mrpReturnLineId: 'RL1', mrpPutawayLocation: 'M1A1',
+    locationType: 'rack', location: 'M1A1',
+    contents: [{ mrpLotId: 'lotB', quantityCurrent: 40 }],
+    ...over,
+  });
+  const actions = pendingMaterialActions([putAway()]);
+  eq(actions.length, 1, 'a put-away is an action waiting to be recorded');
+  eq(actions[0].kind, 'accept', 'named for the custody it takes back');
+  eq([actions[0].returnId, actions[0].lineId], ['ret1', 'RL1'], 'carrying the return line it closes');
+  eq(actions[0].location, 'Main Storage M1A1',
+     'and where it went, spelled out — the MRP records a place, not a code');
+
+  eq(pendingMaterialActions([putAway({ mrpReturnLineId: '' })]).length, 0,
+     'an accept with no line to point at is not offered');
+  eq(pendingMaterialActions([putAway({ mrpFlowStatus: 'applied' })]).length, 0,
+     'once recorded it stops being pending — no double accepting');
+
+  const both = pendingMaterialActions([
+    buildTransitPalletForRequest(REQ_LINE, REQ, { palletId: 'EV1', qty: 120, position: 'TP1', lot: LOT_PICKED }),
+    putAway(),
+  ]);
+  eq(both.map((x) => x.kind), ['stage', 'accept'], 'both directions ride in one batch');
 }
 
 // --- To/From Process and In Process -----------------------------------------

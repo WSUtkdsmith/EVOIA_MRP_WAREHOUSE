@@ -15169,9 +15169,10 @@ function renderMaterialFlow(){
       <td>${esc(l.lotNumber||'—')}</td>
       <td>${esc(formatNum(l.qty))} ${esc(l.unit||'')}</td>
       <td>${esc(l.suggestedLocation||'—')}</td>
-      <td>${esc(l.lineStatus)}${l.position?' · '+esc(l.position):''}</td>
+      <td><button type="button" class="btn small putAwayBtn" data-ret="${esc(l.ret.returnId)}" data-line="${esc(l.lineId)}">Put away</button></td>
     </tr>`).join('')
       :'<tr><td colspan="7">Nothing coming back.</td></tr>';
+    body.querySelectorAll('.putAwayBtn').forEach(b=>b.onclick=()=>putAwayReturnLine(b.dataset.ret,b.dataset.line));
     $('flowCount').textContent=rows.length;
   }else{
     const rows=(materialFlow.inProcess||[]).filter(match);
@@ -15260,6 +15261,52 @@ function submitStagePick(e){
   render();
   renderMaterialFlow();
   toast(`Staged ${formatNum(qty)} for ${req.reference} in ${position}.`);
+}
+
+/* Taking material back into warehouse custody.
+
+   A leftover goes back to the position it came from, which the return already
+   carries as a hint; production output has never been stored, so it needs a
+   position choosing. Either way the pallet lands somewhere real here and the
+   MRP is told separately, pending until it records it. */
+function putAwayReturnLine(returnId,lineId){
+  const ret=((materialFlow&&materialFlow.returns)||[]).find(r=>r.returnId===returnId);
+  const line=ret&&(ret.lines||[]).find(l=>l.lineId===lineId);
+  if(!line) return toast('That return line is no longer open.');
+  if(!requirePermission('moveInventory','putting returned material away')) return;
+
+  const suggested=line.suggestedLocation||'';
+  const free=RACK.filter(loc=>!occupantAt(loc)&&TRANSIT_LOCS.indexOf(loc)===-1);
+  const prompt_=ret.returnType==='output'
+    ? 'Production output — choose a position for '+line.itemName+':'
+    : 'Leftover from '+line.itemName+' — position (came from '+(suggested||'unknown')+'):';
+  const chosen=(prompt(prompt_, suggested&&free.indexOf(suggested)!==-1?suggested:(free[0]||''))||'').trim().toUpperCase();
+  if(!chosen) return;
+  if(free.indexOf(chosen)===-1) return toast(chosen+' is not a free position.');
+
+  const palletId=('EV'+(state.settings.nextEV||1));
+  const pallet={
+    createdAt:now(),updatedAt:now(),palletId,mfg:'EV',
+    origin:ret.reference||'',status:'Active',
+    notes:'Returned on '+(ret.reference||'material return'),
+    contents:[{id:String(Date.now()+Math.random()),batch:line.lotNumber||'',
+      packageType:line.size||line.packageType||'',
+      description:[line.itemName,line.sku].filter(Boolean).join(' · '),
+      quantityOriginal:Number(line.qty)||0,quantityCurrent:Number(line.qty)||0,
+      expiration:line.expirationDate||'',mrpLotId:line.lotId||'',
+      mrpItemId:line.itemId||'',mrpSku:line.sku||''}],
+    damage:{isDamaged:false,description:'',photoDataUrl:'',photoName:'',reportedAt:''},
+    locationType:'rack',location:chosen,stageLocation:'',buildLocation:'',zone:'',x:0,y:0,
+    mrpReturnId:returnId,mrpReturnLineId:lineId,mrpPutawayLocation:chosen,
+    mrpFlowStatus:'pending',mrpFlowAction:'accept'
+  };
+  const check=canMoveToLocation(palletId,chosen,pallet);
+  if(!check.ok) return toast(check.msg);
+  state.pallets.push(pallet);
+  bump('EV',palletId);
+  hist(palletId,'Created','Returned on '+(ret.reference||'')+' to '+chosen);
+  save(); render(); renderMaterialFlow();
+  toast(`Put away ${formatNum(line.qty)} from ${ret.reference} at ${chosen}.`);
 }
 
 init();

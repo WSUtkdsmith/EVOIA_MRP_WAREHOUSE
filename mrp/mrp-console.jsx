@@ -2333,6 +2333,69 @@ const tx = {
     return { ok: true, lot };
   },
 
+  /* Record what the warehouse has physically done.
+
+     The floor moves first - a pallet picked into a To/From position is picked
+     whether or not the MRP has heard about it yet - and this is where those
+     moves are written down.
+
+     Idempotent without needing a ledger of its own: the line's own status is
+     the guard. stageRequestLine only accepts a Pending line and
+     acceptReturnLine only a Staged one, so replaying an action that already
+     landed is refused by the transaction itself. Those refusals are reported
+     as skipped rather than failed, because a re-sync repeating itself is
+     expected, not an error. */
+  applyWarehouseMaterialActions(db, actions) {
+    const applied = [], skipped = [], failed = [];
+
+    (actions || []).forEach(a => {
+      if (!a || !a.kind) return;
+
+      if (a.kind === "stage") {
+        const req = repo.find(db, "materialRequests", a.requestId);
+        if (!req) { failed.push({ action: a, reason: "That request no longer exists." }); return; }
+        const line = poLines({ lines: req.lines }).find(l => l.id === a.lineId)
+          || (req.lines || []).find(l => l.id === a.lineId);
+        if (!line) { failed.push({ action: a, reason: "That request line no longer exists." }); return; }
+        if (mrLineStatus(line) !== "Pending") {
+          skipped.push({ action: a, reason: "Already staged" });
+          return;
+        }
+        const res = tx.stageRequestLine(db, {
+          materialRequestId: a.requestId, lineId: a.lineId, lotId: a.lotId,
+          qty: a.qty, position: a.position, originLocation: a.originLocation,
+          substituted: a.substituted, substitutionReason: a.substitutionReason
+        });
+        if (res.ok) applied.push({ action: a, line: res.line });
+        else failed.push({ action: a, reason: res.error });
+        return;
+      }
+
+      if (a.kind === "accept") {
+        const ret = repo.find(db, "materialReturns", a.returnId);
+        if (!ret) { failed.push({ action: a, reason: "That return no longer exists." }); return; }
+        const line = (ret.lines || []).find(l => l.id === a.lineId);
+        if (!line) { failed.push({ action: a, reason: "That return line no longer exists." }); return; }
+        if (mrLineStatus(line) === "Accepted") { skipped.push({ action: a, reason: "Already accepted" }); return; }
+        // A return the warehouse has physically taken back may not have been
+        // staged in the MRP yet; staging it here keeps the two in step rather
+        // than refusing a move that has already happened on the floor.
+        if (mrLineStatus(line) === "Pending") {
+          const st = tx.stageReturnLine(db, { materialReturnId: a.returnId, lineId: a.lineId });
+          if (!st.ok) { failed.push({ action: a, reason: st.error }); return; }
+        }
+        const res = tx.acceptReturnLine(db, { materialReturnId: a.returnId, lineId: a.lineId });
+        if (res.ok) applied.push({ action: a, line: res.line, lot: res.lot });
+        else failed.push({ action: a, reason: res.error });
+        return;
+      }
+
+      failed.push({ action: a, reason: "Unknown action “" + a.kind + "”" });
+    });
+
+    return { ok: failed.length === 0, applied, skipped, failed };
+  },
+
   /* Apply deliveries booked at the dock to the MRP.
 
      Each booking is applied through receiveAgainstOrder, so a lot is
@@ -13043,27 +13106,47 @@ function ProcurementCalendar({ data, month, setMonth, mode, rawFilter, onOpenOrd
    second lot. Anything that could not be applied is listed with its
    reason rather than disappearing. */
 function DockReceiptsPanel({ data, update }) {
-  const [state, setState] = useState({ status: "idle", pending: [], applied: [] });
+  const [state, setState] = useState({ status: "idle", pending: [], applied: [], moves: [] });
   const [result, setResult] = useState(null);
 
   const load = async () => {
     setState(s => ({ ...s, status: "loading" }));
     try {
       const bu = (typeof window !== "undefined" && window.EVOIA_BU) || "evoia";
-      const resp = await fetch("/api/pending-receipts?bu=" + encodeURIComponent(bu));
-      if (!resp.ok) throw new Error("HTTP " + resp.status);
-      const body = await resp.json();
-      setState({ status: "ready", pending: body.pending || [], applied: body.applied || [] });
+      // Deliveries booked at the dock, and picks and put-aways done on the
+      // floor. Both are things the warehouse has already physically done that
+      // this side has not written down yet, so they belong in one place.
+      const [r1, r2] = await Promise.all([
+        fetch("/api/pending-receipts?bu=" + encodeURIComponent(bu)),
+        fetch("/api/pending-material-actions?bu=" + encodeURIComponent(bu))
+      ]);
+      if (!r1.ok) throw new Error("HTTP " + r1.status);
+      const body = await r1.json();
+      const flow = r2.ok ? await r2.json() : { pending: [] };
+      setState({ status: "ready", pending: body.pending || [], applied: body.applied || [],
+                 moves: flow.pending || [] });
     } catch (e) {
-      setState({ status: "error", pending: [], applied: [] });
+      setState({ status: "error", pending: [], applied: [], moves: [] });
     }
   };
 
-  useEffect(() => { load(); }, [data.warehouseReceipts]);
+  useEffect(() => { load(); }, [data.warehouseReceipts, data.materialRequests, data.materialReturns]);
 
   const apply = () => {
     let res = null;
-    update(d => { res = tx.applyWarehouseReceipts(d, state.pending); return d; });
+    update(d => {
+      res = tx.applyWarehouseReceipts(d, state.pending);
+      if (state.moves.length) {
+        const m = tx.applyWarehouseMaterialActions(d, state.moves);
+        res = {
+          ok: res.ok && m.ok,
+          applied: res.applied.concat(m.applied),
+          skipped: res.skipped.concat(m.skipped),
+          failed: res.failed.concat(m.failed)
+        };
+      }
+      return d;
+    });
     setResult(res);
     load();
   };
@@ -13077,21 +13160,36 @@ function DockReceiptsPanel({ data, update }) {
       </div>
     );
   }
-  if (!state.pending.length && !result) return null;
+  if (!state.pending.length && !state.moves.length && !result) return null;
 
   return (
     <div style={{ padding: "10px 14px", marginBottom: 14, borderRadius: 8, fontSize: 13,
                   background: state.pending.length ? "#FFF9EF" : "#F1F6F2",
                   border: "1px solid " + (state.pending.length ? "#E8D5A8" : "#CFE0D3") }}>
-      {state.pending.length > 0 && (
+      {(state.pending.length > 0 || state.moves.length > 0) && (
         <div style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap", marginBottom: 8 }}>
-          <div><b>{state.pending.length}</b> delivery(ies) booked at the dock, not yet recorded here</div>
-          <div style={{ color: "#8C6B45" }}>
-            Recording them creates the stock lots and credits the orders.
+          <div>
+            {state.pending.length > 0 && <><b>{state.pending.length}</b> delivery(ies) booked at the dock</>}
+            {state.pending.length > 0 && state.moves.length > 0 && " · "}
+            {state.moves.length > 0 && <><b>{state.moves.length}</b> pick(s) and put-away(s) on the floor</>}
+            {" — not yet recorded here"}
           </div>
-          <Btn onClick={apply}>Record {state.pending.length} delivery(ies)</Btn>
+          <div style={{ color: "#8C6B45" }}>
+            Recording creates the stock lots, credits the orders and moves custody.
+          </div>
+          <Btn onClick={apply}>Record {state.pending.length + state.moves.length} item(s)</Btn>
         </div>
       )}
+
+      {state.moves.map(mv => (
+        <div key={mv.kind + mv.lineId} style={{ display: "flex", gap: 14, flexWrap: "wrap",
+                                                fontSize: 12.5, color: "#5B6470", padding: "2px 0" }}>
+          <span><b>{mv.kind === "stage" ? "Picked" : "Put away"}</b></span>
+          <span>{mv.position || mv.location || ""}</span>
+          <span>on {mv.palletId || "—"}</span>
+          {mv.substituted && <span style={{ color: "#B87510" }}>substituted: {mv.substitutionReason}</span>}
+        </div>
+      ))}
 
       {state.pending.map(p => (
         <div key={p.sourceLineId} style={{ display: "flex", gap: 14, flexWrap: "wrap",

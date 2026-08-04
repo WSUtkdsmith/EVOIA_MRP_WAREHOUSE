@@ -220,6 +220,75 @@ console.log('\n--- the material balance ---');
   ok('returning it all balances the lot', bal.returned === 100 && bal.balanced === true);
 }
 
+console.log('\n--- recording what the warehouse did ---');
+{
+  const { D, raw } = plant();
+  const r = req(D, raw, 100);
+  const act = { kind: 'stage', requestId: r.id, lineId: r.lines[0].id, lotId: 'lotB',
+                qty: 100, position: 'TP1', originLocation: 'M1A1' };
+
+  const res = tx.applyWarehouseMaterialActions(D, [act]);
+  ok('a pick taken on the floor is recorded', res.ok === true && res.applied.length === 1);
+  ok('the line is staged in the MRP', r.lines[0].lineStatus === 'Staged');
+  ok('with the lot the warehouse actually picked', r.lines[0].lotId === 'lotB');
+  ok('and where it came from', r.lines[0].originLocation === 'M1A1');
+  ok('holding the position it is sitting in', r.lines[0].position === 'TP1');
+
+  // The property that matters: a re-sync must not stage it twice.
+  const again = tx.applyWarehouseMaterialActions(D, [act]);
+  ok('replaying it applies nothing', again.applied.length === 0);
+  ok('it is reported as already staged, not as a failure', again.skipped.length === 1 && again.ok === true);
+  ok('the position is not double-claimed', freeTransitPositions(D).length === 5);
+
+  // The same action arriving twice in one batch.
+  const { D: D2, raw: raw2 } = plant();
+  const r2 = req(D2, raw2, 50);
+  const a2 = { kind: 'stage', requestId: r2.id, lineId: r2.lines[0].id, lotId: 'lotB', qty: 50, position: 'TP1' };
+  const dup = tx.applyWarehouseMaterialActions(D2, [a2, a2]);
+  ok('a repeat inside one batch stages once', dup.applied.length === 1 && dup.skipped.length === 1);
+}
+
+console.log('\n--- recording a put-away ---');
+{
+  const { D, raw } = plant();
+  const r = req(D, raw, 100);
+  tx.stageRequestLine(D, { materialRequestId: r.id, lineId: r.lines[0].id, lotId: 'lotB', qty: 100 });
+  tx.receiveRequestLine(D, { materialRequestId: r.id, lineId: r.lines[0].id });
+  const ret = tx.raiseMaterialReturn(D, { returnType: 'leftover',
+    lines: [{ itemType: 'raw', itemId: raw.id, lotId: 'lotB', qty: 40 }] })['return'];
+
+  // The warehouse has already taken it back physically, without the MRP having
+  // seen it staged — the applier should not refuse a move that has happened.
+  const res = tx.applyWarehouseMaterialActions(D, [{ kind: 'accept', returnId: ret.id, lineId: ret.lines[0].id }]);
+  ok('a put-away is recorded even if the MRP never saw it staged', res.ok === true && res.applied.length === 1);
+  ok('custody returns to the warehouse', raw.lots.find(l => l.id === 'lotB').inProcess === false);
+  ok('the return line reads accepted', ret.lines[0].lineStatus === 'Accepted');
+  ok('and the door is clear', freeTransitPositions(D).length === 6);
+
+  const again = tx.applyWarehouseMaterialActions(D, [{ kind: 'accept', returnId: ret.id, lineId: ret.lines[0].id }]);
+  ok('replaying the put-away changes nothing', again.applied.length === 0 && again.skipped.length === 1);
+}
+
+console.log('\n--- one bad action does not stop the rest ---');
+{
+  const { D, raw } = plant();
+  const a = req(D, raw, 10), b = req(D, raw, 10);
+  const res = tx.applyWarehouseMaterialActions(D, [
+    { kind: 'stage', requestId: a.id, lineId: a.lines[0].id, lotId: 'lotB', qty: 10, position: 'TP1' },
+    { kind: 'stage', requestId: 'nope', lineId: 'x', lotId: 'lotA', qty: 5, position: 'TP2' },
+    { kind: 'stage', requestId: b.id, lineId: b.lines[0].id, lotId: 'lotA', qty: 10, position: 'TP3' }
+  ]);
+  ok('the good ones are recorded', res.applied.length === 2);
+  ok('the bad one is reported with its reason', res.failed.length === 1 && !!res.failed[0].reason);
+  ok('the batch reports overall failure so it is not ignored', res.ok === false);
+  ok('nothing else is disturbed', freeTransitPositions(D).length === 4);
+
+  ok('an unknown action is refused, not guessed at',
+     tx.applyWarehouseMaterialActions(D, [{ kind: 'teleport' }]).failed.length === 1);
+  ok('no actions is a no-op', tx.applyWarehouseMaterialActions(D, []).applied.length === 0);
+  ok('null is a no-op', tx.applyWarehouseMaterialActions(D, null).applied.length === 0);
+}
+
 console.log('\n============================');
 console.log('  ' + pass + ' passed, ' + fail + ' failed');
 console.log('============================\n');

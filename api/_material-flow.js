@@ -235,7 +235,60 @@ function deriveMaterialFlow(mrpData) {
   };
 }
 
+// Actions the warehouse has taken that the MRP has not recorded. The line's own
+// status is the authority on what has landed: a request line past Pending has
+// been staged, a return line at Accepted has been put away. So nothing needs a
+// separate ledger — replaying is refused by the transaction, and reported here
+// as already done.
+function derivePendingMaterialActions(warehouseState, mrpData) {
+  const wh = warehouseState && typeof warehouseState === 'object' ? warehouseState : {};
+  const data = mrpData && typeof mrpData === 'object' ? mrpData : {};
+  const pallets = Array.isArray(wh.pallets) ? wh.pallets : [];
+
+  const requestLine = (requestId, lineId) => {
+    const r = (Array.isArray(data.materialRequests) ? data.materialRequests : [])
+      .find((x) => x && x.id === requestId);
+    return r ? (Array.isArray(r.lines) ? r.lines : []).find((l) => l && l.id === lineId) : null;
+  };
+  const returnLine = (returnId, lineId) => {
+    const r = (Array.isArray(data.materialReturns) ? data.materialReturns : [])
+      .find((x) => x && x.id === returnId);
+    return r ? (Array.isArray(r.lines) ? r.lines : []).find((l) => l && l.id === lineId) : null;
+  };
+
+  const pending = [], done = [];
+  pallets.forEach((p) => {
+    if (!p || typeof p !== 'object') return;
+    if (p.mrpFlowAction === 'stage' && p.mrpRequestLineId) {
+      const line = requestLine(p.mrpRequestId, p.mrpRequestLineId);
+      const content = (Array.isArray(p.contents) ? p.contents : [])[0] || {};
+      const action = {
+        kind: 'stage', palletId: p.palletId || '',
+        requestId: p.mrpRequestId || '', lineId: p.mrpRequestLineId || '',
+        lotId: p.mrpStagedLotId || '', qty: Number(content.quantityOriginal) || 0,
+        position: p.transitLocation || '', originLocation: p.mrpOriginLocation || '',
+        substituted: !!p.mrpSubstituted, substitutionReason: p.mrpSubstitutionReason || '',
+      };
+      if (line && line.lineStatus !== 'Pending') done.push(action); else pending.push(action);
+      return;
+    }
+    if (p.mrpFlowAction === 'accept' && p.mrpReturnLineId) {
+      const line = returnLine(p.mrpReturnId, p.mrpReturnLineId);
+      const action = {
+        kind: 'accept', palletId: p.palletId || '',
+        returnId: p.mrpReturnId || '', lineId: p.mrpReturnLineId || '',
+        location: p.mrpPutawayLocation || '',
+      };
+      if (line && line.lineStatus === 'Accepted') done.push(action); else pending.push(action);
+    }
+  });
+
+  return { pending, applied: done,
+    counts: { pending: pending.length, applied: done.length, total: pending.length + done.length } };
+}
+
 module.exports = {
+  derivePendingMaterialActions,
   ITEM_TYPE_COLLECTION,
   TRANSIT_POSITIONS,
   fefoCandidates,

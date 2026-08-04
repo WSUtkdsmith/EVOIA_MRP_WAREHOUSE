@@ -215,17 +215,33 @@ inProcessClearedReason: "str"     // set only via the exception path
    `doorFull` flag so a blocked pick is stated rather than inferred.
    Read-only: staging, receiving and accepting all move custody and stay in the
    MRP's transactions. `api/test/material-flow.test.js` — 39 assertions.
-4. ~~**Warehouse UI**~~ — **partly done.** A **Material Flow** window on the
-   topbar with three views: **requests to pick** (FEFO shown per line, with a
+4. ~~**Warehouse UI + the return leg**~~ — **done.** A **Material Flow** window on
+   the topbar with three views: **requests to pick** (FEFO shown per line, with a
    Pick action), **returns to put away** (production output called out as needing
    a new position, leftovers showing where they came from), and **held by
    Operations** (oldest out first). Picking preselects the FEFO lot, offers the
    alternatives, and **demands a reason if anything else is chosen**; it refuses
    a position that has just been taken, and stages the pallet into the door
-   immediately, marked `pending` until the MRP records it.
-   *Still to do:* the put-away action on returns, and the MRP-side applier that
-   turns pending stagings into `tx.stageRequestLine` calls — until that lands the
-   pick is real on the floor but not yet recorded in the MRP.
+   immediately, marked `pending` until the MRP records it. **Put-away** builds the
+   pallet at the chosen position — defaulting to the origin hint when it is still
+   free — and runs it through `canMoveToLocation` like any other move, so a return
+   cannot land somewhere the floor would not allow.
+
+   The loop closes at `tx.applyWarehouseMaterialActions`, fed by
+   `GET /api/pending-material-actions?bu=` and applied by `DockReceiptsPanel`
+   alongside receipts in a single `update()`.
+
+   **It has no ledger of its own, unlike receipts.** The line's status *is* the
+   record: `stageRequestLine` accepts only a `Pending` line and `acceptReturnLine`
+   only a `Staged` one, so a replayed batch is refused by the transaction rather
+   than by bookkeeping. A refusal is reported as **`skipped`, not `failed`** —
+   the warehouse asking twice is not an error, and treating it as one would make
+   every retry look like a fault.
+
+   One deliberate asymmetry: a return line still `Pending` when the pallet is
+   already on the rack gets **staged and accepted in the same pass**. The material
+   is demonstrably back; refusing to record it because a bookkeeping step was
+   missed would leave the MRP arguing with the floor.
 5. **MRP UI** — raise requests, the In Process window, and the balance report.
 
 ## Decisions — resolved
