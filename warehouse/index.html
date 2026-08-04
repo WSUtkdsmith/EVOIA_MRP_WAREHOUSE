@@ -5675,6 +5675,7 @@ body.reconMapPickMode .palletTag{
     <button id="openInventoryWindowBtn" type="button" class="btn topTabBtn">Inventory Register <span id="topInventoryCount" class="miniCount">0</span></button>
     <button id="openBatchConsumptionBtn" type="button" class="btn topTabBtn">Batch Use Log <span id="topBatchUseCount" class="miniCount">0</span></button>
     <button id="openMrpCatalogBtn" type="button" class="btn topTabBtn">MRP Catalog <span id="topCatalogCount" class="miniCount">0</span></button>
+    <button id="openMaterialFlowBtn" type="button" class="btn topTabBtn">Material Flow <span id="topFlowCount" class="miniCount">0</span></button>
     <button id="openReportsBtn" type="button" class="btn topTabBtn">Reports</button>
     <button id="openSettingsBtn" type="button" class="btn topTabBtn">Settings</button>
   </div>
@@ -5837,6 +5838,58 @@ body.reconMapPickMode .palletTag{
       <thead id="mrpCatalogHead"></thead>
       <tbody id="mrpCatalogBody"></tbody>
     </table></div>
+  </div>
+</dialog>
+
+<dialog id="materialFlowDialog">
+  <div class="modal logWindowDialog">
+    <div class="modalHead"><h2>Material Flow <span id="flowCount" class="receivedCount">0</span></h2><button type="button" class="x" data-close="materialFlowDialog">×</button></div>
+    <div class="logHead"><span id="flowStatus">Requests to pick, returns to put away, and what Operations is holding.</span><button id="refreshFlowBtn" class="btn">Refresh</button></div>
+    <div class="totalsBox inventoryWindowTotals"><h3>Material Flow</h3><div id="flowTotals" class="totalsGrid"></div></div>
+    <div class="two" style="margin-bottom:10px">
+      <label class="field"><span>View</span>
+        <select id="flowView">
+          <option value="pick">Requests to pick</option>
+          <option value="returns">Returns to put away</option>
+          <option value="inprocess">Held by Operations</option>
+        </select>
+      </label>
+      <label class="field"><span>Search</span><input id="flowSearch" placeholder="Reference, material, lot, run..."></label>
+    </div>
+    <div class="tableWrap"><table>
+      <thead id="flowHead"></thead>
+      <tbody id="flowBody"></tbody>
+    </table></div>
+  </div>
+</dialog>
+
+<dialog id="stagePickDialog">
+  <div class="modal">
+    <div class="modalHead"><h2>Pick and stage</h2><button type="button" class="x" data-close="stagePickDialog">×</button></div>
+    <form id="stagePickForm">
+      <div id="stagePickSummary" class="totalsBox" style="margin-bottom:10px"></div>
+      <label class="field"><span>Lot to pick<b class="reqMark">*</b></span>
+        <select id="stagePickLot" required></select>
+      </label>
+      <div id="stagePickSubstituted" style="display:none">
+        <label class="field"><span>Why not the suggested lot?<b class="reqMark">*</b></span>
+          <input id="stagePickReason" placeholder="Blocked, damaged, quarantined...">
+        </label>
+      </div>
+      <div class="two">
+        <label class="field"><span>Quantity<b class="reqMark">*</b></span><input id="stagePickQty" type="number" step="any" min="0" required></label>
+        <label class="field"><span>Pallet ID<b class="reqMark">*</b></span><input id="stagePickPalletId" required></label>
+      </div>
+      <div class="two">
+        <label class="field"><span>To/From position<b class="reqMark">*</b></span><select id="stagePickPosition" required></select></label>
+        <label class="field"><span>Picked from</span><input id="stagePickOrigin" placeholder="M1A1 — recorded so leftovers come back here"></label>
+      </div>
+      <div id="stagePickError" style="color:var(--red);font-weight:800;font-size:13px;margin:6px 0"></div>
+      <div class="actions" style="justify-content:flex-end;margin-top:10px">
+        <button type="button" class="btn" data-close="stagePickDialog">Cancel</button>
+        <button type="submit" class="btn primary">Stage to position</button>
+      </div>
+    </form>
   </div>
 </dialog>
 
@@ -7861,6 +7914,12 @@ function init(){
   $('openReceivingWindowBtn').onclick=openReceivingLogWindow;
   $('openShippingWindowBtn').onclick=openShippingLogWindow;
   $('openMrpCatalogBtn').onclick=openMrpCatalog;
+  $('openMaterialFlowBtn').onclick=openMaterialFlow;
+  $('refreshFlowBtn').onclick=()=>loadMaterialFlow(true);
+  $('flowView').onchange=renderMaterialFlow;
+  $('flowSearch').oninput=renderMaterialFlow;
+  $('stagePickForm').onsubmit=submitStagePick;
+  $('stagePickLot').onchange=updateStagePickSubstitution;
   $('mrpPlaceForm').onsubmit=submitMrpPlacement;
   $('refreshMrpCatalogBtn').onclick=()=>loadMrpCatalog(true);
   $('mrpCatalogSearch').oninput=renderMrpCatalog;
@@ -14590,6 +14649,97 @@ function toast(msg){const t=$('toast');t.textContent=msg;t.style.display='block'
 
 function todayISO(){ return now().slice(0,10) }
 
+/* ---------------------------------------------------------------------------
+   Material flow, warehouse side.
+
+   The warehouse picks what Operations has asked for and puts back what comes
+   home. Both actions move a pallet into or out of a To/From position, and both
+   have to be told to the MRP - which owns the request, the return and the
+   custody flag. So the pallet moves here immediately, because the physical move
+   is real, and the intent is marked pending until the MRP records it. Exactly
+   the shape receipts use.
+--------------------------------------------------------------------------- */
+
+/* A pallet staged into a To/From position for an outbound request. Carries the
+   request and line it satisfies so the MRP can be told which one moved. */
+function buildTransitPalletForRequest(reqLine, request, opts){
+  const o=opts||{};
+  const stamp=o.now||new Date().toISOString();
+  return {
+    createdAt:stamp,updatedAt:stamp,
+    palletId:String(o.palletId||'').trim().toUpperCase(),
+    mfg:o.mfg||'EV',
+    origin:(request&&request.requestedFor)||'',
+    status:'Active',
+    notes:o.notes||('Picked for '+((request&&request.reference)||'material request')),
+    contents:[{
+      id:String(Date.now()+Math.random()),
+      batch:(o.lot&&o.lot.lotNumber)||'',
+      packageType:(reqLine&&reqLine.size)||(reqLine&&reqLine.packageType)||'',
+      description:[(reqLine&&reqLine.itemName)||'',(reqLine&&reqLine.sku)||''].filter(Boolean).join(' · '),
+      quantityOriginal:Number(o.qty)||0,
+      quantityCurrent:Number(o.qty)||0,
+      expiration:(o.lot&&o.lot.expirationDate)||'',
+      mrpLotId:(o.lot&&o.lot.lotId)||'',
+      mrpItemId:(reqLine&&reqLine.itemId)||'',
+      mrpSku:(reqLine&&reqLine.sku)||''
+    }],
+    damage:{isDamaged:false,description:'',photoDataUrl:'',photoName:'',reportedAt:''},
+    // The door. Direction is what the position badge reads.
+    locationType:'transit',location:'',stageLocation:'',buildLocation:'',
+    transitLocation:o.position||'',transitDirection:'request',zone:TRANSIT_ZONE,x:0,y:0,
+    // Told to the MRP separately, so it is pending until it lands there.
+    mrpRequestId:(request&&request.requestId)||'',
+    mrpRequestLineId:(reqLine&&reqLine.lineId)||'',
+    mrpStagedLotId:(o.lot&&o.lot.lotId)||'',
+    mrpFlowStatus:'pending',
+    mrpFlowAction:'stage',
+    mrpSubstituted:!!o.substituted,
+    mrpSubstitutionReason:o.substituted?(o.substitutionReason||''):''
+  };
+}
+
+/* Which To/From positions the warehouse itself is holding. The MRP has its own
+   view of this; the warehouse must not put two pallets in one position while
+   waiting for the MRP to catch up. */
+function transitPositionsHeld(pallets){
+  const held={};
+  (pallets||[]).forEach(p=>{
+    if(p&&p.locationType==='transit'&&p.transitLocation) held[p.transitLocation]=p;
+  });
+  return held;
+}
+
+function freeTransitPositionsLocal(pallets,fromApi){
+  const held=transitPositionsHeld(pallets);
+  // A position the MRP reports as taken is taken, even if this device has not
+  // seen the pallet yet.
+  (fromApi||[]).forEach(p=>{ if(p&&p.held&&p.position) held[p.position]=held[p.position]||true; });
+  return TRANSIT_LOCS.filter(loc=>!held[loc]);
+}
+
+/* Actions the warehouse has taken that the MRP has not yet recorded. The same
+   pending/applied shape as dock receipts, and the same reason: a re-sync must
+   not stage the same line twice. */
+function pendingMaterialActions(pallets){
+  const out=[];
+  (pallets||[]).forEach(p=>{
+    if(!p||p.mrpFlowStatus!=='pending') return;
+    if(p.mrpFlowAction==='stage'&&p.mrpRequestLineId){
+      out.push({kind:'stage',palletId:p.palletId,requestId:p.mrpRequestId,
+        lineId:p.mrpRequestLineId,lotId:p.mrpStagedLotId,
+        qty:Number((p.contents&&p.contents[0]&&p.contents[0].quantityOriginal)||0),
+        position:p.transitLocation||'',originLocation:p.mrpOriginLocation||'',
+        substituted:!!p.mrpSubstituted,substitutionReason:p.mrpSubstitutionReason||''});
+    }
+    if(p.mrpFlowAction==='accept'&&p.mrpReturnLineId){
+      out.push({kind:'accept',palletId:p.palletId,returnId:p.mrpReturnId,
+        lineId:p.mrpReturnLineId,location:locationText(p)});
+    }
+  });
+  return out;
+}
+
 /* An MRP purchase order, in the shape the receiving queue already speaks.
 
    Orders raised in the MRP used to be receivable straight from the catalog
@@ -14948,6 +15098,168 @@ function queueMrpPurchaseOrder(poId){
   if(typeof populateReceivingImportDropdown==='function') populateReceivingImportDropdown();
   renderMrpCatalog();
   toast(order.reference+' queued. Receive it from the Receive Order screen.');
+}
+
+/* ---------------------------------------------------------------------------
+   The Material Flow window.
+--------------------------------------------------------------------------- */
+let materialFlow=null, flowLoading=false, stagePickCtx=null;
+
+async function loadMaterialFlow(force){
+  if(flowLoading) return;
+  if(materialFlow && !force){ renderMaterialFlow(); return; }
+  flowLoading=true;
+  $('flowStatus').textContent='Loading…';
+  try{
+    const resp=await fetch('/api/material-flow?bu='+encodeURIComponent(EVOIA_BU));
+    if(!resp.ok) throw new Error('HTTP '+resp.status);
+    materialFlow=await resp.json();
+    const c=materialFlow.counts||{};
+    $('flowStatus').textContent=c.doorFull
+      ? 'Every To/From position is taken — a pick is waiting for one to clear.'
+      : `${c.linesToPick||0} line(s) to pick · ${c.openReturns||0} return(s) · ${c.freePositions||0} position(s) free`;
+  }catch(e){
+    console.warn('material flow load failed:',e);
+    materialFlow=null;
+    $('flowStatus').textContent='Could not reach the material-flow service — try Refresh.';
+  }finally{ flowLoading=false; renderMaterialFlow(); }
+}
+
+function openMaterialFlow(){ $('materialFlowDialog').showModal(); loadMaterialFlow(false); }
+
+function renderMaterialFlow(){
+  const head=$('flowHead'), body=$('flowBody'), totals=$('flowTotals');
+  if(!head||!body) return;
+  if(!materialFlow){ head.innerHTML=''; body.innerHTML='<tr><td>Nothing to show yet.</td></tr>';
+    totals.innerHTML=''; $('flowCount').textContent='0'; return; }
+  const c=materialFlow.counts||{};
+  totals.innerHTML=[['Lines to pick',c.linesToPick||0],['Open returns',c.openReturns||0],
+    ['Held by Operations',c.inProcess||0],['Positions free',c.freePositions||0]]
+    .map(([k,v])=>`<div class="totalCard"><b>${esc(v)}</b><span>${esc(k)}</span></div>`).join('');
+
+  const q=($('flowSearch').value||'').trim().toLowerCase();
+  const match=(o)=>!q||JSON.stringify(o).toLowerCase().includes(q);
+  const view=$('flowView').value;
+
+  if(view==='pick'){
+    const rows=(materialFlow.requests||[]).flatMap(r=>(r.lines||[])
+      .filter(l=>l.lineStatus==='Pending').map(l=>({...l,req:r}))).filter(match);
+    head.innerHTML='<tr><th>Request</th><th>For</th><th>Material</th><th>Qty</th><th>FEFO suggests</th><th>Needed</th><th></th></tr>';
+    body.innerHTML=rows.length?rows.map(l=>`<tr>
+      <td><b>${esc(l.req.reference)}</b></td>
+      <td>${esc(l.req.requestedFor||'—')}</td>
+      <td>${esc(l.itemName)}<small> · ${esc(l.sku||l.itemSku||'')}</small></td>
+      <td>${esc(formatNum(l.qty))} ${esc(l.unit||'')}</td>
+      <td>${l.fefoSuggestion?esc(l.fefoSuggestion.lotNumber)+(l.fefoSuggestion.expirationDate?' <small>exp '+esc(l.fefoSuggestion.expirationDate)+'</small>':''):'<span style="color:#e53935">no stock available</span>'}</td>
+      <td>${esc(l.req.neededDate||'—')}</td>
+      <td>${l.fefoSuggestion?`<button type="button" class="btn small pickFlowBtn" data-req="${esc(l.req.requestId)}" data-line="${esc(l.lineId)}">Pick</button>`:''}</td>
+    </tr>`).join('')
+      :'<tr><td colspan="7">Nothing waiting to be picked.</td></tr>';
+    body.querySelectorAll('.pickFlowBtn').forEach(b=>b.onclick=()=>openStagePick(b.dataset.req,b.dataset.line));
+    $('flowCount').textContent=rows.length;
+  }else if(view==='returns'){
+    const rows=(materialFlow.returns||[]).flatMap(r=>(r.lines||[]).map(l=>({...l,ret:r}))).filter(match);
+    head.innerHTML='<tr><th>Return</th><th>Type</th><th>Material</th><th>Lot</th><th>Qty</th><th>Goes back to</th><th>Status</th></tr>';
+    body.innerHTML=rows.length?rows.map(l=>`<tr>
+      <td><b>${esc(l.ret.reference)}</b></td>
+      <td>${l.ret.returnType==='output'
+        ? '<b style="color:#2f6f43">production output</b><br><small>needs a new position</small>'
+        : 'leftover<br><small>goes back to stock</small>'}</td>
+      <td>${esc(l.itemName)}<small> · ${esc(l.sku||l.itemSku||'')}</small></td>
+      <td>${esc(l.lotNumber||'—')}</td>
+      <td>${esc(formatNum(l.qty))} ${esc(l.unit||'')}</td>
+      <td>${esc(l.suggestedLocation||'—')}</td>
+      <td>${esc(l.lineStatus)}${l.position?' · '+esc(l.position):''}</td>
+    </tr>`).join('')
+      :'<tr><td colspan="7">Nothing coming back.</td></tr>';
+    $('flowCount').textContent=rows.length;
+  }else{
+    const rows=(materialFlow.inProcess||[]).filter(match);
+    head.innerHTML='<tr><th>Material</th><th>Lot</th><th>Qty</th><th>Out since</th><th>Expires</th></tr>';
+    body.innerHTML=rows.length?rows.map(l=>`<tr>
+      <td>${esc(l.itemName)}<small> · ${esc(l.itemSku||'')}</small></td>
+      <td>${esc(l.lotNumber)}</td>
+      <td>${esc(formatNum(l.qty))} ${esc(l.unit||'')}</td>
+      <td>${esc(l.since||'—')}</td>
+      <td>${esc(l.expirationDate||'—')}</td>
+    </tr>`).join('')
+      :'<tr><td colspan="5">Operations is holding nothing.</td></tr>';
+    $('flowCount').textContent=rows.length;
+  }
+  if($('topFlowCount')) $('topFlowCount').textContent=(c.linesToPick||0)+(c.openReturns||0);
+}
+
+/* Picking. FEFO is preselected; choosing anything else demands a reason,
+   because overriding rotation is a decision worth keeping. */
+function openStagePick(requestId,lineId){
+  const req=((materialFlow&&materialFlow.requests)||[]).find(r=>r.requestId===requestId);
+  const line=req&&(req.lines||[]).find(l=>l.lineId===lineId);
+  if(!line) return toast('That request line is no longer open.');
+  if(!requirePermission('moveInventory','picking material for a request')) return;
+  const free=freeTransitPositionsLocal(state.pallets,materialFlow.positions);
+  if(!free.length) return toast('Every To/From position is taken — clear one first.');
+  stagePickCtx={req,line};
+
+  const options=[line.fefoSuggestion].concat(line.alternatives||[]).filter(Boolean);
+  $('stagePickSummary').innerHTML=`<h3>${esc(req.reference)} — ${esc(line.itemName)}</h3>
+    <div class="totalsGrid">
+      <div class="totalCard"><b>${esc(formatNum(line.qty))} ${esc(line.unit||'')}</b><span>Asked for</span></div>
+      <div class="totalCard"><b>${esc(req.requestedFor||'—')}</b><span>For</span></div>
+      <div class="totalCard"><b>${esc(free.length)}</b><span>Positions free</span></div>
+    </div>`;
+  $('stagePickLot').innerHTML=options.map((o,i)=>
+    `<option value="${esc(o.lotId)}"${i===0?' selected':''}>${esc(o.lotNumber)}${o.expirationDate?' — exp '+esc(o.expirationDate):' — no expiry'}${i===0?' (FEFO)':''}</option>`).join('');
+  $('stagePickPosition').innerHTML=free.map(p=>`<option value="${esc(p)}">${esc(p)}</option>`).join('');
+  $('stagePickQty').value=line.qty;
+  $('stagePickPalletId').value='EV'+(state.settings.nextEV||1);
+  $('stagePickOrigin').value='';
+  $('stagePickReason').value='';
+  $('stagePickError').textContent='';
+  updateStagePickSubstitution();
+  $('stagePickDialog').showModal();
+}
+
+function updateStagePickSubstitution(){
+  if(!stagePickCtx) return;
+  const fefo=stagePickCtx.line.fefoSuggestion;
+  const chosen=$('stagePickLot').value;
+  const isSub=!!(fefo&&chosen&&chosen!==fefo.lotId);
+  $('stagePickSubstituted').style.display=isSub?'block':'none';
+}
+
+function submitStagePick(e){
+  e.preventDefault();
+  if(!stagePickCtx) return;
+  const {req,line}=stagePickCtx;
+  const err=$('stagePickError'); err.textContent='';
+  const lotId=$('stagePickLot').value;
+  const qty=Number($('stagePickQty').value)||0;
+  const palletId=$('stagePickPalletId').value.trim().toUpperCase();
+  const position=$('stagePickPosition').value;
+  const fefo=line.fefoSuggestion;
+  const substituted=!!(fefo&&lotId!==fefo.lotId);
+  const reason=$('stagePickReason').value.trim();
+
+  if(!palletId) { err.textContent='Pallet ID is required.'; return; }
+  if(state.pallets.some(p=>p.palletId===palletId)) { err.textContent='That pallet ID already exists.'; return; }
+  if(qty<=0) { err.textContent='Enter a quantity greater than zero.'; return; }
+  if(substituted && !reason) { err.textContent='Say why the suggested lot was not used.'; return; }
+  if(freeTransitPositionsLocal(state.pallets,materialFlow.positions).indexOf(position)===-1){
+    err.textContent=position+' has just been taken.'; return; }
+
+  const lot=[line.fefoSuggestion].concat(line.alternatives||[]).filter(Boolean).find(o=>o.lotId===lotId);
+  const pallet=buildTransitPalletForRequest(line,req,{
+    palletId,qty,position,lot,substituted,substitutionReason:reason,now:now()
+  });
+  pallet.mrpOriginLocation=$('stagePickOrigin').value.trim();
+  state.pallets.push(pallet);
+  bump(pallet.mfg,palletId);
+  hist(palletId,'Created','Picked for '+req.reference+' into '+position);
+  save();
+  $('stagePickDialog').close();
+  render();
+  renderMaterialFlow();
+  toast(`Staged ${formatNum(qty)} for ${req.reference} in ${position}.`);
 }
 
 init();

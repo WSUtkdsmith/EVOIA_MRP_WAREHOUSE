@@ -215,8 +215,17 @@ inProcessClearedReason: "str"     // set only via the exception path
    `doorFull` flag so a blocked pick is stated rather than inferred.
    Read-only: staging, receiving and accepting all move custody and stay in the
    MRP's transactions. `api/test/material-flow.test.js` — 39 assertions.
-4. **Warehouse UI** — requests to pick and stage, returns to put away, with the
-   original-position hint on leftovers.
+4. ~~**Warehouse UI**~~ — **partly done.** A **Material Flow** window on the
+   topbar with three views: **requests to pick** (FEFO shown per line, with a
+   Pick action), **returns to put away** (production output called out as needing
+   a new position, leftovers showing where they came from), and **held by
+   Operations** (oldest out first). Picking preselects the FEFO lot, offers the
+   alternatives, and **demands a reason if anything else is chosen**; it refuses
+   a position that has just been taken, and stages the pallet into the door
+   immediately, marked `pending` until the MRP records it.
+   *Still to do:* the put-away action on returns, and the MRP-side applier that
+   turns pending stagings into `tx.stageRequestLine` calls — until that lands the
+   pick is real on the floor but not yet recorded in the MRP.
 5. **MRP UI** — raise requests, the In Process window, and the balance report.
 
 ## Decisions — resolved

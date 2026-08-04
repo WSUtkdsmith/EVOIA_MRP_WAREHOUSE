@@ -28,10 +28,19 @@ function extract(name) {
 }
 
 const NAMES = ['mrpPlacementIndex', 'mrpLotPlacement', 'mrpContentLine', 'buildPalletFromMrpLot',
-               'mrpPoLineReceived', 'mrpReceiptApplied', 'mrpOrderToParsed', 'mrpOrderQueued'];
-const src = NAMES.map(extract).join('\n');
+               'mrpPoLineReceived', 'mrpReceiptApplied', 'mrpOrderToParsed', 'mrpOrderQueued',
+               'buildTransitPalletForRequest', 'transitPositionsHeld', 'pendingMaterialActions'];
+// Constants the extracted functions close over. Pulled from the file too, so a
+// rename fails here rather than silently testing a stale literal.
+const CONSTS = ['TRANSIT_ZONE', 'IN_PROCESS_ZONE', 'TRANSIT_LOCS'].map((n) => {
+  const m = HTML.match(new RegExp('const ' + n + '=([^;]+);'));
+  if (!m) throw new Error('constant not found in warehouse/index.html: ' + n);
+  return 'const ' + n + '=' + m[1] + ';';
+}).join('\n');
+const src = CONSTS + '\n' + NAMES.map(extract).join('\n');
 const { mrpPlacementIndex, mrpLotPlacement, mrpContentLine, buildPalletFromMrpLot,
-        mrpPoLineReceived, mrpReceiptApplied, mrpOrderToParsed, mrpOrderQueued } =
+        mrpPoLineReceived, mrpReceiptApplied, mrpOrderToParsed, mrpOrderQueued,
+        buildTransitPalletForRequest, transitPositionsHeld, pendingMaterialActions } =
   new Function(src + '; return {' + NAMES.join(',') + '};')();
 
 let passed = 0, failed = 0;
@@ -177,6 +186,64 @@ eq(mrpReceiptApplied({ id: 'l1', mrpReceiptStatus: 'applied' }, null),
    true, 'with no ledger to consult the local mark is the fallback');
 eq(mrpReceiptApplied({ id: 'l1', mrpReceiptStatus: 'pending' }, null), false, 'pending stays pending');
 eq(mrpReceiptApplied(null, ['l1']), false, 'no line is not recorded');
+
+// --- picking material for a request -----------------------------------------
+const REQ = { requestId: 'r1', reference: 'MR-0001', requestedFor: 'Run 42' };
+const REQ_LINE = { lineId: 'L1', itemId: 'rm1', itemName: 'Green coffee', sku: 'GC-1-60KG',
+                   size: '60 kg', unit: 'kg', qty: 120 };
+const LOT_PICKED = { lotId: 'lotB', lotNumber: 'B', expirationDate: '2026-09-01' };
+
+{
+  const p = buildTransitPalletForRequest(REQ_LINE, REQ, {
+    palletId: 'ev7', qty: 120, position: 'TP2', lot: LOT_PICKED, now: '2026-08-05T00:00:00Z' });
+  eq(p.palletId, 'EV7', 'pallet id upper-cased like the rest of the app');
+  eq(p.locationType, 'transit', 'a pick goes to the door, not to storage');
+  eq(p.transitLocation, 'TP2', 'into the position chosen');
+  eq(p.transitDirection, 'request', 'moving out to Operations, which is what the badge reads');
+  eq(p.contents[0].batch, 'B', 'the lot picked becomes the batch on the pallet');
+  eq(p.contents[0].expiration, '2026-09-01', 'expiry carries across so the floor can see it');
+  eq(p.contents[0].mrpLotId, 'lotB', 'linked to the MRP lot');
+  eq(p.mrpRequestLineId, 'L1', 'and to the request line it satisfies');
+  eq(p.mrpFlowAction, 'stage', 'the action is a staging');
+  eq(p.mrpFlowStatus, 'pending', 'pending until the MRP records it — the same rule receipts follow');
+  eq(p.mrpSubstituted, false, 'no substitution by default');
+  eq(p.createdAt, '2026-08-05T00:00:00Z', 'timestamp injectable, so this is deterministic');
+
+  const sub = buildTransitPalletForRequest(REQ_LINE, REQ, {
+    palletId: 'EV8', qty: 10, position: 'TP3', lot: LOT_PICKED,
+    substituted: true, substitutionReason: 'B blocked behind a rack' });
+  eq(sub.mrpSubstituted, true, 'a substitution is flagged');
+  eq(sub.mrpSubstitutionReason, 'B blocked behind a rack', 'and its reason kept');
+  eq(buildTransitPalletForRequest(REQ_LINE, REQ, { palletId: 'X', qty: 5, substituted: false, substitutionReason: 'ignored' }).mrpSubstitutionReason,
+     '', 'a reason without a substitution is dropped rather than stored misleadingly');
+}
+
+// The warehouse must not put two pallets in one position while the MRP catches up.
+{
+  const a = buildTransitPalletForRequest(REQ_LINE, REQ, { palletId: 'EV1', qty: 10, position: 'TP1', lot: LOT_PICKED });
+  const b = buildTransitPalletForRequest(REQ_LINE, REQ, { palletId: 'EV2', qty: 10, position: 'TP4', lot: LOT_PICKED });
+  const held = transitPositionsHeld([a, b, pallet('EV3', [])]);
+  eq(Object.keys(held).sort(), ['TP1', 'TP4'], 'only pallets in the door hold a position');
+  eq(transitPositionsHeld([]), {}, 'nothing staged holds nothing');
+  eq(transitPositionsHeld(null), {}, 'null pallets tolerated');
+}
+
+// What the MRP has not been told yet.
+{
+  const a = buildTransitPalletForRequest(REQ_LINE, REQ, { palletId: 'EV1', qty: 120, position: 'TP1', lot: LOT_PICKED });
+  const actions = pendingMaterialActions([a]);
+  eq(actions.length, 1, 'a staged pick is an action waiting to be recorded');
+  eq(actions[0].kind, 'stage', 'named for what it was');
+  eq(actions[0].lineId, 'L1', 'carrying the line it satisfies');
+  eq(actions[0].lotId, 'lotB', 'and the lot actually picked');
+  eq(actions[0].qty, 120, 'and how much');
+  eq(actions[0].position, 'TP1', 'and where it is sitting');
+
+  a.mrpFlowStatus = 'applied';
+  eq(pendingMaterialActions([a]).length, 0, 'once recorded it stops being pending — no double staging');
+  eq(pendingMaterialActions([pallet('EV9', [])]).length, 0, 'an ordinary pallet is not a material-flow action');
+  eq(pendingMaterialActions(null).length, 0, 'null pallets tolerated');
+}
 
 // --- To/From Process and In Process -----------------------------------------
 // The door between the warehouse and Operations, and the custody region that is
