@@ -195,7 +195,17 @@ inProcessClearedReason: "str"     // set only via the exception path
    `returnType` drives what the *warehouse* does physically, which is why it
    lives on the document rather than branching the MRP write.
 
-2. **Warehouse zone** — `TP1`–`TP6` on the map, In Process region, storage rules.
+2. ~~**Warehouse zone**~~ — **done.** `TP1`–`TP6` drawn beside Build Slot as a
+   six-position grid, each occupied position showing **OUT** or **IN** so the
+   picker can see which way it is moving. In Process is drawn as a **flat region
+   with no cells** — a count and a note, because there is nothing to slot.
+   `locationType` gains `transit` and `inprocess`; `locParts` reports
+   `isTransit`; `locationText` names both zones.
+   **The discipline rule is enforced in code:** `canMoveToLocation` refuses a
+   hand-driven move into a To/From position unless it comes from material flow
+   (`opts.materialFlow`), so the door cannot quietly become six more storage
+   slots. 12 warehouse assertions cover it, including that `IN_PROCESS_LOCS`
+   does **not** exist.
 3. **API** — `/api/material-flow?bu=` exposing open requests and returns, the
    same read-only shape as `/api/pending-receipts`; application stays in the MRP.
 4. **Warehouse UI** — requests to pick and stage, returns to put away, with the

@@ -178,5 +178,44 @@ eq(mrpReceiptApplied({ id: 'l1', mrpReceiptStatus: 'applied' }, null),
 eq(mrpReceiptApplied({ id: 'l1', mrpReceiptStatus: 'pending' }, null), false, 'pending stays pending');
 eq(mrpReceiptApplied(null, ['l1']), false, 'no line is not recorded');
 
+// --- To/From Process and In Process -----------------------------------------
+// The door between the warehouse and Operations, and the custody region that is
+// deliberately not a place. Constants and the locParts branch are read straight
+// out of the file so a rename fails loudly.
+{
+  const constOf = (name) => {
+    const m = HTML.match(new RegExp('const ' + name + "=([^;]+);"));
+    if (!m) throw new Error('constant not found: ' + name);
+    return eval(m[1]);
+  };
+  const TRANSIT_LOCS = constOf('TRANSIT_LOCS');
+  const TRANSIT_ZONE = constOf('TRANSIT_ZONE');
+  const IN_PROCESS_ZONE = constOf('IN_PROCESS_ZONE');
+
+  eq(TRANSIT_LOCS.length, 6, 'the door is six positions wide');
+  eq(TRANSIT_LOCS, ['TP1','TP2','TP3','TP4','TP5','TP6'], 'named TP1..TP6');
+  eq(TRANSIT_ZONE, 'To/From Process', 'the zone is named for what it does');
+  eq(IN_PROCESS_ZONE, 'In Process', 'custody region is named In Process');
+  ok(!/IN_PROCESS_LOCS/.test(HTML),
+     'In Process has NO positions — it is custody, not capacity, and must never be slotted');
+
+  // Transit positions are real locations the app knows about...
+  ok(/TRANSIT_LOCS\.forEach\(loc=>RACK\.push\(loc\)\)/.test(HTML),
+     'transit positions are registered as addressable locations');
+  // ...but the map draws no cells for In Process.
+  ok(/class="transitGrid"|transitGrid/.test(HTML), 'To/From renders a grid of positions');
+  ok(!/inProcessGrid/.test(HTML), 'In Process renders no grid — nothing to slot');
+
+  // The discipline rule: hand-moving a pallet into the door is refused.
+  ok(/parts\.isTransit && !\(opts && opts\.materialFlow\)/.test(HTML),
+     'a hand-driven move into To/From is refused unless it comes from material flow');
+  ok(/positions are filled by material requests and returns/.test(HTML),
+     'and the refusal says why, so the door does not quietly become six more slots');
+
+  // locationText names both zones rather than falling through to Open Floor.
+  ok(/p\.locationType==='transit'/.test(HTML), 'transit pallets report the To/From zone');
+  ok(/p\.locationType==='inprocess'/.test(HTML), 'in-process pallets report the In Process zone');
+}
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

@@ -1160,6 +1160,54 @@ dialog::backdrop{background:rgba(16,28,21,.45)}
   grid-template-columns:repeat(6,var(--slot-w));
   gap:var(--slot-gap);
 }
+.transitZone{
+  position:absolute;
+  left:588px;
+  top:690px;
+  width:466px;
+  z-index:3;
+  border:2px dashed rgba(217,117,0,.6);
+  background:rgba(255,244,228,.9);
+  border-radius:15px;
+  padding:10px;
+  color:#8c5a00;
+}
+.transitGrid{
+  display:grid;
+  grid-template-columns:repeat(6,var(--slot-w));
+  gap:var(--slot-gap);
+}
+.transitSlot{
+  position:relative;
+  width:var(--slot-w);
+  height:var(--slot-h);
+  background:rgba(255,255,255,.78);
+  border:1.8px dashed rgba(217,117,0,.65);
+  border-radius:5px;
+  overflow:hidden;
+}
+.transitSlot.occupied{background:var(--occupied);border-color:var(--occupied-border)}
+.transitSlot.selected{outline:3px solid var(--green);outline-offset:2px}
+.transitDir{
+  position:absolute;left:3px;top:3px;font-size:10px;font-weight:900;
+  padding:1px 4px;border-radius:999px;background:rgba(255,255,255,.85);color:#8c5a00;
+}
+/* The custody region is deliberately flat: no cells, because there are no
+   positions to draw. It reports a count and lists what is out. */
+.inProcessZone{
+  position:absolute;
+  left:588px;
+  top:612px;
+  width:466px;
+  z-index:3;
+  border:2px dotted rgba(90,90,120,.55);
+  background:rgba(240,240,248,.9);
+  border-radius:15px;
+  padding:8px 10px;
+  color:#3d3d5c;
+}
+.inProcessZone .ipCount{font-size:22px;font-weight:900;line-height:1.1}
+.inProcessZone .ipNote{font-size:11.5px;color:#5a5a78}
 .buildSlot{
   position:relative;
   width:var(--slot-w);
@@ -5706,6 +5754,15 @@ body.reconMapPickMode .palletTag{
           <div class="zoneTitle">Build Slot</div>
           <div class="buildGrid" id="buildGrid"></div>
         </div>
+        <div class="inProcessZone" id="inProcessZone">
+          <div class="zoneTitle">In Process</div>
+          <div class="ipCount" id="inProcessCount">0</div>
+          <div class="ipNote" id="inProcessNote">Held by Operations — visible here, not stored here.</div>
+        </div>
+        <div class="transitZone" id="transitZone">
+          <div class="zoneTitle">To/From Process</div>
+          <div class="transitGrid" id="transitGrid"></div>
+        </div>
         <div class="rackWrap">
           <div class="zoneTitle">Main Storage</div>
           <div class="rackArea"><div id="bayNums" class="bayNums"></div><div id="rack" class="rackGrid"></div><div id="rowLabels" class="rowLabels"></div></div>
@@ -6521,6 +6578,16 @@ const STAGING_ZONE='Shipping / Receiving';
 const RECEIVING_OPEN_FLOOR='OPEN_FLOOR_RECEIVING';
 const BUILD_ZONE='Build Slot';
 const BUILD_LOCS=['BS1','BS2','BS3','BS4','BS5','BS6'];
+/* The single door between the warehouse and Operations. Six positions, and a
+   position is occupied only during handover - material staged for a Material
+   Request frees it the moment Operations takes custody, and a Material Return
+   frees it once the warehouse accepts it back. Transit, not storage. */
+const TRANSIT_ZONE='To/From Process';
+const TRANSIT_LOCS=['TP1','TP2','TP3','TP4','TP5','TP6'];
+/* Not a location at all: material Operations is holding. Drawn so the warehouse
+   manager can see what is out and plan for what is coming back, but never
+   slotted - stock in a mixing tank has no position, footprint or capacity. */
+const IN_PROCESS_ZONE='In Process';
 const PLANT_ROWS=['P1','P2'];
 const PLANT_COLUMNS=['1','2','3','4'];
 const PLANT_LOCS=[];
@@ -6674,6 +6741,7 @@ for(let bay=1;bay<=8;bay++){
 EMPTY_TOTE_LOCS.forEach(loc=>RACK.push(loc));
 PLANT_LOCS.forEach(loc=>RACK.push(loc));
 BARREL_LOCS.forEach(loc=>RACK.push(loc));
+TRANSIT_LOCS.forEach(loc=>RACK.push(loc));
 
 const SR_LOCS=[];
 SR_COLUMNS.forEach(col=>STAGE_ROWS.forEach(row=>[1,2].forEach(level=>SR_LOCS.push(`${col}${row}${level}`))));
@@ -7504,10 +7572,12 @@ function palletMakeupSummary(p){
 function rackOf(loc){loc=normalizeLocCode(loc);return visible().find(p=>p.locationType==='rack'&&normalizeLocCode(p.location)===loc)}
 function stageOf(loc){loc=normalizeLocCode(loc);return visible().find(p=>p.locationType==='stage'&&normalizeLocCode(p.stageLocation)===loc)}
 function buildOf(loc){return visible().find(p=>p.locationType==='build'&&p.buildLocation===loc)}
+function transitOf(loc){return visible().find(p=>p.locationType==='transit'&&p.transitLocation===loc)}
 function occupantAt(loc,excludeId=''){
   const rp=rackOf(loc); if(rp && rp.palletId!==excludeId) return rp;
   const sp=stageOf(loc); if(sp && sp.palletId!==excludeId) return sp;
   const bp=buildOf(loc); if(bp && bp.palletId!==excludeId) return bp;
+  const tp=transitOf(loc); if(tp && tp.palletId!==excludeId) return tp;
   return null;
 }
 function normalizeLocCode(loc){
@@ -7518,10 +7588,11 @@ function normalizeLocCode(loc){
 function locParts(loc){
   loc=normalizeLocCode(loc);
   const isBuild=BUILD_LOCS.includes(loc);
+  const isTransit=TRANSIT_LOCS.includes(loc);
   const isEmptyTote=EMPTY_TOTE_LOCS.includes(loc);
   const isBarrel=BARREL_LOCS.includes(loc);
   let level='', base=loc;
-  if(!isBuild){
+  if(!isBuild && !isTransit){
     if(isBarrel){
       level='1';
       base=loc;
@@ -7535,7 +7606,7 @@ function locParts(loc){
   }
   const stackLocs=isBarrel?[base]:(isEmptyTote?[base+'1',base+'2',base+'3']:[base+'1',base+'2']);
   const idx=stackLocs.indexOf(loc);
-  return {loc,base,level,lower:isBarrel?base:base+'1',upper:isBarrel?'':base+'2',third:isBarrel?'':base+'3',stackLocs,aboveLocs:idx>=0?stackLocs.slice(idx+1):[],belowLocs:idx>=0?stackLocs.slice(0,idx):[],isRack:RACK.includes(loc),isStage:SR_LOCS.includes(loc),isBuild,isEmptyTote,isBarrel};
+  return {loc,base,level,lower:isBarrel?base:base+'1',upper:isBarrel?'':base+'2',third:isBarrel?'':base+'3',stackLocs,aboveLocs:idx>=0?stackLocs.slice(idx+1):[],belowLocs:idx>=0?stackLocs.slice(0,idx):[],isRack:RACK.includes(loc),isStage:SR_LOCS.includes(loc),isBuild,isTransit,isEmptyTote,isBarrel};
 }
 function canLeaveCurrent(id){
   const p=state.pallets.find(x=>x.palletId===id);
@@ -7589,10 +7660,17 @@ function moveToEmptyToteOverflow(id){
   if(!loc) return toast('No open Empty Tote Overflow position is available.');
   moveToRack(id,loc);
 }
-function canMoveToLocation(id,loc,candidate=null){
+function canMoveToLocation(id,loc,candidate=null,opts=null){
   const p=candidate || state.pallets.find(x=>x.palletId===id);
   if(!p) return {ok:false,msg:'Pallet not found'};
   const parts=locParts(loc);
+  /* To/From is the handshake between the warehouse and Operations, not a
+     parking space. Only a Material Request or Material Return may put anything
+     there, so a hand-driven move is refused - otherwise the door silently
+     becomes six more storage slots and the discipline it exists for is gone. */
+  if(parts.isTransit && !(opts && opts.materialFlow)){
+    return {ok:false,msg:TRANSIT_ZONE+' positions are filled by material requests and returns, not by moving a pallet there.'};
+  }
   if(parts.isBuild){
     const settingCheck=canStoreBySettings(p,parts,'buildSlots'); if(!settingCheck.ok) return settingCheck;
     const occ=occupantAt(parts.loc,id);
@@ -7656,6 +7734,8 @@ function locationText(p){
   }
   if(p.locationType==='stage') return p.stageLocation || STAGING_ZONE;
   if(p.locationType==='build') return p.buildLocation || BUILD_ZONE;
+  if(p.locationType==='transit') return p.transitLocation ? TRANSIT_ZONE+' '+p.transitLocation : TRANSIT_ZONE;
+  if(p.locationType==='inprocess') return IN_PROCESS_ZONE;
   return p.zone || 'Open Floor';
 }
 
@@ -8465,6 +8545,8 @@ function render(){
     ['Barrel Storage',renderBarrelStorage],
     ['Shipping / Receiving',renderStageGrid],
     ['Build Slots',renderBuildSlots],
+    ['To/From Process',renderTransitSlots],
+    ['In Process',renderInProcessZone],
     ['Open Floor',renderFloor],
     ['Details',renderDetails],
     ['Stats',renderStats],
@@ -8767,6 +8849,42 @@ function renderBuildSlots(){
     grid.appendChild(cell);
   });
 }
+/* The six To/From positions. Each shows which direction it is moving, because
+   a position holds material going out to Operations and material coming back,
+   and the picker needs to know which at a glance. */
+function renderTransitSlots(){
+  const grid=$('transitGrid');
+  if(!grid) return;
+  grid.innerHTML='';
+  TRANSIT_LOCS.forEach(loc=>{
+    const cell=document.createElement('div');
+    cell.className='transitSlot';
+    cell.dataset.loc=loc;
+    const p=transitOf(loc);
+    const dir=p&&p.transitDirection==='return'?'IN':p?'OUT':'';
+    cell.innerHTML=`<div class="locBuild">${loc}</div>`+(dir?`<div class="transitDir">${dir}</div>`:'');
+    if(p){ cell.classList.add('occupied'); applyCellStatusClass(cell,[p]); }
+    applyCellFocusClass(cell,[p]);
+    if(p&&p.palletId===selected) cell.classList.add('selected');
+    if(p) cell.appendChild(createPalletTag(p,'build'));
+    cell.addEventListener('click',e=>{e.stopPropagation();if(p&&mapFocusMatches(p)){selected=p.palletId;render()}else{selected=null;render()}});
+    grid.appendChild(cell);
+  });
+}
+
+/* Custody, not capacity. There is nothing to draw per item because there are no
+   positions - just how much is out and a reminder of why it is not stored here. */
+function renderInProcessZone(){
+  const el=$('inProcessCount');
+  if(!el) return;
+  const held=(state.pallets||[]).filter(p=>p&&p.locationType==='inprocess');
+  el.textContent=held.length;
+  const note=$('inProcessNote');
+  if(note) note.textContent=held.length
+    ? held.length+' pallet(s) held by Operations — visible here, not stored here.'
+    : 'Nothing with Operations. Material appears here once a request is received.';
+}
+
 function renderFloor(){
   const layer=$('floorLayer'); layer.innerHTML='';
   visible().filter(p=>p.locationType==='floor').forEach(p=>{
@@ -13156,6 +13274,7 @@ async function savePallet(e){
   if(type==='rack'){
     if(SR_LOCS.includes(choice)){p.locationType='stage';p.location='';p.stageLocation=choice;p.buildLocation='';p.zone=STAGING_ZONE}
     else if(BUILD_LOCS.includes(choice)){p.locationType='build';p.location='';p.stageLocation='';p.buildLocation=choice;p.zone=BUILD_ZONE}
+    else if(TRANSIT_LOCS.includes(choice)){p.locationType='transit';p.location='';p.stageLocation='';p.buildLocation='';p.transitLocation=choice;p.zone=TRANSIT_ZONE}
     else{p.locationType='rack';p.location=choice;p.stageLocation='';p.buildLocation='';p.zone=''}
     p.x=0;p.y=0;
   }else{p.locationType='floor';p.location='';p.stageLocation='';p.zone='Open Floor'; if(!p.x)p.x=525;if(!p.y)p.y=635}
