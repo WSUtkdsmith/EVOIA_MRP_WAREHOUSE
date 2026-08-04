@@ -30,6 +30,7 @@ function extract(name) {
 const NAMES = ['mrpPlacementIndex', 'mrpLotPlacement', 'mrpContentLine', 'buildPalletFromMrpLot',
                'mrpPoLineReceived', 'mrpReceiptApplied', 'mrpOrderToParsed', 'mrpOrderQueued',
                'buildTransitPalletForRequest', 'transitPositionsHeld', 'pendingMaterialActions',
+               'custodyMoves',
                // pendingMaterialActions names a put-away by where it landed.
                'locationText'];
 // Constants the extracted functions close over. Pulled from the file too, so a
@@ -44,7 +45,7 @@ const src = CONSTS + '\n' + NAMES.map(extract).join('\n');
 const { mrpPlacementIndex, mrpLotPlacement, mrpContentLine, buildPalletFromMrpLot,
         mrpPoLineReceived, mrpReceiptApplied, mrpOrderToParsed, mrpOrderQueued,
         buildTransitPalletForRequest, transitPositionsHeld, pendingMaterialActions,
-        locationText } =
+        custodyMoves, locationText } =
   new Function(src + '; return {' + NAMES.join(',') + '};')();
 
 let passed = 0, failed = 0;
@@ -277,6 +278,56 @@ const LOT_PICKED = { lotId: 'lotB', lotNumber: 'B', expirationDate: '2026-09-01'
     putAway(),
   ]);
   eq(both.map((x) => x.kind), ['stage', 'accept'], 'both directions ride in one batch');
+}
+
+// --- custody coming back the other way --------------------------------------
+// Every other step runs warehouse -> MRP, because the floor moves first. Taking
+// custody is the one that starts on the MRP side, and until custodyMoves existed
+// nothing carried it back: a pallet picked into TP1 stayed there for ever, the
+// door never freed, and In Process never showed anything because no code path
+// set locationType 'inprocess'.
+{
+  const staged = () => buildTransitPalletForRequest(REQ_LINE, REQ,
+    { palletId: 'EV1', qty: 120, position: 'TP1', lot: LOT_PICKED });
+  const holding = { inProcess: [{ lotId: 'lotB', lotNumber: 'B', qty: 120 }] };
+  const empty = { inProcess: [] };
+
+  eq(custodyMoves([staged()], empty), [],
+     'while the MRP has not taken custody, the pallet stays in the door');
+
+  const handed = custodyMoves([staged()], holding);
+  eq(handed.length, 1, 'once the MRP holds the lot, the pallet is handed over');
+  eq([handed[0].palletId, handed[0].to, handed[0].from], ['EV1', 'inprocess', 'TP1'],
+     'naming where it went and which position it frees');
+
+  // The rule that stops double counting: a put-away builds a fresh rack pallet,
+  // so the in-process one has to retire or the same material is on the map twice.
+  const out = { palletId: 'EV1', locationType: 'inprocess', mrpStagedLotId: 'lotB', contents: [] };
+  eq(custodyMoves([out], holding), [], 'while it is still out, it stays out');
+  const back = custodyMoves([out], empty);
+  eq(back.length === 1 && back[0].to, 'archive',
+     'when the MRP no longer holds it, custody came back and the in-process pallet retires');
+
+  // Clearing In Process as an exception looks identical from here, which is
+  // right: the material is not coming back and should stop being shown as if
+  // it were.
+  eq(custodyMoves([out], { inProcess: [{ lotId: 'someOtherLot' }] })[0].to, 'archive',
+     'a cleared flag retires the pallet the same way a return does');
+
+  // Safety: a failed fetch must not be read as "the MRP holds nothing", or every
+  // in-process pallet on the floor would be archived by a network blip.
+  eq(custodyMoves([out], null), [], 'no flow data means no moves, not mass retirement');
+  eq(custodyMoves([out], {}), [], 'a response with no inProcess list is not an empty one');
+  eq(custodyMoves([out], { inProcess: 'nonsense' }), [], 'a malformed list is ignored');
+
+  eq(custodyMoves([{ palletId: 'EV9', locationType: 'rack', location: 'M1A1' }], holding), [],
+     'a rack pallet is not part of this — custody never left the warehouse');
+  eq(custodyMoves([{ ...staged(), status: 'Archived' }], holding), [],
+     'an already-retired pallet is not moved again');
+  eq(custodyMoves([{ ...staged(), mrpStagedLotId: '' }], holding), [],
+     'a transit pallet with no lot to match cannot be handed over automatically');
+  eq(custodyMoves(null, holding), [], 'null pallets tolerated');
+  eq(custodyMoves([], holding), [], 'no pallets, no moves');
 }
 
 // --- To/From Process and In Process -----------------------------------------

@@ -73,5 +73,22 @@ const ok = (c, m, extra) => {
   ok(bad.length === 0, 'every row handler has a definition', bad.join(', '));
 }
 
+// 4. The boot sequence itself — the bare calls after init() at the end of the
+//    script. These run before anything is on screen, so a missing name here is
+//    the same fatal throw, just earlier.
+{
+  const tail = HTML.slice(HTML.indexOf('\ninit();'));
+  const calls = [...tail.matchAll(/^([A-Za-z0-9_$]+)\(/gm)].map((c) => c[1]);
+  ok(calls.length >= 2, 'the boot sequence is found', 'found: ' + calls.join(', '));
+  const missing = calls.filter((c) => !defined(c));
+  ok(missing.length === 0, 'every function called at boot has a definition', missing.join(', '));
+
+  // Custody can change while nobody is on this screen. If the map only
+  // reconciles when the Material Flow window is opened, a handed-over pallet
+  // sits in the door until someone happens to look.
+  ok(calls.indexOf('loadMaterialFlow') !== -1,
+     'boot reconciles custody, so the door is not stale on load', calls.join(', '));
+}
+
 console.log(`\n  ${passed} passed, ${failed} failed`);
 process.exit(failed === 0 ? 0 : 1);

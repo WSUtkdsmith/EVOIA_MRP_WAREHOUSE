@@ -8938,7 +8938,8 @@ function renderTransitSlots(){
 function renderInProcessZone(){
   const el=$('inProcessCount');
   if(!el) return;
-  const held=(state.pallets||[]).filter(p=>p&&p.locationType==='inprocess');
+  // visible(), not state.pallets: a retired pallet is not still with Operations.
+  const held=visible().filter(p=>p&&p.locationType==='inprocess');
   el.textContent=held.length;
   const note=$('inProcessNote');
   if(note) note.textContent=held.length
@@ -14718,6 +14719,51 @@ function freeTransitPositionsLocal(pallets,fromApi){
   return TRANSIT_LOCS.filter(loc=>!held[loc]);
 }
 
+/* The other half of the handshake: what the MRP has done that this side has not
+   reflected yet.
+
+   Everything else in material flow runs warehouse -> MRP, because the floor
+   moves first. Taking custody is the one step that starts on the MRP side, and
+   until this existed nothing carried it back: a pallet picked into TP1 stayed
+   in TP1 for ever, the door never freed, and the In Process zone never showed
+   anything because no code path ever set locationType 'inprocess'.
+
+   The MRP's In Process list is the authority - it is a custody statement, and
+   custody is the MRP's to declare. So:
+
+     transit pallet whose lot the MRP now holds  -> hand it over, free the door
+     in-process pallet whose lot it no longer holds -> custody came back
+
+   The second rule is what stops double counting. When a return is put away the
+   warehouse creates a fresh rack pallet, so the in-process pallet has to retire
+   or the same material would be on the map twice. Clearing In Process as an
+   exception lands here too, which is right: the material is not coming back and
+   should stop being shown as though it were. */
+function custodyMoves(pallets,flow){
+  // No flow, or a shape we do not recognise, means we did not hear from the
+  // MRP - not that it holds nothing. Acting on a failed fetch would archive
+  // every in-process pallet on the floor.
+  if(!flow||!Array.isArray(flow.inProcess)) return [];
+  const heldLots={};
+  flow.inProcess.forEach(r=>{ if(r&&r.lotId) heldLots[r.lotId]=r; });
+
+  const moves=[];
+  (pallets||[]).forEach(p=>{
+    if(!p||p.status==='Archived') return;
+    const lotId=p.mrpStagedLotId||'';
+    if(p.locationType==='transit'&&p.transitDirection==='request'&&lotId&&heldLots[lotId]){
+      moves.push({palletId:p.palletId,to:'inprocess',from:p.transitLocation||'',
+                  lotId,reason:'Operations took custody'});
+      return;
+    }
+    if(p.locationType==='inprocess'&&lotId&&!heldLots[lotId]){
+      moves.push({palletId:p.palletId,to:'archive',from:'',
+                  lotId,reason:'Custody returned to the warehouse'});
+    }
+  });
+  return moves;
+}
+
 /* Actions the warehouse has taken that the MRP has not yet recorded. The same
    pending/applied shape as dock receipts, and the same reason: a re-sync must
    not stage the same line twice. */
@@ -15105,24 +15151,60 @@ function queueMrpPurchaseOrder(poId){
 --------------------------------------------------------------------------- */
 let materialFlow=null, flowLoading=false, stagePickCtx=null;
 
+// This runs at boot as well as when the window opens, so the status line may
+// not be on screen. Writing to it unguarded would throw during init() and take
+// the whole map down with it - the exact failure mode startup.test.js exists for.
+function flowStatus(text){ const el=$('flowStatus'); if(el) el.textContent=text; }
+
 async function loadMaterialFlow(force){
   if(flowLoading) return;
   if(materialFlow && !force){ renderMaterialFlow(); return; }
   flowLoading=true;
-  $('flowStatus').textContent='Loading…';
+  flowStatus('Loading…');
   try{
     const resp=await fetch('/api/material-flow?bu='+encodeURIComponent(EVOIA_BU));
     if(!resp.ok) throw new Error('HTTP '+resp.status);
     materialFlow=await resp.json();
+    applyCustodyMoves();
     const c=materialFlow.counts||{};
-    $('flowStatus').textContent=c.doorFull
+    flowStatus(c.doorFull
       ? 'Every To/From position is taken — a pick is waiting for one to clear.'
-      : `${c.linesToPick||0} line(s) to pick · ${c.openReturns||0} return(s) · ${c.freePositions||0} position(s) free`;
+      : `${c.linesToPick||0} line(s) to pick · ${c.openReturns||0} return(s) · ${c.freePositions||0} position(s) free`);
   }catch(e){
     console.warn('material flow load failed:',e);
     materialFlow=null;
-    $('flowStatus').textContent='Could not reach the material-flow service — try Refresh.';
+    flowStatus('Could not reach the material-flow service — try Refresh.');
   }finally{ flowLoading=false; renderMaterialFlow(); }
+}
+
+/* Reflect the MRP's custody decisions onto the map.
+
+   Runs on every material-flow load, not just when the window is open, so a
+   pallet handed over while the warehouse was looking elsewhere still clears the
+   door. Silent when nothing changed - this is bookkeeping catching up, not an
+   event anyone needs telling about. */
+function applyCustodyMoves(){
+  const moves=custodyMoves(state.pallets,materialFlow);
+  if(!moves.length) return;
+  moves.forEach(m=>{
+    const p=state.pallets.find(x=>x.palletId===m.palletId);
+    if(!p) return;
+    if(m.to==='inprocess'){
+      p.locationType='inprocess';
+      p.transitLocation=''; p.transitDirection='';
+      p.location=''; p.stageLocation=''; p.buildLocation='';
+      p.zone=IN_PROCESS_ZONE; p.x=0; p.y=0;
+      p.updatedAt=now();
+      hist(p.palletId,'Moved',m.reason+(m.from?' from '+m.from:'')+' — now with Operations.');
+    } else if(m.to==='archive'){
+      p.status='Archived';
+      p.locationType='inprocess'; p.zone='Archived';
+      p.updatedAt=now();
+      hist(p.palletId,'Archived',m.reason+' — retired here; the return was put away as a new pallet.');
+    }
+  });
+  save();
+  render();
 }
 
 function openMaterialFlow(){ $('materialFlowDialog').showModal(); loadMaterialFlow(false); }
@@ -15312,6 +15394,10 @@ function putAwayReturnLine(returnId,lineId){
 init();
 syncStateFromServerOnBoot();
 loadMrpCatalog(false);
+// Custody can change while nobody is looking at this screen, so reconcile at
+// boot rather than only when the Material Flow window is opened - otherwise the
+// door stays occupied on the map until someone happens to look.
+loadMaterialFlow(false);
 </script>
 <div id="printStage" class="printStage"></div>
 </body>

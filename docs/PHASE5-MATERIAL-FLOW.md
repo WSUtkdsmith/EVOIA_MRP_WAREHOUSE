@@ -253,6 +253,42 @@ inProcessClearedReason: "str"     // set only via the exception path
    the warehouse has nothing to balance — worst discrepancy first, because the
    point of the report is the exceptions.
 
+## The return leg of custody — MRP → warehouse
+
+Everything else in material flow runs **warehouse → MRP**, because the floor
+moves first and the MRP writes down what already happened. **Taking custody is
+the one step that starts on the MRP side**, and nothing carried it back: a pallet
+picked into TP1 stayed in TP1 for ever, the door never freed, and the In Process
+zone never showed anything, because no code path ever set
+`locationType: 'inprocess'`.
+
+`custodyMoves(pallets, flow)` closes it, driven by the MRP's In Process list —
+which is the right authority, since In Process is a custody statement and custody
+is the MRP's to declare:
+
+| Pallet | MRP says | Result |
+|---|---|---|
+| in a To/From position | holds that lot | hand over → In Process, door frees |
+| In Process | no longer holds it | custody came back → retire the pallet |
+
+The second rule is what prevents **double counting**: putting a return away
+builds a *fresh* rack pallet, so the in-process one has to retire or the same
+material appears on the map twice. Clearing the flag as an exception lands in the
+same branch, which is correct — the material is not coming back and should stop
+being drawn as though it were.
+
+**A failed fetch is not an empty answer.** `custodyMoves` returns nothing unless
+`flow.inProcess` is actually an array. Treating a network blip as "the MRP holds
+nothing" would archive every in-process pallet on the floor, so that is asserted
+explicitly rather than left to luck.
+
+It runs on **every** material-flow load, including at boot — not only when the
+window is opened, or a handover would sit in the door until someone happened to
+look. That put `loadMaterialFlow` in the boot sequence, so its status-line writes
+are now guarded: an unguarded `$()` there throws during `init()` and takes the
+whole map down, which is the failure `startup.test.js` exists for. That test now
+also checks the boot sequence itself.
+
 ## The consumption gate — closing the last bypass
 
 Found while building step 5, and the reason it grew: **the batch log could reach
