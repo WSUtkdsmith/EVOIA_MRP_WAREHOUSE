@@ -28,10 +28,10 @@ function extract(name) {
 }
 
 const NAMES = ['mrpPlacementIndex', 'mrpLotPlacement', 'mrpContentLine', 'buildPalletFromMrpLot',
-               'mrpReceiptLine', 'buildPalletFromPoLine', 'mrpPoLineReceived', 'mrpReceiptApplied'];
+               'mrpPoLineReceived', 'mrpReceiptApplied', 'mrpOrderToParsed', 'mrpOrderQueued'];
 const src = NAMES.map(extract).join('\n');
 const { mrpPlacementIndex, mrpLotPlacement, mrpContentLine, buildPalletFromMrpLot,
-        mrpReceiptLine, buildPalletFromPoLine, mrpPoLineReceived, mrpReceiptApplied } =
+        mrpPoLineReceived, mrpReceiptApplied, mrpOrderToParsed, mrpOrderQueued } =
   new Function(src + '; return {' + NAMES.join(',') + '};')();
 
 let passed = 0, failed = 0;
@@ -129,62 +129,45 @@ eq(mrpLotPlacement(LOT, {}).palletIds, [], 'no pallets when unplaced');
 eq(buildPalletFromMrpLot(LOT, { palletId: 'EV1', qty: 1, mfg: 'EV' }).mfg, 'EV',
    'an explicit manufacturer overrides the lot');
 
-// --- receiving against a purchase order -----------------------------------
-const PO_LINE = {
-  lineId: 'L1', rawMaterialId: 'rm1', itemName: 'Green coffee', itemSku: 'GC-1',
-  sku: 'GC-1-60KG', size: '60 kg', packageType: 'sack', unit: 'kg',
-  qty: 600, unitCost: 5, containerCount: 10, outstanding: 600,
+// --- an MRP order becomes a queued order file ------------------------------
+// Orders used to be receivable straight from the catalog window, which skipped
+// staging, putaway, labels and who signed for it. Now they join the same queue
+// a parsed order file lands in and go through Receive Order like anything else.
+const ORDER = {
+  poId: 'po1', reference: 'PO-1', supplier: 'Acme', orderDate: '2026-07-01',
+  expectedDate: '2026-09-01', status: 'Ordered',
+  lines: [
+    { lineId: 'L1', itemName: 'Green coffee', sku: 'GC-1-60KG', size: '60 kg',
+      packageType: 'sack', unit: 'kg', outstanding: 600, containerCount: 10 },
+    { lineId: 'L2', itemName: 'Green coffee', sku: 'GC-1-1000KG', size: '1000 kg',
+      packageType: 'tote', unit: 'kg', outstanding: 3000, containerCount: 3 },
+  ],
 };
-const ORDER = { poId: 'po1', reference: 'PO-1', supplier: 'Acme', expectedDate: '2026-09-01' };
-
 {
-  const line = mrpReceiptLine(PO_LINE, ORDER, 600, 'SUP-77');
-  eq(line.batch, 'SUP-77', 'the supplier batch is what identifies the stock');
-  eq(line.quantityOriginal, 600, 'received quantity is booked');
-  eq(line.quantityCurrent, 600, 'and is available to pick immediately');
-  eq(line.mrpOrderRef, 'PO-1', 'the order reference is recorded');
-  eq(line.mrpPoLineId, 'L1', 'and the exact line it satisfies');
-  eq(line.mrpSku, 'GC-1-60KG', 'the storable sku carries over');
-  eq(line.mrpLotId, '', 'no MRP lot exists yet — this stock has not been told to the MRP');
-  eq(line.mrpReceiptStatus, 'pending', 'so the receipt is pending until it is applied there');
-  eq(mrpReceiptLine(null, null, 5, '').mrpOrderRef, '', 'missing order or line does not throw');
+  const parsed = mrpOrderToParsed(ORDER);
+  eq(parsed.orderRef, 'PO-1', 'the order reference is what the dock quotes');
+  eq(parsed.account, 'Acme', 'the supplier reads as the account');
+  eq(parsed.origin, 'Acme', 'the goods come from the supplier');
+  eq(parsed.destination, 'Evoia', 'and are bound for us — which is how MFG is detected on import');
+  eq(parsed.items.length, 2, 'one item per outstanding order line');
+  ok(parsed.items[0].description.includes('Green coffee'), 'the item names the material');
+  ok(parsed.items[0].description.includes('GC-1-60KG'), 'and its storable sku');
+  eq(parsed.items[0].orderedQty, 600, 'the quantity offered is what is still owed');
+  eq(parsed.items[0].mrpPoLineId, 'L1', 'each item remembers the order line it came from');
+  eq(parsed.items[1].mrpPoLineId, 'L2', 'including the second container size');
+  eq(parsed.items[0].mrpPoId, 'po1', 'and the order');
+  eq(parsed.items[0].batch, '', 'no batch is assumed — the dock reads it off what arrives');
+  eq(parsed.items[0].shippedQty, 0, 'and nothing is presumed shipped');
+  eq(mrpOrderToParsed(null).items, [], 'a missing order yields no items, not a throw');
 }
 
-{
-  const p = buildPalletFromPoLine(PO_LINE, ORDER, { palletId: 'ev5', qty: 600, batch: 'SUP-77', now: '2026-08-01T00:00:00Z' });
-  eq(p.palletId, 'EV5', 'pallet id upper-cased');
-  eq(p.origin, 'Acme', 'origin is the supplier the order was placed with');
-  eq(p.locationType, 'floor', 'no location means the open floor');
-  eq(p.contents.length, 1, 'one content line');
-  eq(p.contents[0].mrpPoLineId, 'L1', 'linked to the order line');
-  eq(p.createdAt, '2026-08-01T00:00:00Z', 'timestamp injectable, so this is deterministic');
-  const r = buildPalletFromPoLine(PO_LINE, ORDER, { palletId: 'EV6', qty: 60, batch: 'B', locationType: 'rack', location: 'M1A1' });
-  eq(r.locationType, 'rack', 'a rack location is honoured');
-  eq(r.location, 'M1A1', 'with its slot code');
-}
-
-// What has already been booked against a line — including pending ones, so the
-// same delivery is not booked twice by two people an hour apart.
-{
-  eq(mrpPoLineReceived([], 'L1'), { qty: 0, pending: 0, palletIds: [] }, 'nothing booked yet');
-  eq(mrpPoLineReceived(null, 'L1').qty, 0, 'null pallets tolerated');
-  const a = buildPalletFromPoLine(PO_LINE, ORDER, { palletId: 'EV1', qty: 200, batch: 'B1' });
-  const b = buildPalletFromPoLine(PO_LINE, ORDER, { palletId: 'EV2', qty: 150, batch: 'B2' });
-  const got = mrpPoLineReceived([a, b], 'L1');
-  eq(got.qty, 350, 'quantities sum across pallets');
-  eq(got.pending, 350, 'and are all pending until applied to the MRP');
-  eq(got.palletIds, ['EV1', 'EV2'], 'naming the pallets that hold them');
-  eq(mrpPoLineReceived([a, b], 'OTHER').qty, 0, 'a different line is unaffected');
-  // once applied, it stops being pending but still counts as received
-  b.contents[0].mrpReceiptStatus = 'applied';
-  const after = mrpPoLineReceived([a, b], 'L1');
-  eq(after.qty, 350, 'applying does not change what was received');
-  eq(after.pending, 200, 'only what is still unapplied is pending');
-}
-
-// A hand-built pallet is not MRP stock and must not be counted against an order.
-eq(mrpPoLineReceived([pallet('EV9', [{ quantityOriginal: 99 }])], 'L1').qty, 0,
-   'pallets with no order link are ignored');
+// Queued twice would become two receiving orders for one delivery.
+eq(mrpOrderQueued([], 'po1'), false, 'an empty queue holds nothing');
+eq(mrpOrderQueued(null, 'po1'), false, 'a missing queue tolerated');
+eq(mrpOrderQueued([{ mrpPoId: 'po1', status: 'queued' }], 'po1'), true, 'a queued order is recognised');
+eq(mrpOrderQueued([{ mrpPoId: 'other', status: 'queued' }], 'po1'), false, 'a different order is not');
+eq(mrpOrderQueued([{ fileName: 'hand.pdf', status: 'queued' }], 'po1'), false,
+   'a hand-uploaded order file is not an MRP order');
 
 // The MRP's ledger is the authority on whether a booking has been recorded.
 eq(mrpReceiptApplied({ id: 'l1' }, ['l1']), true, 'the ledger says it is recorded');

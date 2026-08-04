@@ -240,10 +240,18 @@ transaction logic is duplicated.
     duplicating it is acceptable for a **read**, and deliberately does not extend
     to the write (step 4 goes through the MRP's own transaction).
   - Warehouse: an **Inbound purchase orders** view in the MRP Catalog window,
-    one row per order line with overdue dates called out, and a **Receive**
-    action per line. Receiving asks for pallet, quantity, supplier batch and
-    location, refuses more than the order still owes, and books a real pallet
-    that picks and ships like any other.
+    one row per order with its lines, overdue dates called out, and an **Add to
+    receiving queue** action.
+    - *Corrected after review:* the first cut let an order be received straight
+      from the catalog window, which **bypassed the warehouse's own receiving
+      workflow** — staging, putaway, labels, damage capture, who signed for it,
+      and the receiving-order record itself. An MRP order does not get its own
+      receiving path. It becomes a **queued order file** like any parsed order,
+      appears in the dropdown on **Receive Order**, and goes in through the
+      normal flow. The MRP link rides along on the queue entry's items → the
+      receiving row's dataset → the pallet content line, so the delivery is
+      still reported back to the MRP. The two functions that served the old
+      direct path were deleted rather than left unaccounted for.
   - The receipt records `mrpPoId` / `mrpPoLineId` / `mrpOrderRef` and is marked
     **`mrpReceiptStatus: 'pending'`** — the MRP has not been told yet. That mark
     is the seed of step 4's ledger, and `mrpPoLineReceived` already counts

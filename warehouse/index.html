@@ -5781,35 +5781,6 @@ body.reconMapPickMode .palletTag{
   </div>
 </dialog>
 
-<dialog id="mrpReceiveDialog">
-  <div class="modal">
-    <div class="modalHead"><h2>Receive against purchase order</h2><button type="button" class="x" data-close="mrpReceiveDialog">×</button></div>
-    <form id="mrpReceiveForm">
-      <div id="mrpReceiveSummary" class="totalsBox" style="margin-bottom:10px"></div>
-      <div class="two">
-        <label class="field"><span>Pallet ID<b class="reqMark">*</b></span><input id="mrpReceivePalletId" required placeholder="EV123"></label>
-        <label class="field"><span>MFG</span><select id="mrpReceiveMfg"><option value="EV">EV</option><option value="LV">LV</option></select></label>
-      </div>
-      <div class="two">
-        <label class="field"><span>Quantity received<b class="reqMark">*</b></span><input id="mrpReceiveQty" type="number" step="any" min="0" required></label>
-        <label class="field"><span>Lot / batch number<b class="reqMark">*</b></span><input id="mrpReceiveBatch" required placeholder="Supplier batch"></label>
-      </div>
-      <label class="field"><span>Location</span>
-        <select id="mrpReceiveLocation"><option value="">Open Floor</option></select>
-      </label>
-      <div style="font-size:12.5px;color:#66746c;margin:8px 0">
-        The pallet is booked in here immediately. The MRP is told separately, so
-        this delivery is marked pending until it is applied there.
-      </div>
-      <div id="mrpReceiveError" style="color:var(--red);font-weight:800;font-size:13px;margin:6px 0"></div>
-      <div class="actions" style="justify-content:flex-end;margin-top:10px">
-        <button type="button" class="btn" data-close="mrpReceiveDialog">Cancel</button>
-        <button type="submit" class="btn primary">Book in pallet</button>
-      </div>
-    </form>
-  </div>
-</dialog>
-
 <dialog id="mrpPlaceDialog">
   <div class="modal">
     <div class="modalHead"><h2>Place MRP lot</h2><button type="button" class="x" data-close="mrpPlaceDialog">×</button></div>
@@ -7809,7 +7780,6 @@ function init(){
   $('openShippingWindowBtn').onclick=openShippingLogWindow;
   $('openMrpCatalogBtn').onclick=openMrpCatalog;
   $('mrpPlaceForm').onsubmit=submitMrpPlacement;
-  $('mrpReceiveForm').onsubmit=submitMrpReceive;
   $('refreshMrpCatalogBtn').onclick=()=>loadMrpCatalog(true);
   $('mrpCatalogSearch').oninput=renderMrpCatalog;
   $('mrpCatalogView').onchange=renderMrpCatalog;
@@ -10482,7 +10452,10 @@ function receivingLineDrafts(){
     damagedAnswer:d.querySelector('.recDamaged').value,
     damaged:d.querySelector('.recDamaged').value==='Yes',
     damageDescription:d.querySelector('.recDamageDescription').value.trim(),
-    damageFile:d.querySelector('.recDamagePhoto').files && d.querySelector('.recDamagePhoto').files[0]
+    damageFile:d.querySelector('.recDamagePhoto').files && d.querySelector('.recDamagePhoto').files[0],
+    mrpPoId:d.dataset.mrpPoId||'',
+    mrpPoLineId:d.dataset.mrpPoLineId||'',
+    mrpOrderRef:d.dataset.mrpOrderRef||''
   }));
 }
 const RECEIVING_IMPORT_PKG_OPTIONS=['1 gallon','2.5 gallon','Molasses 1 gallon','Molasses Quart','Liquid tote','Empty tote','Barrel','Supersack of Char','Other'];
@@ -10978,6 +10951,11 @@ function onReceivingImportSelectChange(){
       if(!row) return;
       row.dataset.imported='1';
       row.dataset.importedFrom=queueId;
+      // An order file raised in the MRP carries the order and line each item
+      // came from, so the pallet built from this row can be matched back to it.
+      if(it.mrpPoId) row.dataset.mrpPoId=it.mrpPoId;
+      if(it.mrpPoLineId) row.dataset.mrpPoLineId=it.mrpPoLineId;
+      if(it.mrpOrderRef) row.dataset.mrpOrderRef=it.mrpOrderRef;
       row.querySelector('.recPkg').value=pkgValue;
       row.querySelector('.recDesc').value=it.description||'';
       row.querySelector('.recBatch').value=entry.batch||'';
@@ -11052,8 +11030,9 @@ async function createReceivingOrder(e){
     }
     const isEmptyTote=packageCategoryFromType(l.packageType)==='empty tote';
     const contentQty=isEmptyTote?0:l.qty;
-    const content={id:String(Date.now()+Math.random()),batch:l.batch,packageType:l.packageType,description:l.description||'Empty tote',quantityOriginal:contentQty,quantityCurrent:contentQty,gallons:l.gallons||''};
-    const contentsArr=(l.mixed && !isEmptyTote)?l.batchRows.map(r=>({id:String(Date.now()+Math.random()),batch:r.batch,packageType:l.packageType,description:l.description||'',quantityOriginal:Number(r.qty||0),quantityCurrent:Number(r.qty||0),gallons:r.gallons||''})):[content];
+    const mrpLink=l.mrpPoLineId?{mrpPoId:l.mrpPoId,mrpPoLineId:l.mrpPoLineId,mrpOrderRef:l.mrpOrderRef,mrpReceiptStatus:'pending'}:{};
+    const content={id:String(Date.now()+Math.random()),batch:l.batch,packageType:l.packageType,description:l.description||'Empty tote',quantityOriginal:contentQty,quantityCurrent:contentQty,gallons:l.gallons||'',...mrpLink};
+    const contentsArr=(l.mixed && !isEmptyTote)?l.batchRows.map(r=>({id:String(Date.now()+Math.random()),batch:r.batch,packageType:l.packageType,description:l.description||'',quantityOriginal:Number(r.qty||0),quantityCurrent:Number(r.qty||0),gallons:r.gallons||'',...mrpLink})):[content];
     const p={
       palletId:l.palletId,
       mfg:l.mfg,
@@ -14490,52 +14469,45 @@ function toast(msg){const t=$('toast');t.textContent=msg;t.style.display='block'
 
 function todayISO(){ return now().slice(0,10) }
 
-/* A pallet content line for stock arriving against a purchase order.
+/* An MRP purchase order, in the shape the receiving queue already speaks.
 
-   This is a receipt, not a placement: the stock does not exist as an MRP lot
-   yet. The line therefore records the order and line it satisfies, and is
-   marked pending - the MRP has not been told. Applying it to the MRP goes
-   through the MRP's own receive transaction rather than being written here,
-   so its enforcement and costing stay authoritative. Until that happens the
-   pallet is real and usable on the floor, and the pending mark is what stops
-   the same delivery being applied twice. */
-function mrpReceiptLine(poLine, order, qty, batch){
+   Orders raised in the MRP used to be receivable straight from the catalog
+   window, which quietly skipped everything receiving actually does - staging,
+   putaway, labels, damage capture, who signed for it. So an order does not get
+   its own receiving path: it becomes a queued order file like any other, and
+   goes in through Receive Order with the rest.
+
+   Each item keeps the order and line it came from, so the pallet built from it
+   can still be matched back and reported to the MRP. */
+function mrpOrderToParsed(order){
   return {
-    id:String(Date.now()+Math.random()),
-    batch:batch||'',
-    packageType:(poLine&&poLine.size)||(poLine&&poLine.packageType)||'',
-    description:[(poLine&&poLine.itemName)||'',(poLine&&poLine.itemSku)||''].filter(Boolean).join(' · '),
-    quantityOriginal:Number(qty)||0,
-    quantityCurrent:Number(qty)||0,
-    expiration:'',
-    mrpLotId:'',
-    mrpItemId:(poLine&&poLine.rawMaterialId)||'',
-    mrpSku:(poLine&&poLine.sku)||'',
-    mrpOrderRef:(order&&order.reference)||'',
-    mrpPoId:(order&&order.poId)||'',
-    mrpPoLineId:(poLine&&poLine.lineId)||'',
-    mrpReceiptStatus:'pending'
+    orderRef:(order&&order.reference)||'',
+    customerPO:(order&&order.reference)||'',
+    account:(order&&order.supplier)||'',
+    date:(order&&order.orderDate)||'',
+    origin:(order&&order.supplier)||'',
+    destination:'Evoia',
+    salesPerson:'',
+    items:((order&&order.lines)||[]).map(l=>({
+      description:[l.itemName,l.sku].filter(Boolean).join(' · '),
+      orderedQty:Number(l.outstanding)||0,
+      shippedQty:0,
+      batch:'',
+      batchBreakdown:[],
+      unit:l.unit||'',
+      containerCount:l.containerCount,
+      packageHint:l.size||l.packageType||'',
+      mrpPoId:(order&&order.poId)||'',
+      mrpPoLineId:l.lineId||'',
+      mrpOrderRef:(order&&order.reference)||''
+    }))
   };
 }
 
-function buildPalletFromPoLine(poLine,order,opts){
-  const o=opts||{};
-  const stamp=o.now||new Date().toISOString();
-  const p={
-    createdAt:stamp,updatedAt:stamp,
-    palletId:String(o.palletId||'').trim().toUpperCase(),
-    mfg:o.mfg||'EV',
-    origin:(order&&order.supplier)||'',
-    status:'Active',
-    notes:o.notes||('Received against '+((order&&order.reference)||'purchase order')),
-    contents:[mrpReceiptLine(poLine,order,o.qty,o.batch)],
-    damage:{isDamaged:false,description:'',photoDataUrl:'',photoName:'',reportedAt:''},
-    locationType:'floor',location:'',stageLocation:'',buildLocation:'',zone:'Open Floor',x:525,y:635
-  };
-  if(o.locationType==='rack'&&o.location){
-    p.locationType='rack';p.location=o.location;p.zone='';p.x=0;p.y=0;
-  }
-  return p;
+/* Whether this order is already sitting in the receiving queue. An order file
+   queued twice becomes two receiving orders for one delivery. */
+function mrpOrderQueued(queue,poId){
+  return (queue||[]).some(q=>q&&q.mrpPoId===poId&&q.status!=='removed');
 }
 
 /* How much of a purchase-order line the warehouse has already booked in,
@@ -14696,27 +14668,30 @@ function renderMrpCatalog(){
   const match=(o)=>!q||Object.values(o).some(v=>String(v??'').toLowerCase().includes(q));
 
   if(view==='orders'){
-    const orders=(mrpCatalog.purchaseOrders||[]);
-    // Flatten to one row per line: a line is what actually arrives and what
-    // gets received, and an order routinely carries several.
-    const rows=orders.flatMap(o=>(o.lines||[]).map(l=>({...l,order:o}))).filter(match);
-    head.innerHTML='<tr><th>Order</th><th>Supplier</th><th>Expected</th><th>Material</th><th>Container</th><th>Outstanding</th><th>Unit cost</th><th></th></tr>';
-    body.innerHTML=rows.length?rows.map(r=>{
-      const late=r.order.expectedDate && r.order.expectedDate < todayISO();
-      const containers=(r.containerCount!=null?r.containerCount+' × ':'')+(r.size||r.packageType||'—');
+    // One row per order, not per line: an order file is queued as a whole and
+    // received through the normal Receive Order screen, the same as any other.
+    const rows=(mrpCatalog.purchaseOrders||[]).filter(match);
+    head.innerHTML='<tr><th>Order</th><th>Supplier</th><th>Expected</th><th>Lines</th><th>Outstanding</th><th>Value</th><th>Receiving queue</th></tr>';
+    body.innerHTML=rows.length?rows.map(o=>{
+      const late=o.expectedDate && o.expectedDate < todayISO();
+      const queued=mrpOrderQueued(state.importedOrderQueue,o.poId);
+      const detail=(o.lines||[]).map(l=>
+        `${esc(l.itemName)} — ${esc(formatNum(l.outstanding))} ${esc(l.unit||'')}`+
+        (l.containerCount!=null?` (${esc(l.containerCount)} × ${esc(l.size||l.packageType||'')})`:'')).join('<br>');
       return `<tr>
-        <td><b>${esc(r.order.reference)}</b>${r.order.status==='Part received'?' <small>(part received)</small>':''}</td>
-        <td>${esc(r.order.supplier||'—')}</td>
-        <td${late?' style="color:#e53935;font-weight:800"':''}>${esc(r.order.expectedDate||'—')}${late?' overdue':''}</td>
-        <td>${esc(r.itemName)}<small> · ${esc(r.itemSku||'')}</small></td>
-        <td>${esc(containers)}</td>
-        <td>${esc(formatNum(r.outstanding))} ${esc(r.unit||'')}</td>
-        <td>${esc(formatNum(r.unitCost))}</td>
-        <td><button type="button" class="btn small receiveMrpPoBtn" data-po="${esc(r.order.poId)}" data-line="${esc(r.lineId)}">Receive</button></td>
+        <td><b>${esc(o.reference)}</b>${o.status==='Part received'?'<br><small>part received</small>':''}</td>
+        <td>${esc(o.supplier||'—')}</td>
+        <td${late?' style="color:#e53935;font-weight:800"':''}>${esc(o.expectedDate||'—')}${late?'<br>overdue':''}</td>
+        <td style="font-size:12px">${detail}</td>
+        <td>${esc(formatNum(o.totalOutstanding))}</td>
+        <td>${esc(formatNum(o.totalCost))}</td>
+        <td>${queued
+          ? '<span style="color:#2f6f43;font-weight:800">Queued</span><br><small>Receive it from the Receive Order screen</small>'
+          : `<button type="button" class="btn small queueMrpPoBtn" data-po="${esc(o.poId)}">Add to receiving queue</button>`}</td>
       </tr>`;
     }).join('')
-      :'<tr><td colspan="8">No inbound orders. Raise and place them in the MRP first.</td></tr>';
-    body.querySelectorAll('.receiveMrpPoBtn').forEach(b=>b.onclick=()=>openMrpReceive(b.dataset.po,b.dataset.line));
+      :'<tr><td colspan="7">No inbound orders. Raise and place them in the MRP first.</td></tr>';
+    body.querySelectorAll('.queueMrpPoBtn').forEach(b=>b.onclick=()=>queueMrpPurchaseOrder(b.dataset.po));
     $('mrpCatalogCount').textContent=rows.length;
   }else if(view==='skus'){
     const rows=(mrpCatalog.skus||[]).filter(match);
@@ -14789,100 +14764,39 @@ function openMrpPlacement(lotId){
   $('mrpPlaceDialog').showModal();
 }
 let mrpPlaceLotId='';
-let mrpReceiveCtx=null;
+/* Put an MRP purchase order into the receiving queue.
 
-function openMrpReceive(poId,lineId){
+   This deliberately does not receive anything. It drops the order into the
+   same queue a parsed order file lands in, so the delivery goes through
+   Receive Order like every other: staged, put away, labelled, signed for. */
+function queueMrpPurchaseOrder(poId){
   const order=((mrpCatalog&&mrpCatalog.purchaseOrders)||[]).find(o=>o.poId===poId);
-  const line=order&&(order.lines||[]).find(l=>l.lineId===lineId);
-  if(!order||!line) return toast('That order line is no longer open.');
-  if(!requirePermission('createReceiving','receiving inventory')) return;
-  const booked=mrpPoLineReceived(state.pallets,lineId);
-  const left=Math.max(0,Number(line.outstanding||0)-booked.qty);
-  mrpReceiveCtx={order,line};
-  $('mrpReceiveSummary').innerHTML=`<h3>${esc(order.reference)} — ${esc(line.itemName)}</h3>
-    <div class="totalsGrid">
-      <div class="totalCard"><b>${esc(order.supplier||'—')}</b><span>Supplier</span></div>
-      <div class="totalCard"><b>${esc(formatNum(line.outstanding))} ${esc(line.unit||'')}</b><span>Outstanding on the order</span></div>
-      <div class="totalCard"><b>${esc(formatNum(booked.qty))}</b><span>Already booked here${booked.pending?' ('+formatNum(booked.pending)+' pending)':''}</span></div>
-      <div class="totalCard"><b>${esc((line.containerCount!=null?line.containerCount+' × ':'')+(line.size||line.packageType||'—'))}</b><span>Expected containers</span></div>
-    </div>`;
-  const mfg='EV';
-  $('mrpReceiveMfg').value=mfg;
-  $('mrpReceivePalletId').value=mfg+(state.settings['next'+mfg]||1);
-  $('mrpReceiveQty').value=left;
-  $('mrpReceiveBatch').value='';
-  const sel=$('mrpReceiveLocation');
-  sel.innerHTML='<option value="">Open Floor</option>'+
-    RACK.filter(loc=>!occupantAt(loc)).map(loc=>`<option value="${esc(loc)}">${esc(loc)}</option>`).join('');
-  $('mrpReceiveError').textContent='';
-  $('mrpReceiveDialog').showModal();
-}
-
-function submitMrpReceive(e){
-  e.preventDefault();
-  if(!mrpReceiveCtx) return;
-  const {order,line}=mrpReceiveCtx;
-  const err=$('mrpReceiveError'); err.textContent='';
-  const palletId=$('mrpReceivePalletId').value.trim().toUpperCase();
-  const qty=Number($('mrpReceiveQty').value)||0;
-  const batch=$('mrpReceiveBatch').value.trim();
-  const loc=$('mrpReceiveLocation').value;
-  if(!palletId){ err.textContent='Pallet ID is required.'; return; }
-  if(state.pallets.some(p=>p.palletId===palletId)){ err.textContent='That pallet ID already exists.'; return; }
-  if(qty<=0){ err.textContent='Enter a quantity greater than zero.'; return; }
-  if(!batch){ err.textContent='A lot / batch number is required — it is what ties this stock to the delivery.'; return; }
-  const booked=mrpPoLineReceived(state.pallets,line.lineId);
-  if(booked.qty+qty>Number(line.outstanding||0)+0.0001){
-    err.textContent=`That is more than the order still owes. Outstanding ${formatNum(line.outstanding)}, already booked ${formatNum(booked.qty)}.`;
-    return;
+  if(!order) return toast('That order is no longer open.');
+  if(!requirePermission('createReceiving','queueing an order for receiving')) return;
+  if(!Array.isArray(state.importedOrderQueue)) state.importedOrderQueue=[];
+  if(mrpOrderQueued(state.importedOrderQueue,poId)){
+    return toast(order.reference+' is already in the receiving queue.');
   }
-  const pallet=buildPalletFromPoLine(line,order,{
-    palletId,qty,batch,mfg:$('mrpReceiveMfg').value,
-    locationType:loc?'rack':'floor',location:loc,now:now()
-  });
-  if(loc){
-    const check=canMoveToLocation(palletId,loc,pallet);
-    if(!check.ok){ err.textContent=check.msg; return; }
-  }
-  state.pallets.push(pallet);
-  bump(pallet.mfg,palletId);
-  hist(palletId,'Created','Received against '+order.reference+' at '+locationText(pallet));
-  addReceiptLog(pallet);
+  const entry={
+    id:'IMPQ-'+Date.now(),
+    fileName:'MRP '+order.reference+(order.supplier?' — '+order.supplier:''),
+    uploadedAt:now(),
+    uploadedBy:currentUser()?.name||'',
+    status:'queued',
+    parsed:mrpOrderToParsed(order),
+    estimatedReceiveDate:order.expectedDate||'',
+    usedInReceivingOrderId:'',
+    // Where this came from, so it is not queued twice and so the pallets it
+    // becomes can be reported back to the MRP.
+    mrpPoId:order.poId,
+    mrpOrderRef:order.reference
+  };
+  state.importedOrderQueue.push(entry);
   save();
-  $('mrpReceiveDialog').close();
-  render();
+  if(typeof renderImportQueueList==='function') renderImportQueueList();
+  if(typeof populateReceivingImportDropdown==='function') populateReceivingImportDropdown();
   renderMrpCatalog();
-  toast(`Booked in ${formatNum(qty)} against ${order.reference} on ${palletId}.`);
-}
-
-function submitMrpPlacement(e){
-  e.preventDefault();
-  const lot=((mrpCatalog&&mrpCatalog.lots)||[]).find(l=>l.lotId===mrpPlaceLotId);
-  if(!lot) return;
-  const err=$('mrpPlaceError'); err.textContent='';
-  const palletId=$('mrpPlacePalletId').value.trim().toUpperCase();
-  const qty=Number($('mrpPlaceQty').value)||0;
-  const loc=$('mrpPlaceLocation').value;
-  if(!palletId) { err.textContent='Pallet ID is required.'; return; }
-  if(state.pallets.some(p=>p.palletId===palletId)) { err.textContent='That pallet ID already exists.'; return; }
-  if(qty<=0) { err.textContent='Enter a quantity greater than zero.'; return; }
-  const pallet=buildPalletFromMrpLot(lot,{
-    palletId,qty,mfg:$('mrpPlaceMfg').value,
-    locationType:loc?'rack':'floor',location:loc,now:now()
-  });
-  if(loc){
-    const check=canMoveToLocation(palletId,loc,pallet);
-    if(!check.ok){ err.textContent=check.msg; return; }
-  }
-  state.pallets.push(pallet);
-  bump(pallet.mfg,palletId);
-  hist(palletId,'Created','Placed from MRP lot '+lot.lotNumber+' at '+locationText(pallet));
-  addReceiptLog(pallet);
-  save();
-  $('mrpPlaceDialog').close();
-  render();
-  renderMrpCatalog();
-  toast(`Placed ${formatNum(qty)} from lot ${lot.lotNumber} on ${palletId}.`);
+  toast(order.reference+' queued. Receive it from the Receive Order screen.');
 }
 
 init();
