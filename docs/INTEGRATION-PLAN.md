@@ -61,13 +61,15 @@ through the phase notes below and easy to lose.
 
 ### Next planned work
 
-- **Phase 5 — material flow (specced, not built).** See
+- **Phase 5 — material flow (step 1 of 5 built).** See
   `docs/PHASE5-MATERIAL-FLOW.md`. Gives WIP an owner: a 6-position To/From
   Process zone, Material Request / Material Return documents, an In Process
   custody flag, and an MRP-side material balance that reuses the existing waste
   streams. Three open decisions are listed at the end of that spec — FEFO vs
   named lot, what happens when all six positions are full, and whether produced
-  goods must pass through To/From.
+  goods must pass through To/From — **all three now resolved** in that spec.
+  Step 1 (schema + transactions + 68 assertions) is done; the warehouse zone,
+  API and both UIs remain.
 
 ### Functional gaps (known, not blocking)
 

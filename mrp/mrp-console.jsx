@@ -454,7 +454,12 @@ const LOTS_TABLE = {
     // of that item's packagings by id (a local id, not a cross-entity ref).
     packagingId: "str", expirationDate: "date",
     productionDate: "date", arrivalDate: "date",
-    origin: "str", mfg: "str", orderRef: "str", containerCount: "num"
+    origin: "str", mfg: "str", orderRef: "str", containerCount: "num",
+    // Custody (Phase 5): true while this stock is held by Operations rather
+    // than the warehouse. Set by the material-flow transactions, never by
+    // hand; cleared either by a Material Return or, exceptionally, with a
+    // recorded reason.
+    inProcess: "bool", inProcessSince: "date", inProcessClearedReason: "str"
   },
   embeds: LOT_EMBEDS,
   children: LOT_CHILDREN
@@ -766,6 +771,94 @@ const SCHEMA = {
     },
     embeds: {},
     children: {}
+  },
+
+  /* Material issued from the warehouse to Operations.
+
+     The warehouse holds and issues; Operations consumes. A request asks for
+     an item and a quantity, never a lot - the warehouse selects, FEFO is
+     suggested, and the picker confirms or substitutes. A substitution is
+     recorded with its reason, because a picker overriding FEFO is a signal
+     (blocked, damaged, quarantined) rather than noise.
+
+     Status lives on the line, not the header: an order routinely gets one
+     line staged while another is still waiting for a position. */
+  materialRequests: {
+    table: "material_requests",
+    label: "Material request",
+    pk: "id",
+    naturalKey: "reference",
+    columns: {
+      id: "str", reference: "str!", requestedBy: "str", requestedFor: "str",
+      requestedDate: "date!", neededDate: "date",
+      status: "enum:Draft|Requested|Part staged|Staged|Received|Cancelled!",
+      notes: "str"
+    },
+    embeds: {},
+    children: {
+      lines: {
+        table: "material_request_lines", fk: "materialRequestId", pk: "id",
+        columns: {
+          id: "str", itemType: "enum:raw|intermediate|finished|waste!",
+          itemId: "str!", qty: "num!",
+          // Filled by the warehouse when it picks, not by the requester.
+          lotId: "str", packagingId: "str", containerCount: "num",
+          // Where it came from, so a leftover can go straight back. A hint,
+          // never a reservation - the position may be filled meanwhile.
+          originLocation: "str",
+          // Which To/From position it is staged in, freed once received.
+          position: "str",
+          substituted: "bool", substitutionReason: "str",
+          stagedAt: "date", receivedAt: "date",
+          lineStatus: "enum:Pending|Staged|Received|Cancelled!",
+          notes: "str"
+        },
+        polyRefs: { itemId: { typeColumn: "itemType", companion: "itemKey" } },
+        lotRefs: { lotId: { companion: "lotNumber" } }
+      }
+    }
+  },
+
+  /* Material handed back from Operations to the warehouse.
+
+     Two flavours, and the warehouse has to know which before it walks out to
+     the floor: a `leftover` goes back to stock that already exists, an
+     `output` is production that must be slotted for the first time.
+
+     Produced goods pass through here like everything else. That is an
+     organisational rule, not a technical one: it stops Manufacturing quietly
+     assuming the warehouse role. */
+  materialReturns: {
+    table: "material_returns",
+    label: "Material return",
+    pk: "id",
+    naturalKey: "reference",
+    columns: {
+      id: "str", reference: "str!",
+      returnType: "enum:leftover|output!",
+      returnedBy: "str", returnedDate: "date!",
+      status: "enum:Draft|Returned|Part accepted|Accepted|Cancelled!",
+      materialRequestId: "ref:materialRequests", notes: "str"
+    },
+    embeds: {},
+    children: {
+      lines: {
+        table: "material_return_lines", fk: "materialReturnId", pk: "id",
+        columns: {
+          id: "str", itemType: "enum:raw|intermediate|finished|waste!",
+          itemId: "str!", qty: "num!",
+          // On a leftover this is the lot coming back; on an output it is the
+          // lot the acceptance created.
+          lotId: "str", lotNumber: "str", packagingId: "str", containerCount: "num",
+          suggestedLocation: "str", position: "str",
+          acceptedAt: "date",
+          lineStatus: "enum:Pending|Staged|Accepted|Cancelled!",
+          notes: "str"
+        },
+        polyRefs: { itemId: { typeColumn: "itemType", companion: "itemKey" } },
+        lotRefs: { lotId: { companion: "returnedLotNumber" } }
+      }
+    }
   },
 
   salesOrders: {
@@ -1291,6 +1384,8 @@ const IMPORT_ORDER = [
   "equipment", "customers", "waste_streams", "processes",
   "composition", "packagings", "process_inputs", "process_equipment", "process_outputs",
   "maintenance", "production_targets", "purchase_orders", "purchase_order_lines", "warehouse_receipts",
+  "material_requests", "material_request_lines",
+  "material_returns", "material_return_lines",
   "sales_orders", "sales_order_lines", "fulfilment_cancellations",
   "production_schedule", "schedule_revisions",
   "lots", "lot_sources", "lot_actual_equipment", "lot_actual_labor", "lot_qc_checks",
@@ -2042,6 +2137,200 @@ const tx = {
     if (expectedDate) po.expectedDate = expectedDate;
     po.status = "Ordered";
     return { ok: true, po };
+  },
+
+  /* --- Material flow: warehouse <-> Operations ---------------------
+
+     A request asks for an item and a quantity. The warehouse selects the
+     lot when it picks, so nothing here names one up front. */
+  raiseMaterialRequest(db, { reference, requestedBy, requestedFor, requestedDate, neededDate, notes, lines, submit }) {
+    const clean = (lines || [])
+      .filter(l => l && l.itemType && l.itemId && (Number(l.qty) || 0) > 0)
+      .map(l => ({
+        id: l.id || uid(), itemType: l.itemType, itemId: l.itemId,
+        qty: Number(l.qty) || 0, lotId: "", packagingId: l.packagingId || "",
+        containerCount: Number(l.containerCount) || 0,
+        originLocation: "", position: "",
+        substituted: false, substitutionReason: "",
+        stagedAt: "", receivedAt: "", lineStatus: "Pending", notes: l.notes || ""
+      }));
+    if (!clean.length) return { ok: false, error: "A request needs at least one item and quantity." };
+
+    const ref = String(reference || "").trim() || nextMaterialRef(db, "materialRequests", "MR-");
+    if ((db.materialRequests || []).some(r => r.reference === ref)) {
+      return { ok: false, error: "Reference " + ref + " is already in use." };
+    }
+    const req = repo.create(db, "materialRequests", {
+      reference: ref, requestedBy: requestedBy || "", requestedFor: requestedFor || "",
+      requestedDate: requestedDate || todayStr(), neededDate: neededDate || "",
+      status: submit ? "Requested" : "Draft", notes: notes || "", lines: clean
+    });
+    return { ok: true, request: req };
+  },
+
+  /* The warehouse picks and stages a line into a To/From position.
+
+     A position must be free: six is the door's width, and a request with
+     nowhere to go waits rather than being refused - waitingForPosition is
+     what surfaces the queue. Substituting away from the FEFO suggestion
+     is allowed but must say why. */
+  stageRequestLine(db, { materialRequestId, lineId, lotId, qty, position, originLocation, substituted, substitutionReason }) {
+    const req = repo.find(db, "materialRequests", materialRequestId);
+    if (!req) return { ok: false, error: "That request no longer exists." };
+    if (req.status === "Cancelled") return { ok: false, error: "That request was cancelled." };
+    if (req.status === "Draft") return { ok: false, error: "That request has not been submitted yet." };
+    const line = (req.lines || []).find(l => l.id === lineId);
+    if (!line) return { ok: false, error: "That request line no longer exists." };
+    if (mrLineStatus(line) !== "Pending") return { ok: false, error: "That line has already been staged." };
+
+    const free = freeTransitPositions(db);
+    const pos = position || free[0];
+    if (!pos) return { ok: false, error: "No To/From position is free - the line waits until one clears." };
+    if (free.indexOf(pos) === -1) return { ok: false, error: pos + " is already occupied." };
+
+    const entity = ITEM_TYPE_ENTITY[line.itemType];
+    const item = entity ? repo.find(db, entity, line.itemId) : null;
+    const lot = item && (item.lots || []).find(l => l.id === lotId);
+    if (!lot) return { ok: false, error: "That lot no longer exists." };
+    if (lot.inProcess) return { ok: false, error: "That lot is already out with Operations." };
+
+    const amount = Number(qty) || Number(line.qty) || 0;
+    if (amount <= 0) return { ok: false, error: "Staged quantity must be greater than zero." };
+    if (amount > (Number(lot.qty) || 0) + 0.0001) {
+      return { ok: false, error: "That lot does not hold enough - " + fmtNum(lot.qty) + " available." };
+    }
+    if (substituted && !String(substitutionReason || "").trim()) {
+      return { ok: false, error: "Say why FEFO was not followed." };
+    }
+
+    line.lotId = lot.id;
+    line.qty = amount;
+    line.position = pos;
+    line.originLocation = originLocation || "";
+    line.substituted = !!substituted;
+    line.substitutionReason = substituted ? substitutionReason : "";
+    line.stagedAt = todayStr();
+    line.lineStatus = "Staged";
+    req.status = materialRequestStatus(req);
+    return { ok: true, request: req, line, lot, position: pos };
+  },
+
+  /* Operations takes custody. The In Process flag goes on the lot and the
+     position frees immediately - To/From is transit, not storage. */
+  receiveRequestLine(db, { materialRequestId, lineId, receivedAt }) {
+    const req = repo.find(db, "materialRequests", materialRequestId);
+    if (!req) return { ok: false, error: "That request no longer exists." };
+    const line = (req.lines || []).find(l => l.id === lineId);
+    if (!line) return { ok: false, error: "That request line no longer exists." };
+    if (mrLineStatus(line) !== "Staged") return { ok: false, error: "That line is not staged." };
+
+    const entity = ITEM_TYPE_ENTITY[line.itemType];
+    const item = entity ? repo.find(db, entity, line.itemId) : null;
+    const lot = item && (item.lots || []).find(l => l.id === line.lotId);
+    if (!lot) return { ok: false, error: "That lot no longer exists." };
+
+    lot.inProcess = true;
+    lot.inProcessSince = receivedAt || todayStr();
+    lot.inProcessClearedReason = "";
+    line.receivedAt = receivedAt || todayStr();
+    line.position = "";           // the door is clear again
+    line.lineStatus = "Received";
+    req.status = materialRequestStatus(req);
+    return { ok: true, request: req, line, lot };
+  },
+
+  /* Material handed back. Produced goods come this way too - that is the
+     rule that stops Manufacturing quietly becoming a second warehouse. */
+  raiseMaterialReturn(db, { reference, returnType, returnedBy, returnedDate, materialRequestId, notes, lines }) {
+    if (["leftover", "output"].indexOf(returnType) === -1) {
+      return { ok: false, error: "A return must say whether it is leftover material or production output." };
+    }
+    const clean = (lines || [])
+      .filter(l => l && l.itemType && l.itemId && (Number(l.qty) || 0) > 0)
+      .map(l => ({
+        id: l.id || uid(), itemType: l.itemType, itemId: l.itemId,
+        qty: Number(l.qty) || 0, lotId: l.lotId || "", lotNumber: l.lotNumber || "",
+        packagingId: l.packagingId || "", containerCount: Number(l.containerCount) || 0,
+        suggestedLocation: l.suggestedLocation || "", position: "",
+        acceptedAt: "", lineStatus: "Pending", notes: l.notes || ""
+      }));
+    if (!clean.length) return { ok: false, error: "A return needs at least one item and quantity." };
+
+    const ref = String(reference || "").trim() || nextMaterialRef(db, "materialReturns", "RET-");
+    if ((db.materialReturns || []).some(r => r.reference === ref)) {
+      return { ok: false, error: "Reference " + ref + " is already in use." };
+    }
+    const ret = repo.create(db, "materialReturns", {
+      reference: ref, returnType, returnedBy: returnedBy || "",
+      returnedDate: returnedDate || todayStr(),
+      materialRequestId: materialRequestId || "",
+      status: "Returned", notes: notes || "", lines: clean
+    });
+    return { ok: true, return: ret };
+  },
+
+  stageReturnLine(db, { materialReturnId, lineId, position }) {
+    const ret = repo.find(db, "materialReturns", materialReturnId);
+    if (!ret) return { ok: false, error: "That return no longer exists." };
+    if (ret.status === "Cancelled") return { ok: false, error: "That return was cancelled." };
+    const line = (ret.lines || []).find(l => l.id === lineId);
+    if (!line) return { ok: false, error: "That return line no longer exists." };
+    if (mrLineStatus(line) !== "Pending") return { ok: false, error: "That line has already been staged." };
+
+    const free = freeTransitPositions(db);
+    const pos = position || free[0];
+    if (!pos) return { ok: false, error: "No To/From position is free - the return waits until one clears." };
+    if (free.indexOf(pos) === -1) return { ok: false, error: pos + " is already occupied." };
+
+    line.position = pos;
+    line.lineStatus = "Staged";
+    ret.status = materialReturnStatus(ret);
+    return { ok: true, return: ret, line, position: pos };
+  },
+
+  /* The warehouse takes custody back. Both flavours clear In Process; what
+     differs is what the warehouse does with it physically - a leftover goes
+     back to stock it already knows, an output has to be slotted for the
+     first time, which is why the return says which it is. */
+  acceptReturnLine(db, { materialReturnId, lineId, acceptedAt }) {
+    const ret = repo.find(db, "materialReturns", materialReturnId);
+    if (!ret) return { ok: false, error: "That return no longer exists." };
+    const line = (ret.lines || []).find(l => l.id === lineId);
+    if (!line) return { ok: false, error: "That return line no longer exists." };
+    if (mrLineStatus(line) !== "Staged") return { ok: false, error: "That line is not staged." };
+
+    const entity = ITEM_TYPE_ENTITY[line.itemType];
+    const item = entity ? repo.find(db, entity, line.itemId) : null;
+    if (!item) return { ok: false, error: "That item no longer exists." };
+    const lot = (item.lots || []).find(l => l.id === line.lotId);
+    if (!lot) return { ok: false, error: "That lot no longer exists." };
+
+    lot.inProcess = false;
+    lot.inProcessSince = "";
+    line.acceptedAt = acceptedAt || todayStr();
+    line.position = "";
+    line.lotNumber = lot.lotNumber || "";
+    line.lineStatus = "Accepted";
+    ret.status = materialReturnStatus(ret);
+    return { ok: true, return: ret, line, lot };
+  },
+
+  /* Clearing custody without a return: material scrapped on the line, a
+     correction, a mis-key. Deliberately an exception - the reason is
+     recorded on the lot, the same way an amended frozen run records why. */
+  clearInProcess(db, { itemType, itemId, lotId, reason }) {
+    if (!String(reason || "").trim()) {
+      return { ok: false, error: "Clearing In Process without a return needs a reason." };
+    }
+    const entity = ITEM_TYPE_ENTITY[itemType];
+    const item = entity ? repo.find(db, entity, itemId) : null;
+    const lot = item && (item.lots || []).find(l => l.id === lotId);
+    if (!lot) return { ok: false, error: "That lot no longer exists." };
+    if (!lot.inProcess) return { ok: false, error: "That lot is not out with Operations." };
+    lot.inProcess = false;
+    lot.inProcessSince = "";
+    lot.inProcessClearedReason = String(reason).trim();
+    return { ok: true, lot };
   },
 
   /* Apply deliveries booked at the dock to the MRP.
@@ -3828,7 +4117,8 @@ function seedData() {
     schedule: schedule.map(normalizeScheduleEntry),
     equipment, maintenance, customers, components, wasteStreams, shipments,
     operatingCalendars, productionTargets, purchaseOrders, salesOrders,
-    fulfilmentCancellations, warehouseReceipts: []
+    fulfilmentCancellations, warehouseReceipts: [],
+    materialRequests: [], materialReturns: []
   });
 }
 
@@ -4101,6 +4391,8 @@ function normalizeData(raw) {
       shipments: normalizeShipments(raw.shipments),
       purchaseOrders: normalizePurchaseOrders(raw.purchaseOrders),
       warehouseReceipts: Array.isArray(raw.warehouseReceipts) ? raw.warehouseReceipts : [],
+      materialRequests: Array.isArray(raw.materialRequests) ? raw.materialRequests : [],
+      materialReturns: Array.isArray(raw.materialReturns) ? raw.materialReturns : [],
       salesOrders: normalizeSalesOrders(raw.salesOrders),
       fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [],
       operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars),
@@ -4173,7 +4465,7 @@ function normalizeData(raw) {
   const shipments = normalizeShipments(raw.shipments);
 
   const migrated = migrateCompositionToComponents(rawMaterials, intermediateProducts, finishedGoods, raw.components);
-  return backfillRowIds({ rawMaterials: migrated.rawMaterials, intermediateProducts: migrated.intermediateProducts, finishedGoods: migrated.finishedGoods, components: migrated.components, wasteStreams, processes, schedule, equipment, maintenance, customers, shipments, productionTargets, purchaseOrders: normalizePurchaseOrders(raw.purchaseOrders), warehouseReceipts: Array.isArray(raw.warehouseReceipts) ? raw.warehouseReceipts : [], salesOrders: normalizeSalesOrders(raw.salesOrders), fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [], operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars), seedVersion: raw.seedVersion || "" });
+  return backfillRowIds({ rawMaterials: migrated.rawMaterials, intermediateProducts: migrated.intermediateProducts, finishedGoods: migrated.finishedGoods, components: migrated.components, wasteStreams, processes, schedule, equipment, maintenance, customers, shipments, productionTargets, purchaseOrders: normalizePurchaseOrders(raw.purchaseOrders), warehouseReceipts: Array.isArray(raw.warehouseReceipts) ? raw.warehouseReceipts : [], materialRequests: Array.isArray(raw.materialRequests) ? raw.materialRequests : [], materialReturns: Array.isArray(raw.materialReturns) ? raw.materialReturns : [], salesOrders: normalizeSalesOrders(raw.salesOrders), fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [], operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars), seedVersion: raw.seedVersion || "" });
 }
 
 /* ---------------------------------------------------------------
@@ -5215,6 +5507,192 @@ function nextPoReference(data, prefix) {
     if (m) max = Math.max(max, Number(m[1]) || 0);
   });
   return p + String(max + 1).padStart(4, "0");
+}
+
+/* ---------------------------------------------------------------
+   Material flow between the warehouse and Operations.
+
+   The custody rule: a lot is "in process" when it is held by
+   Operations rather than the warehouse. That is a statement about who
+   has it, not where it is - material in a mixing tank has no slot.
+
+   Six To/From positions are the single door between the two. A
+   position is occupied only during handover and freed the moment the
+   material is received or put away, so six throttles handover time
+   rather than how many jobs can run.
+----------------------------------------------------------------*/
+
+const TRANSIT_POSITIONS = ["TP1", "TP2", "TP3", "TP4", "TP5", "TP6"];
+
+/* References are the natural key on both documents, so they are minted
+   from the highest existing number and never reused. */
+function nextMaterialRef(data, collection, prefix) {
+  let max = 0;
+  ((data && data[collection]) || []).forEach(r => {
+    const m = String(r.reference || "").match(/(\d+)\s*$/);
+    if (m) max = Math.max(max, Number(m[1]) || 0);
+  });
+  return prefix + String(max + 1).padStart(4, "0");
+}
+
+/* Lines currently sitting in a To/From position, from both directions.
+   Requests staged and not yet received, and returns staged and not yet
+   accepted, both hold a position. */
+function occupiedTransitPositions(data) {
+  const held = {};
+  ((data && data.materialRequests) || []).forEach(r => {
+    (r.lines || []).forEach(l => {
+      if (l.lineStatus === "Staged" && l.position) held[l.position] = { kind: "request", ref: r.reference, line: l };
+    });
+  });
+  ((data && data.materialReturns) || []).forEach(r => {
+    (r.lines || []).forEach(l => {
+      if (l.lineStatus === "Staged" && l.position) held[l.position] = { kind: "return", ref: r.reference, line: l };
+    });
+  });
+  return held;
+}
+
+function freeTransitPositions(data) {
+  const held = occupiedTransitPositions(data);
+  return TRANSIT_POSITIONS.filter(p => !held[p]);
+}
+
+/* FEFO: first to expire, first out. Undated lots sort last rather than
+   first - an unknown expiry is not an urgent one, and shipping it ahead
+   of stock with a known short life would be exactly wrong. Only lots
+   with stock, and only lots the warehouse still holds. */
+function fefoLots(data, itemType, itemId) {
+  const entity = ITEM_TYPE_ENTITY[itemType];
+  const item = entity ? repo.find(data, entity, itemId) : null;
+  // A lot already picked for another request is spoken for, even though it
+  // has not left the building yet - offering it again would double-commit it.
+  const committed = {};
+  ((data && data.materialRequests) || []).forEach(r => {
+    (r.lines || []).forEach(l => { if (l.lotId && l.lineStatus === "Staged") committed[l.lotId] = true; });
+  });
+  return ((item && item.lots) || [])
+    .filter(l => (Number(l.qty) || 0) > 0 && !l.inProcess && !committed[l.id])
+    .slice()
+    .sort((a, b) => {
+      const ax = a.expirationDate || "", bx = b.expirationDate || "";
+      if (ax && bx) return ax.localeCompare(bx);
+      if (ax) return -1;
+      if (bx) return 1;
+      return String(a.lotNumber || "").localeCompare(String(b.lotNumber || ""));
+    });
+}
+
+/* What the picker is offered by default. Null when nothing is available,
+   which the caller should report rather than silently pick nothing. */
+function suggestFefoLot(data, itemType, itemId) {
+  return fefoLots(data, itemType, itemId)[0] || null;
+}
+
+function mrLineStatus(line) {
+  return (line && line.lineStatus) || "Pending";
+}
+
+/* Header status derived from the lines, so it cannot drift out of step
+   with them - the same rule purchase orders follow. Draft and Cancelled
+   are decisions and stay put. */
+function materialRequestStatus(req) {
+  if (!req) return "Draft";
+  if (req.status === "Draft" || req.status === "Cancelled") return req.status;
+  const lines = (req.lines || []).filter(l => mrLineStatus(l) !== "Cancelled");
+  if (!lines.length) return "Requested";
+  if (lines.every(l => mrLineStatus(l) === "Received")) return "Received";
+  if (lines.every(l => mrLineStatus(l) === "Staged" || mrLineStatus(l) === "Received")) return "Staged";
+  if (lines.some(l => mrLineStatus(l) === "Staged" || mrLineStatus(l) === "Received")) return "Part staged";
+  return "Requested";
+}
+
+function materialReturnStatus(ret) {
+  if (!ret) return "Draft";
+  if (ret.status === "Draft" || ret.status === "Cancelled") return ret.status;
+  const lines = (ret.lines || []).filter(l => mrLineStatus(l) !== "Cancelled");
+  if (!lines.length) return "Returned";
+  if (lines.every(l => mrLineStatus(l) === "Accepted")) return "Accepted";
+  if (lines.some(l => mrLineStatus(l) === "Accepted")) return "Part accepted";
+  return "Returned";
+}
+
+/* Lines asked for that the warehouse has not been able to stage. Shown as
+   waiting rather than refused at raise time: the need is real even when
+   the door is full, and Operations should be able to see the queue. */
+function waitingForPosition(data) {
+  const free = freeTransitPositions(data).length;
+  const rows = [];
+  ((data && data.materialRequests) || []).forEach(req => {
+    if (req.status === "Draft" || req.status === "Cancelled") return;
+    (req.lines || []).forEach(line => {
+      if (mrLineStatus(line) !== "Pending") return;
+      rows.push({ request: req, line, blocked: free === 0 });
+    });
+  });
+  return rows;
+}
+
+/* Every lot Operations is holding. This is the In Process window: what
+   the warehouse manager can see but does not control, so they can keep a
+   material balance and plan for what is coming back off the line. */
+function inProcessLots(data) {
+  const out = [];
+  ENTITIES.forEach(entity => {
+    const itemType = ENTITY_ITEM_TYPE[entity];
+    if (!itemType) return;
+    (data[entity] || []).forEach(item => {
+      (item.lots || []).forEach(lot => {
+        if (!lot.inProcess) return;
+        out.push({
+          entity, itemType, itemId: item.id, itemName: item.name, itemSku: item.sku,
+          unit: item.unit || "", lot,
+          since: lot.inProcessSince || "",
+          qty: Number(lot.qty) || 0
+        });
+      });
+    });
+  });
+  return out.sort((a, b) => String(a.since).localeCompare(String(b.since)));
+}
+
+/* Material balance, per lot, in the MRP where it belongs.
+
+   issued - (consumed + returned + waste) should be zero. Consumption is
+   already recorded per source lot by logProductionBatch, and waste
+   already routes into waste streams, so only issued and returned are new
+   here. A non-zero discrepancy is a signal to investigate, not something
+   to reconcile away - the same rule over-placement follows. */
+function materialBalance(data, itemType, itemId, lotId) {
+  let issued = 0, returned = 0;
+  ((data && data.materialRequests) || []).forEach(r => {
+    (r.lines || []).forEach(l => {
+      if (l.lotId === lotId && mrLineStatus(l) === "Received") issued += Number(l.qty) || 0;
+    });
+  });
+  ((data && data.materialReturns) || []).forEach(r => {
+    (r.lines || []).forEach(l => {
+      if (l.lotId === lotId && mrLineStatus(l) === "Accepted") returned += Number(l.qty) || 0;
+    });
+  });
+
+  // What production actually drew from this lot, and the waste it raised.
+  let consumed = 0;
+  ENTITIES.forEach(entity => {
+    (data[entity] || []).forEach(item => {
+      (item.lots || []).forEach(lot => {
+        (lot.sources || []).forEach(src => {
+          if (src.lotId === lotId) consumed += Number(src.qty) || 0;
+        });
+      });
+    });
+  });
+  const waste = ((data && data.wasteStreams) || []).reduce((s, ws) =>
+    s + (ws.lots || []).reduce((n, l) =>
+      n + ((l.sources || []).some(src => src.lotId === lotId) ? (Number(l.producedQty) || Number(l.qty) || 0) : 0), 0), 0);
+
+  const discrepancy = issued - (consumed + returned + waste);
+  return { issued, consumed, returned, waste, discrepancy, balanced: Math.abs(discrepancy) < 0.001 };
 }
 
 /* One row per order, with everything derived resolved, newest first. */

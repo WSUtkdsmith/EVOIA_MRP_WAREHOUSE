@@ -184,9 +184,17 @@ inProcessClearedReason: "str"     // set only via the exception path
 
 ## Build order
 
-1. **Schema delta + transactions** — `raiseMaterialRequest`, `stageRequestLine`,
-   `receiveRequestLine`, `raiseMaterialReturn`, `applyMaterialReturn`, plus the
-   In Process flag and its exception path. Tests first, as with Phase 4.
+1. ~~**Schema delta + transactions**~~ — **done.** `materialRequests` and
+   `materialReturns` entities with line-level status, the `inProcess` /
+   `inProcessSince` / `inProcessClearedReason` lot columns, and the seven
+   transactions (`raiseMaterialRequest`, `stageRequestLine`, `receiveRequestLine`,
+   `raiseMaterialReturn`, `stageReturnLine`, `acceptReturnLine`,
+   `clearInProcess`) plus FEFO, the position ledger, the waiting queue, the
+   In Process window and the balance. `mrp/test/material-flow.test.mjs` — 68
+   assertions. Both return flavours clear custody through the same transaction;
+   `returnType` drives what the *warehouse* does physically, which is why it
+   lives on the document rather than branching the MRP write.
+
 2. **Warehouse zone** — `TP1`–`TP6` on the map, In Process region, storage rules.
 3. **API** — `/api/material-flow?bu=` exposing open requests and returns, the
    same read-only shape as `/api/pending-receipts`; application stays in the MRP.
@@ -194,15 +202,23 @@ inProcessClearedReason: "str"     // set only via the exception path
    original-position hint on leftovers.
 5. **MRP UI** — raise requests, the In Process window, and the balance report.
 
-## Open decisions
+## Decisions — resolved
 
-1. **Does a Material Request name a specific lot, or a quantity the warehouse
-   picks FEFO?** Naming a lot gives Operations control; FEFO gives the warehouse
-   control and better rotation. Recommend **FEFO by default with an optional
-   named lot**, since expiry data now exists to make FEFO real.
-2. **What happens when all six positions are occupied?** A request presumably
-   queues in `Requested` and the warehouse sees a "waiting for a position"
-   state. Confirm that is wanted rather than blocking the raise.
-3. **Do intermediates always pass through To/From**, or can a produced lot be
-   returned straight to a rack? The six-position door says everything passes
-   through; that is a discipline choice, not a technical one.
+1. **The warehouse selects the lot.** A request asks for an item and a quantity,
+   not a lot. When picking, the system **suggests FEFO** (earliest expiry first,
+   undated last) and the **operator confirms or substitutes**. A substitution is
+   recorded with its reason — a picker overriding FEFO is a signal worth keeping
+   (blocked, damaged, quarantined, wrong side of the rack), not noise to discard.
+2. **A request with no free position queues.** It stays `Requested` and is shown
+   as **waiting for a position** rather than being refused at raise time — the
+   need is real even when the door is full, and Operations should see the queue.
+3. **Produced goods pass through To/From like everything else.** No straight-to-
+   rack path for production output. The reason is organisational, not technical:
+   **it stops Manufacturing quietly assuming the warehouse role.** Everything
+   entering warehouse custody enters the same way and is signed for.
+
+   Consequence to watch: To/From is now the single door for issues, leftover
+   returns *and* all production output. Because a position frees on receipt or
+   putaway rather than being held for the life of a job, six positions throttle
+   handover time, not throughput — but if the floor ever backs up, position count
+   is the dial to turn, not the rule to weaken.
