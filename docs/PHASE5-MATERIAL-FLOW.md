@@ -242,7 +242,52 @@ inProcessClearedReason: "str"     // set only via the exception path
    already on the rack gets **staged and accepted in the same pass**. The material
    is demonstrably back; refusing to record it because a bookkeeping step was
    missed would leave the MRP arguing with the floor.
-5. **MRP UI** — raise requests, the In Process window, and the balance report.
+5. ~~**MRP UI**~~ — **done.** A **Material flow** tab (Materials group for admin,
+   and on the operator nav too — operators are the ones who ask for material and
+   sign for it) with four views: **requests** with a Take custody action per
+   staged line, **returns**, **in process** with Return and the Clear exception,
+   and the **material balance**. A blocked-door banner states how many lines are
+   waiting for a position rather than leaving it to be inferred.
+
+   The balance lists only lots that were actually issued — a lot that never left
+   the warehouse has nothing to balance — worst discrepancy first, because the
+   point of the report is the exceptions.
+
+## The consumption gate — closing the last bypass
+
+Found while building step 5, and the reason it grew: **the batch log could reach
+every lot in the MRP.** Production could draw straight off the rack — no pick, no
+document, no position, and a warehouse stock figure wrong the moment it happened.
+That is the same bypass the Place button opened on the receiving side, and it is
+closed the same way: *the material has to come through the door.*
+
+A lot is now one of two things to the batch log:
+
+| | |
+|---|---|
+| **In process — available** | issued against a Material Request, or produced in Operations' custody. Consumable now. |
+| **Inventory in storage — request material** | sitting in the warehouse. Listed but **not selectable**, and needs a Material Request first. |
+
+Storage lots are **shown, not hidden**. Hiding them would read as "we have none",
+which is false and sends the operator looking in the wrong place; naming them
+says what to do next. And the answer to "you may not consume this" is a document,
+not a dead end: a **Request this material** button raises the Material Request
+for exactly the blocked lines, deduplicated per item — two source rows drawing
+the same material ask for it once.
+
+Three consequences worth stating:
+
+1. **Produced goods now start In Process.** `logProductionBatch` stamps
+   `inProcess` / `inProcessSince` on every output lot. Without it the warehouse
+   would show stock it had never received, and the Material Return that hands it
+   over would have nothing to clear. It also means a downstream process can draw
+   on what the line just made **without a request** — which is correct: it never
+   left Operations' custody.
+2. **Nothing is preselected unless it is consumable.** The modal opens with the
+   first *available* lot, not the first lot of any kind, so it cannot open
+   already in breach.
+3. **Enforcement is in the UI, not yet in the transaction.** See the flag below —
+   this is deliberate and needs a decision before go-live.
 
 ## Decisions — resolved
 

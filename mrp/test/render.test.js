@@ -884,6 +884,158 @@ console.log('\n--- expected COGS and disposition ---');
      (cm.html || '').replace(/<!-- -->/g, '').includes('Disposition'));
 }
 
+console.log('\n--- material flow: the MRP half of the handshake ---');
+{
+  const D5 = A.seedData();
+  D5.materialRequests = []; D5.materialReturns = [];
+  const raw = D5.rawMaterials[0];
+
+  const empty = tryRender('mf', React.createElement(A.MaterialFlowTab, { data: D5, update: noop }));
+  ok('the tab renders with nothing raised yet', !empty.err, empty.err);
+  const eh = (empty.html || '').replace(/<!-- -->/g, '');
+  ok('and offers the four views',
+     eh.includes('Requests') && eh.includes('Returns') && eh.includes('In process') && eh.includes('Material balance'));
+  ok('an empty request list says what the button is for', eh.includes('No material requests yet'));
+
+  // Raise one, stage it, take custody - the same path the warehouse drives.
+  const req = A.tx.raiseMaterialRequest(D5, { requestedFor: 'Run 42', submit: true,
+    lines: [{ itemType: 'raw', itemId: raw.id, qty: 100 }] }).request;
+  const staged = tryRender('mf2', React.createElement(A.MaterialFlowTab, { data: D5, update: noop }));
+  const sh = (staged.html || '').replace(/<!-- -->/g, '');
+  ok('a raised request is listed by reference', sh.includes(req.reference));
+  ok('with what it is for', sh.includes('Run 42'));
+
+  // Pick the way the warehouse would: FEFO over lots that actually hold stock.
+  // Half the seed lots are empty, and staging an empty one is correctly refused.
+  const pick = A.suggestFefoLot(D5, 'raw', raw.id);
+  ok('the seed offers a lot with stock to pick', !!pick);
+  A.tx.stageRequestLine(D5, { materialRequestId: req.id, lineId: req.lines[0].id,
+    lotId: pick.id, qty: 100, position: 'TP1' });
+  const inDoor = (tryRender('mf3', React.createElement(A.MaterialFlowTab, { data: D5, update: noop })).html || '')
+    .replace(/<!-- -->/g, '');
+  ok('a staged line shows the position it is sitting in', inDoor.includes('TP1'));
+  ok('and offers to take custody of it', inDoor.includes('Take custody'));
+
+  A.tx.receiveRequestLine(D5, { materialRequestId: req.id, lineId: req.lines[0].id });
+  const held = tryRender('mf4', React.createElement(A.MaterialFlowTab, { data: D5, update: noop }));
+  ok('the tab still renders once material is out', !held.err, held.err);
+}
+
+console.log('\n--- in process is a custody statement, with an exception ---');
+{
+  const D5 = A.seedData();
+  D5.materialRequests = []; D5.materialReturns = [];
+  const raw = D5.rawMaterials[0];
+  const holding = raw.lots.find(l => (Number(l.qty) || 0) > 0);
+  holding.inProcess = true;
+  holding.inProcessSince = '2026-08-01';
+
+  const rows = A.inProcessLots(D5);
+  const list = tryRender('ip', React.createElement(A.InProcessList, {
+    data: D5, rows, onReturn: noop, onClear: noop }));
+  ok('the in-process list renders', !list.err, list.err);
+  const lh = (list.html || '').replace(/<!-- -->/g, '');
+  ok('it states the custody definition, not a location',
+     lh.includes('not under the warehouse manager') || lh.includes("warehouse manager's supervision"));
+  ok('and says this is the only stock a batch may draw on',
+     lh.includes('only stock a batch may be logged against'));
+  ok('every row offers a return', lh.includes('Return'));
+  ok('and the exception path', lh.includes('Clear'));
+
+  const clear = tryRender('clr', React.createElement(A.ClearInProcessModal, {
+    data: D5, row: rows[0], update: noop, onClose: noop }));
+  ok('the exception dialog renders', !clear.err, clear.err);
+  const ch = (clear.html || '').replace(/<!-- -->/g, '');
+  ok('it says custody ends without the warehouse seeing it back',
+     ch.includes('without a material return'));
+  ok('and demands a reason', ch.includes('Reason (required)'));
+
+  const ret = tryRender('ret', React.createElement(A.MaterialReturnModal, {
+    data: D5, row: rows[0], update: noop, onClose: noop }));
+  ok('the return dialog renders', !ret.err, ret.err);
+  const rh = (ret.html || '').replace(/<!-- -->/g, '');
+  ok('it distinguishes the two flavours, which is what the warehouse acts on',
+     rh.includes('Leftover') && rh.includes('Production output'));
+  ok('a leftover can say where it came from', rh.includes('Came from'));
+
+  const raise = tryRender('mrq', React.createElement(A.MaterialRequestModal, {
+    data: D5, update: noop, onClose: noop }));
+  ok('the request dialog renders', !raise.err, raise.err);
+  const qh = (raise.html || '').replace(/<!-- -->/g, '');
+  ok('it asks for item and quantity, not a lot — the warehouse picks under FEFO',
+     qh.includes('earliest expiry first') && !qh.includes('Lot number'));
+}
+
+console.log('\n--- the batch log cannot reach warehouse stock ---');
+{
+  // The bypass this closes: production drawing straight off the rack, with no
+  // pick, no document and a warehouse stock figure wrong the moment it happened.
+  const D5 = A.seedData();
+  D5.materialRequests = []; D5.materialReturns = [];
+  const proc = (D5.processes || []).find(p => (p.inputs || []).length > 0);
+  ok('the seed has a process with inputs to test against', !!proc);
+
+  const locked = tryRender('bl', React.createElement(A.BatchLogModal, {
+    data: D5, kind: null, processId: proc.id, onClose: noop, update: noop }));
+  ok('the batch log renders', !locked.err, locked.err);
+  const bh = (locked.html || '').replace(/<!-- -->/g, '');
+  ok('with nothing issued, storage stock is named under its own heading',
+     bh.includes('Inventory in storage'));
+  ok('and the operator is told to request it',
+     bh.includes('request material') || bh.includes('Request this material'));
+  ok('the rule is stated where the picking happens',
+     bh.includes('Only material the line is holding can be consumed'));
+  ok('no lot is preselected, so the modal does not open already in breach',
+     !bh.includes('In process — available'));
+
+  // Issue one input through the door; it becomes selectable and the heading
+  // flips to the available group.
+  const input = proc.inputs[0];
+  const entity = input.itemType === 'raw' ? 'rawMaterials'
+    : input.itemType === 'intermediate' ? 'intermediateProducts'
+    : input.itemType === 'finished' ? 'finishedGoods' : 'wasteStreams';
+  const item = (D5[entity] || []).find(i => i.id === input.itemId);
+  const stocked = ((item && item.lots) || []).find(l => (Number(l.qty) || 0) > 0);
+  ok('the input resolves to a catalog item with stock', !!stocked);
+  stocked.inProcess = true;
+  stocked.inProcessSince = '2026-08-01';
+
+  const openBh = (tryRender('bl2', React.createElement(A.BatchLogModal, {
+    data: D5, kind: null, processId: proc.id, onClose: noop, update: noop })).html || '')
+    .replace(/<!-- -->/g, '');
+  ok('issued material is offered under the available heading',
+     openBh.includes('In process — available'));
+}
+
+console.log('\n--- material balance: shown, never reconciled ---');
+{
+  const D5 = A.seedData();
+  D5.materialRequests = []; D5.materialReturns = [];
+  const raw = D5.rawMaterials[0];
+
+  const none = tryRender('bal', React.createElement(A.MaterialBalanceReport, { data: D5 }));
+  ok('the report renders with nothing issued', !none.err, none.err);
+  ok('and says why it is empty rather than showing a blank table',
+     (none.html || '').includes('nothing to balance'));
+
+  const req = A.tx.raiseMaterialRequest(D5, { requestedFor: 'Run 42', submit: true,
+    lines: [{ itemType: 'raw', itemId: raw.id, qty: 100 }] }).request;
+  const pick = A.suggestFefoLot(D5, 'raw', raw.id);
+  A.tx.stageRequestLine(D5, { materialRequestId: req.id, lineId: req.lines[0].id,
+    lotId: pick.id, qty: 100, position: 'TP1' });
+  A.tx.receiveRequestLine(D5, { materialRequestId: req.id, lineId: req.lines[0].id });
+
+  const r = tryRender('bal2', React.createElement(A.MaterialBalanceReport, { data: D5 }));
+  ok('an issued lot appears', !r.err, r.err);
+  const h = (r.html || '').replace(/<!-- -->/g, '');
+  ok('with all four terms', h.includes('Issued') && h.includes('Consumed') &&
+     h.includes('Returned') && h.includes('Waste'));
+  ok('100 issued and nothing accounted for is a difference, not a rounding note',
+     h.includes('do not balance') || h.includes('does not balance'));
+  ok('and it is stated as something to find out about, not corrected',
+     h.includes('has not been accounted for'));
+}
+
 console.log('\n============================');
 console.log('  ' + pass + ' passed, ' + fail + ' failed');
 console.log('============================\n');

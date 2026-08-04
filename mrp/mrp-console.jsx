@@ -4,7 +4,7 @@ import {
   Plus, Trash2, Pencil, X, Search,
   AlertTriangle, ShoppingCart, LayoutDashboard, Wrench, Activity,
   Users, RefreshCw, DollarSign, Truck, Beaker, Recycle,
-  ChevronDown, ChevronRight, Download, Upload, ClipboardList
+  ChevronDown, ChevronRight, Download, Upload, ClipboardList, ArrowLeftRight
 } from "lucide-react";
 
 /* ---------------------------------------------------------------
@@ -1907,6 +1907,13 @@ const tx = {
         // producedQty is fixed at creation; qty gets drawn down later and
         // can no longer say what the run actually made.
         producedQty: entry.qty,
+        // Born in Operations' custody. Produced goods have no Material
+        // Request to issue them - they come into existence on the line -
+        // so In Process is their starting state and a Material Return is
+        // what clears it. Without this the warehouse would appear to own
+        // stock it has never seen, and could not tell what is coming off
+        // the line.
+        inProcess: true, inProcessSince: date,
         batchId, processId
       });
       created.push({
@@ -5719,6 +5726,79 @@ function inProcessLots(data) {
   return out.sort((a, b) => String(a.since).localeCompare(String(b.since)));
 }
 
+/* ------------------------------------------------------------------
+   Custody gate on consumption.
+
+   A process may only consume what Operations is actually holding. Until
+   now the batch log could reach any lot in the MRP, which quietly let
+   production draw material straight off the rack - no pick, no document,
+   no position, and a warehouse manager whose stock figure was wrong the
+   moment it happened. That is the same bypass the Place button opened on
+   the receiving side, and it gets closed the same way: the material has
+   to come through the door.
+
+   So a lot is either:
+     available - In Process, issued against a Material Request or produced
+                 in Operations' custody, and consumable now; or
+     inStorage - sitting in the warehouse, needing a Material Request
+                 before anyone can put it in a batch.
+
+   Empty lots are offered under neither heading: there is nothing to draw
+   and nothing to request. */
+function lotCustody(lot) {
+  return (lot && lot.inProcess) ? "inprocess" : "storage";
+}
+
+function sourceLotOptions(data, itemType, itemId) {
+  const item = getCatalogItem(data, itemType, itemId);
+  const available = [], inStorage = [];
+  ((item && item.lots) || []).forEach(lot => {
+    if ((Number(lot.qty) || 0) <= 0) return;
+    (lotCustody(lot) === "inprocess" ? available : inStorage).push(lot);
+  });
+  return { item, available, inStorage };
+}
+
+/* What a batch cannot draw, and why - one row per offending source line.
+
+   Used two ways: to disable Save so a batch cannot be logged against
+   warehouse stock, and to prefill the Material Request that unblocks it,
+   so the answer to "you may not consume this" is a document rather than a
+   dead end. */
+function batchCustodyIssues(data, sources) {
+  const issues = [];
+  (sources || []).forEach(s => {
+    const qty = Number(s.qty) || 0;
+    if (qty <= 0 || !s.lotId) return;
+    const sep = String(s.groupKey || "").indexOf(":");
+    if (sep < 0) return;
+    const itemType = s.groupKey.slice(0, sep), itemId = s.groupKey.slice(sep + 1);
+    const item = getCatalogItem(data, itemType, itemId);
+    const lot = item && (item.lots || []).find(l => l.id === s.lotId);
+    if (!lot || lot.inProcess) return;
+    issues.push({
+      sourceId: s.id || "", groupKey: s.groupKey, itemType, itemId, lotId: s.lotId,
+      itemName: item ? item.name : "(deleted item)", unit: item ? (item.unit || "") : "",
+      lotNumber: lot.lotNumber || "", qty, available: Number(lot.qty) || 0
+    });
+  });
+  return issues;
+}
+
+/* The Material Request that would clear those issues, one line per item -
+   two source lines drawing the same material ask for it once. Quantity is
+   what the batch wants, not what the lot happens to hold, because the
+   warehouse may well satisfy it from a different lot under FEFO. */
+function requestLinesForIssues(issues) {
+  const byItem = {};
+  (issues || []).forEach(i => {
+    const key = i.itemType + ":" + i.itemId;
+    if (!byItem[key]) byItem[key] = { itemType: i.itemType, itemId: i.itemId, itemName: i.itemName, unit: i.unit, qty: 0 };
+    byItem[key].qty += Number(i.qty) || 0;
+  });
+  return Object.keys(byItem).map(k => byItem[k]);
+}
+
 /* Material balance, per lot, in the MRP where it belongs.
 
    issued - (consumed + returned + waste) should be zero. Consumption is
@@ -8289,7 +8369,10 @@ const ADMIN_NAV_GROUPS = [
       { key: "materials", label: "Raw materials", icon: Package },
       { key: "intermediateProducts", label: "Intermediate products", icon: Layers },
       { key: "finished", label: "Finished goods", icon: Boxes },
-      { key: "wasteStreams", label: "Waste streams", icon: Recycle }
+      { key: "wasteStreams", label: "Waste streams", icon: Recycle },
+      // The handshake with the warehouse. Sits with Materials because it is
+      // about where material is, not about what the line did with it.
+      { key: "materialFlow", label: "Material flow", icon: ArrowLeftRight }
     ]
   },
   {
@@ -8310,6 +8393,9 @@ const ADMIN_NAV_GROUPS = [
 const OPERATOR_NAV = [
   { key: "schedule", label: "Production schedule", icon: Calendar },
   { key: "receiving", label: "Raw material receiving", icon: Package },
+  // Operators are the ones who ask for material and sign for it, so this is
+  // not an admin-only view.
+  { key: "materialFlow", label: "Material flow", icon: ArrowLeftRight },
   { key: "opprocesses", label: "Processes", icon: Factory },
   { key: "opintermediates", label: "Intermediate products", icon: Layers },
   { key: "opfinished", label: "Finished goods", icon: Boxes },
@@ -8739,6 +8825,9 @@ export default function App() {
             onEdit={(id) => setModal({ type: "equipment", id })}
             onDelete={removeEquipment} />
         )}
+        {/* Not gated on view: operators raise the requests and sign for the
+            material, so they need this as much as admin does. */}
+        {tab === "materialFlow" && <MaterialFlowTab data={data} update={update} />}
         {tab === "flow" && view === "admin" && (
           <ProcessFlowTab data={data}
             onOpenProcess={(id) => setModal({ type: "process", id })} />
@@ -13214,11 +13303,17 @@ function DockReceiptsPanel({ data, update }) {
               {result.skipped.length} already recorded, left alone.
             </div>
           )}
-          {result.failed.map((f, i) => (
-            <div key={i} style={{ color: "#A32D2D" }}>
-              {f.booking.orderRef || f.booking.sourceLineId}: {f.reason}
-            </div>
-          ))}
+          {/* A receipt failure carries the booking it came from, a material
+              action carries the action — both have to name themselves, or a
+              failed pick renders as a crash instead of a message. */}
+          {result.failed.map((f, i) => {
+            const src = f.booking || f.action || {};
+            return (
+              <div key={i} style={{ color: "#A32D2D" }}>
+                {src.orderRef || src.sourceLineId || src.palletId || src.lineId || "Item"}: {f.reason}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -15638,20 +15733,507 @@ function findLotsConsumingLot(data, itemType, itemId, lotId) {
   return results;
 }
 
+/* ------------------------------------------------------------------
+   Material flow - the MRP's half of the handshake with the warehouse.
+
+   Three views, because there are three questions Operations actually
+   asks: what have I asked for and where has it got to, what am I
+   holding, and does the arithmetic close. The warehouse has its own
+   window onto the same documents; this is the side that raises them and
+   signs for them.
+----------------------------------------------------------------*/
+function MaterialFlowTab({ data, update }) {
+  const [view, setView] = useState("requests");
+  const [raising, setRaising] = useState(false);
+  const [returning, setReturning] = useState(null);   // an inProcessLots row
+  const [clearing, setClearing] = useState(null);     // an inProcessLots row
+  const [err, setErr] = useState("");
+
+  const held = useMemo(() => inProcessLots(data), [data]);
+  const queue = useMemo(() => waitingForPosition(data), [data]);
+  const requests = ((data && data.materialRequests) || []).slice()
+    .sort((a, b) => String(b.requestedDate).localeCompare(String(a.requestedDate)));
+  const returns = ((data && data.materialReturns) || []).slice()
+    .sort((a, b) => String(b.returnedDate).localeCompare(String(a.returnedDate)));
+  const blocked = queue.filter(q => q.blocked).length;
+
+  const run = (fn) => {
+    let res = null;
+    update(d => { res = fn(d); return d; });
+    setErr(res && res.ok === false ? (res.error || "That did not work.") : "");
+  };
+
+  const tab = (key, label, count) => (
+    <button type="button" onClick={() => { setView(key); setErr(""); }} style={{
+      padding: "6px 12px", borderRadius: 999, cursor: "pointer", fontSize: 12.5,
+      border: "1px solid " + (view === key ? "#1F6F78" : "#D7DAD3"),
+      background: view === key ? "#1F6F78" : "#fff",
+      color: view === key ? "#fff" : "#5B6470", fontWeight: view === key ? 700 : 500
+    }}>{label}{count != null && count > 0 ? " · " + count : ""}</button>
+  );
+
+  return (
+    <div>
+      <PageHeader tabKey="materialFlow"
+        subtitle="Material requested from the warehouse, material the line is holding, and whether what went out matches what came back"
+        action={<Btn onClick={() => setRaising(true)}><Plus size={14} />New material request</Btn>} />
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+        {tab("requests", "Requests", requests.filter(r => r.status === "Requested" || r.status === "Staged").length)}
+        {tab("returns", "Returns", returns.filter(r => r.status !== "Accepted" && r.status !== "Cancelled").length)}
+        {tab("inprocess", "In process", held.length)}
+        {tab("balance", "Material balance")}
+      </div>
+
+      {blocked > 0 && (
+        <div style={{ background: "#F6E6C8", border: "1px solid #C99A3A", borderRadius: 8,
+                      padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: "#7A5205" }}>
+          <b>{blocked} line{blocked === 1 ? "" : "s"} waiting for a To/From position.</b> The door is full,
+          so the warehouse cannot stage {blocked === 1 ? "it" : "them"} yet — the need is real, it is queued rather than refused.
+        </div>
+      )}
+
+      {err && (
+        <div style={{ background: "#F3DBD6", border: "1px solid #D97066", borderRadius: 8,
+                      padding: "10px 12px", marginBottom: 14, fontSize: 12.5, color: "#8A2E20", fontWeight: 600 }}>{err}</div>
+      )}
+
+      {view === "requests" && (
+        <MaterialRequestList data={data} requests={requests} onReceive={(req, line) =>
+          run(d => tx.receiveRequestLine(d, { materialRequestId: req.id, lineId: line.id }))} />
+      )}
+
+      {view === "returns" && <MaterialReturnList data={data} returns={returns} />}
+
+      {view === "inprocess" && (
+        <InProcessList data={data} rows={held}
+          onReturn={row => { setErr(""); setReturning(row); }}
+          onClear={row => { setErr(""); setClearing(row); }} />
+      )}
+
+      {view === "balance" && <MaterialBalanceReport data={data} />}
+
+      {raising && <MaterialRequestModal data={data} update={update} onClose={() => setRaising(false)} />}
+      {returning && <MaterialReturnModal data={data} update={update} row={returning} onClose={() => setReturning(null)} />}
+      {clearing && <ClearInProcessModal data={data} update={update} row={clearing} onClose={() => setClearing(null)} />}
+    </div>
+  );
+}
+
+const MR_LINE_TONE = { Pending: "warn", Staged: "info", Received: "good", Accepted: "good", Cancelled: null };
+
+function MaterialRequestList({ data, requests, onReceive }) {
+  if (!requests.length) {
+    return <div style={{ fontSize: 13, color: "#8A9099" }}>
+      No material requests yet. Raise one to have the warehouse pick material into a To/From position.
+    </div>;
+  }
+  return (
+    <div>
+      {requests.map(req => (
+        <div key={req.id} style={{ background: "#fff", border: "1px solid #E7E9E4", borderRadius: 8, padding: 12, marginBottom: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 8 }}>
+            <div>
+              <span className="mono" style={{ fontSize: 13, fontWeight: 700 }}>{req.reference}</span>
+              <span style={{ fontSize: 12.5, color: "#8A9099", marginLeft: 8 }}>
+                {req.requestedFor || "—"} · raised {fmtDate(req.requestedDate)}
+                {req.neededDate ? " · needed " + fmtDate(req.neededDate) : ""}
+              </span>
+            </div>
+            <Badge tone={req.status === "Received" ? "good" : req.status === "Cancelled" ? null : "info"}>{req.status}</Badge>
+          </div>
+          {(req.lines || []).map(line => {
+            const item = getCatalogItem(data, line.itemType, line.itemId);
+            const status = mrLineStatus(line);
+            return (
+              <div key={line.id} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 110px",
+                                          gap: 8, alignItems: "center", fontSize: 12.5, padding: "4px 0",
+                                          borderTop: "1px solid #F1F2EE" }}>
+                <span>{item ? item.name : "(deleted item)"}</span>
+                <span className="mono">{fmtNum(line.qty)} {item ? item.unit : ""}</span>
+                <span style={{ color: "#8A9099" }}>{line.position ? "at " + line.position : status === "Pending" ? "waiting for a pick" : "—"}</span>
+                <span><Badge tone={MR_LINE_TONE[status]}>{status}</Badge></span>
+                <span>
+                  {status === "Staged" && (
+                    <Btn variant="secondary" onClick={() => onReceive(req, line)} style={{ padding: "4px 9px", fontSize: 11.5 }}>
+                      Take custody
+                    </Btn>
+                  )}
+                </span>
+              </div>
+            );
+          })}
+          {req.notes && <div style={{ fontSize: 11.5, color: "#8A9099", marginTop: 6 }}>{req.notes}</div>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function MaterialReturnList({ data, returns }) {
+  if (!returns.length) {
+    return <div style={{ fontSize: 13, color: "#8A9099" }}>
+      No material returns yet. Leftovers and anything the line produced go back to the warehouse this way.
+    </div>;
+  }
+  return (
+    <div>
+      {returns.map(ret => (
+        <div key={ret.id} style={{ background: "#fff", border: "1px solid #E7E9E4", borderRadius: 8, padding: 12, marginBottom: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 8 }}>
+            <div>
+              <span className="mono" style={{ fontSize: 13, fontWeight: 700 }}>{ret.reference}</span>
+              <span style={{ fontSize: 12.5, color: "#8A9099", marginLeft: 8 }}>
+                {ret.returnType === "output" ? "production output" : "leftover material"} · {fmtDate(ret.returnedDate)}
+                {ret.returnedBy ? " · " + ret.returnedBy : ""}
+              </span>
+            </div>
+            <Badge tone={ret.status === "Accepted" ? "good" : ret.status === "Cancelled" ? null : "info"}>{ret.status}</Badge>
+          </div>
+          {(ret.lines || []).map(line => {
+            const item = getCatalogItem(data, line.itemType, line.itemId);
+            const status = mrLineStatus(line);
+            return (
+              <div key={line.id} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr",
+                                          gap: 8, alignItems: "center", fontSize: 12.5, padding: "4px 0",
+                                          borderTop: "1px solid #F1F2EE" }}>
+                <span>{item ? item.name : "(deleted item)"} <span style={{ color: "#8A9099" }}>lot {line.lotNumber || "—"}</span></span>
+                <span className="mono">{fmtNum(line.qty)} {item ? item.unit : ""}</span>
+                <span style={{ color: "#8A9099" }}>
+                  {line.position ? "at " + line.position
+                    : status === "Pending" ? "waiting for a position"
+                    : line.suggestedLocation ? "went back to " + line.suggestedLocation : "—"}
+                </span>
+                <span><Badge tone={MR_LINE_TONE[status]}>{status}</Badge></span>
+              </div>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* What Operations is holding. Oldest out first: what has been away longest
+   is what to chase. */
+function InProcessList({ data, rows, onReturn, onClear }) {
+  if (!rows.length) {
+    return <div style={{ fontSize: 13, color: "#8A9099" }}>
+      Nothing is out with the line. Material becomes In Process when a request is taken into custody,
+      and anything the line produces starts here until it is returned.
+    </div>;
+  }
+  return (
+    <div>
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 10 }}>
+        Material received or produced but not under the warehouse manager's supervision — oldest out first.
+        This is the only stock a batch may be logged against.
+      </div>
+      {rows.map(row => (
+        <div key={row.lot.id} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 200px",
+                                       gap: 8, alignItems: "center", background: "#fff",
+                                       border: "1px solid #E7E9E4", borderRadius: 8,
+                                       padding: "8px 12px", marginBottom: 6, fontSize: 12.5 }}>
+          <span>
+            <b>{row.itemName}</b>
+            <span style={{ color: "#8A9099", marginLeft: 6 }}>lot {row.lot.lotNumber || "—"}</span>
+          </span>
+          <span className="mono">{fmtNum(row.qty)} {row.unit}</span>
+          <span><Badge tone={row.itemType === "finished" ? "good" : "info"}>{row.itemType}</Badge></span>
+          <span style={{ color: "#8A9099" }}>out since {fmtDate(row.since) || "—"}</span>
+          <span style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+            <Btn variant="secondary" onClick={() => onReturn(row)} style={{ padding: "4px 9px", fontSize: 11.5 }}>Return</Btn>
+            <Btn variant="secondary" onClick={() => onClear(row)} style={{ padding: "4px 9px", fontSize: 11.5 }}>Clear…</Btn>
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* issued - (consumed + returned + waste), per lot.
+
+   Only lots that were actually issued appear: a lot that never left the
+   warehouse has nothing to balance. A non-zero discrepancy is shown, never
+   corrected - the same rule over-placement follows in the warehouse. */
+function MaterialBalanceReport({ data }) {
+  const rows = useMemo(() => {
+    const seen = {}, out = [];
+    ((data && data.materialRequests) || []).forEach(req => {
+      (req.lines || []).forEach(line => {
+        if (!line.lotId || mrLineStatus(line) !== "Received") return;
+        const key = line.itemType + ":" + line.itemId + ":" + line.lotId;
+        if (seen[key]) return;
+        seen[key] = true;
+        const item = getCatalogItem(data, line.itemType, line.itemId);
+        const lot = item && (item.lots || []).find(l => l.id === line.lotId);
+        out.push({
+          key, itemName: item ? item.name : "(deleted item)", unit: item ? item.unit : "",
+          lotNumber: (lot && lot.lotNumber) || line.lotNumber || "—",
+          inProcess: !!(lot && lot.inProcess),
+          balance: materialBalance(data, line.itemType, line.itemId, line.lotId)
+        });
+      });
+    });
+    // Worst first: the point of the report is the exceptions.
+    return out.sort((a, b) => Math.abs(b.balance.discrepancy) - Math.abs(a.balance.discrepancy));
+  }, [data]);
+
+  const off = rows.filter(r => !r.balance.balanced);
+
+  if (!rows.length) {
+    return <div style={{ fontSize: 13, color: "#8A9099" }}>
+      Nothing has been issued yet, so there is nothing to balance. A lot appears here once a material
+      request for it has been taken into custody.
+    </div>;
+  }
+  return (
+    <div>
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 10 }}>
+        Issued − (consumed + returned + waste) should come to zero. A difference is shown, not corrected —
+        it means material left the warehouse and has not been accounted for, which is worth finding out about.
+      </div>
+      {off.length > 0 && (
+        <div style={{ background: "#F6E6C8", border: "1px solid #C99A3A", borderRadius: 8,
+                      padding: "10px 12px", marginBottom: 12, fontSize: 12.5, color: "#7A5205", fontWeight: 600 }}>
+          {off.length} lot{off.length === 1 ? " does" : "s do"} not balance.
+        </div>
+      )}
+      <div style={{ display: "grid", gridTemplateColumns: "2fr repeat(5, 1fr)", gap: 8, fontSize: 11,
+                    fontWeight: 700, color: "#7A8079", textTransform: "uppercase", letterSpacing: 0.3,
+                    padding: "0 12px 6px" }}>
+        <span>Lot</span><span>Issued</span><span>Consumed</span><span>Returned</span><span>Waste</span><span>Difference</span>
+      </div>
+      {rows.map(r => (
+        <div key={r.key} style={{ display: "grid", gridTemplateColumns: "2fr repeat(5, 1fr)", gap: 8,
+                                  alignItems: "center", fontSize: 12.5, padding: "8px 12px", marginBottom: 6,
+                                  borderRadius: 8, background: r.balance.balanced ? "#fff" : "#F6E6C8",
+                                  border: "1px solid " + (r.balance.balanced ? "#E7E9E4" : "#C99A3A") }}>
+          <span>
+            <b>{r.itemName}</b>
+            <span style={{ color: "#8A9099", marginLeft: 6 }}>lot {r.lotNumber}</span>
+            {r.inProcess && <span style={{ color: "#8A9099", marginLeft: 6 }}>· still out</span>}
+          </span>
+          <span className="mono">{fmtNum(r.balance.issued)}</span>
+          <span className="mono">{fmtNum(r.balance.consumed)}</span>
+          <span className="mono">{fmtNum(r.balance.returned)}</span>
+          <span className="mono">{fmtNum(r.balance.waste)}</span>
+          <span className="mono" style={{ fontWeight: 700, color: r.balance.balanced ? "#2E7D5B" : "#7A5205" }}>
+            {r.balance.balanced ? "—" : fmtNum(r.balance.discrepancy) + " " + r.unit}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* Raise a request. Item and quantity only - the warehouse picks the lot
+   under FEFO, which is decision 1 of the phase 5 spec and the reason there
+   is no lot selector here. */
+function MaterialRequestModal({ data, update, onClose }) {
+  const catalog = useMemo(() => {
+    const out = [];
+    [["raw", "rawMaterials"], ["intermediate", "intermediateProducts"], ["finished", "finishedGoods"]]
+      .forEach(([itemType, entity]) => (data[entity] || []).forEach(i =>
+        out.push({ itemType, itemId: i.id, name: i.name, unit: i.unit || "" })));
+    return out.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  }, [data]);
+
+  const [f, setF] = useState(() => ({
+    requestedFor: "", requestedBy: "", requestedDate: todayStr(), neededDate: "", notes: "",
+    lines: catalog.length ? [{ id: uid(), key: catalog[0].itemType + ":" + catalog[0].itemId, qty: 0 }] : []
+  }));
+  const [err, setErr] = useState("");
+
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+  const setLine = (i, patch) => setF(p => ({ ...p, lines: p.lines.map((l, n) => n === i ? { ...l, ...patch } : l) }));
+  const addLine = () => catalog.length && setF(p => ({ ...p,
+    lines: [...p.lines, { id: uid(), key: catalog[0].itemType + ":" + catalog[0].itemId, qty: 0 }] }));
+  const removeLine = (i) => setF(p => ({ ...p, lines: p.lines.filter((_, n) => n !== i) }));
+
+  const unitFor = (key) => { const c = catalog.find(c => c.itemType + ":" + c.itemId === key); return c ? c.unit : ""; };
+  const canSave = f.lines.some(l => (Number(l.qty) || 0) > 0);
+
+  const submit = () => {
+    if (!canSave) return;
+    let res = null;
+    update(d => {
+      res = tx.raiseMaterialRequest(d, {
+        requestedFor: f.requestedFor, requestedBy: f.requestedBy,
+        requestedDate: f.requestedDate, neededDate: f.neededDate, notes: f.notes, submit: true,
+        lines: f.lines.filter(l => (Number(l.qty) || 0) > 0).map(l => {
+          const sep = l.key.indexOf(":");
+          return { itemType: l.key.slice(0, sep), itemId: l.key.slice(sep + 1), qty: Number(l.qty) || 0 };
+        })
+      });
+      return d;
+    });
+    if (res && res.ok) onClose(); else setErr((res && res.error) || "Could not raise the request.");
+  };
+
+  return (
+    <Modal title="Request material from the warehouse" onClose={onClose}>
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 12 }}>
+        Ask for an item and a quantity. The warehouse picks the lot — earliest expiry first — and stages it
+        into a To/From position; it becomes yours to consume once you take custody of it.
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
+        <Field label="For (process or run)"><input style={inputStyle} value={f.requestedFor} onChange={e => set("requestedFor", e.target.value)} placeholder="e.g. Run 42" /></Field>
+        <Field label="Requested by"><input style={inputStyle} value={f.requestedBy} onChange={e => set("requestedBy", e.target.value)} /></Field>
+        <Field label="Raised"><input type="date" style={inputStyle} value={f.requestedDate} onChange={e => set("requestedDate", e.target.value)} /></Field>
+        <Field label="Needed by"><input type="date" style={inputStyle} value={f.neededDate} onChange={e => set("neededDate", e.target.value)} /></Field>
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "10px 0 6px" }}>
+        <div style={{ fontWeight: 700, fontSize: 13 }}>Items</div>
+        <Btn variant="secondary" onClick={addLine} style={{ padding: "5px 9px", fontSize: 12 }}><Plus size={12} />Add item</Btn>
+      </div>
+      {f.lines.length === 0 && <div style={{ fontSize: 12, color: "#8A9099" }}>There is nothing in the catalog to request.</div>}
+      {f.lines.map((l, i) => (
+        <div key={l.id} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 60px 28px", gap: 6, marginBottom: 6, alignItems: "center" }}>
+          <select style={inputStyle} value={l.key} onChange={e => setLine(i, { key: e.target.value })}>
+            {catalog.map(c => <option key={c.itemType + ":" + c.itemId} value={c.itemType + ":" + c.itemId}>{c.name}</option>)}
+          </select>
+          <input type="number" step="0.01" style={inputStyle} value={l.qty} onChange={e => setLine(i, { qty: parseFloat(e.target.value) || 0 })} />
+          <span style={{ fontSize: 12, color: "#8A9099" }}>{unitFor(l.key)}</span>
+          <IconBtn onClick={() => removeLine(i)} title="Remove" danger><Trash2 size={12} /></IconBtn>
+        </div>
+      ))}
+
+      <Field label="Notes"><input style={inputStyle} value={f.notes} onChange={e => set("notes", e.target.value)} /></Field>
+
+      {err && <div style={{ fontSize: 12, color: "#8A2E20", marginTop: 8, fontWeight: 600 }}>{err}</div>}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
+        <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+        <Btn onClick={submit} style={{ opacity: canSave ? 1 : 0.5 }}>Raise request</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+/* Hand material back. The flavour is prefilled from what the lot is: a raw
+   material going back is leftover, anything the line made is output — that
+   is the distinction the warehouse acts on, since one goes back to a pallet
+   it already knows and the other has to be slotted for the first time. */
+function MaterialReturnModal({ data, update, row, onClose }) {
+  const [f, setF] = useState(() => ({
+    returnType: row.itemType === "raw" ? "leftover" : "output",
+    qty: row.qty, returnedBy: "", returnedDate: todayStr(), suggestedLocation: "", notes: ""
+  }));
+  const [err, setErr] = useState("");
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+
+  const submit = () => {
+    let res = null;
+    update(d => {
+      res = tx.raiseMaterialReturn(d, {
+        returnType: f.returnType, returnedBy: f.returnedBy, returnedDate: f.returnedDate, notes: f.notes,
+        lines: [{ itemType: row.itemType, itemId: row.itemId, lotId: row.lot.id,
+                  lotNumber: row.lot.lotNumber || "", qty: Number(f.qty) || 0,
+                  suggestedLocation: f.suggestedLocation }]
+      });
+      return d;
+    });
+    if (res && res.ok) onClose(); else setErr((res && res.error) || "Could not raise the return.");
+  };
+
+  return (
+    <Modal title={"Return " + row.itemName} onClose={onClose}>
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 12 }}>
+        Lot {row.lot.lotNumber || "—"} · {fmtNum(row.qty)} {row.unit} out since {fmtDate(row.since) || "—"}.
+        The warehouse takes custody back when it puts this away; until then it is still yours.
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
+        <Field label="Type">
+          <select style={inputStyle} value={f.returnType} onChange={e => set("returnType", e.target.value)}>
+            <option value="leftover">Leftover — goes back to an existing pallet</option>
+            <option value="output">Production output — needs a new position</option>
+          </select>
+        </Field>
+        <Field label={"Quantity (" + row.unit + ")"}>
+          <input type="number" step="0.01" style={inputStyle} value={f.qty} onChange={e => set("qty", parseFloat(e.target.value) || 0)} />
+        </Field>
+        <Field label="Returned by"><input style={inputStyle} value={f.returnedBy} onChange={e => set("returnedBy", e.target.value)} /></Field>
+        <Field label="Date"><input type="date" style={inputStyle} value={f.returnedDate} onChange={e => set("returnedDate", e.target.value)} /></Field>
+      </div>
+      {f.returnType === "leftover" && (
+        <Field label="Came from (optional)">
+          <input style={inputStyle} value={f.suggestedLocation} onChange={e => set("suggestedLocation", e.target.value.toUpperCase())}
+            placeholder="e.g. M1A1 — a hint so it goes straight back, not a reservation" />
+        </Field>
+      )}
+      <Field label="Notes"><input style={inputStyle} value={f.notes} onChange={e => set("notes", e.target.value)} /></Field>
+      {err && <div style={{ fontSize: 12, color: "#8A2E20", marginTop: 8, fontWeight: 600 }}>{err}</div>}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
+        <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+        <Btn onClick={submit} style={{ opacity: (Number(f.qty) || 0) > 0 ? 1 : 0.5 }}>Raise return</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+/* The exception. Material scrapped on the line, a correction, a mis-key -
+   custody has to be able to end without a return, but never silently. */
+function ClearInProcessModal({ data, update, row, onClose }) {
+  const [reason, setReason] = useState("");
+  const [err, setErr] = useState("");
+  const submit = () => {
+    let res = null;
+    update(d => {
+      res = tx.clearInProcess(d, { itemType: row.itemType, itemId: row.itemId, lotId: row.lot.id, reason });
+      return d;
+    });
+    if (res && res.ok) onClose(); else setErr((res && res.error) || "Could not clear the flag.");
+  };
+  return (
+    <Modal title={"Clear In Process — " + row.itemName} onClose={onClose}>
+      <div style={{ fontSize: 12.5, color: "#7A5205", background: "#F6E6C8", border: "1px solid #C99A3A",
+                    borderRadius: 8, padding: "10px 12px", marginBottom: 12 }}>
+        This ends custody <b>without a material return</b>, so the warehouse never sees this material come back.
+        Use it when the material genuinely is not coming back — scrapped on the line, or the flag was wrong.
+        The reason is recorded on the lot.
+      </div>
+      <Field label="Reason (required)">
+        <input style={inputStyle} value={reason} onChange={e => setReason(e.target.value)}
+          placeholder="e.g. Scrapped on the line — off-spec" />
+      </Field>
+      {err && <div style={{ fontSize: 12, color: "#8A2E20", marginTop: 8, fontWeight: 600 }}>{err}</div>}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
+        <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+        <Btn onClick={submit} style={{ opacity: reason.trim() ? 1 : 0.5 }}>Clear flag</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+/* Lots a process can draw from, split by custody.
+
+   `lots` stays the full list because the rest of the modal looks a
+   selection up in it - including a selection that is no longer allowed,
+   which must still render so the operator can see what to fix rather than
+   watching the row go blank. `available` and `inStorage` are what the
+   picker offers, and only `available` is selectable. */
 function buildSourceGroups(data, process) {
   return (process.inputs || []).map(line => {
     const item = getCatalogItem(data, line.itemType, line.itemId);
     if (!item) return null;
+    const toOption = l => ({
+      id: l.id,
+      qty: Number(l.qty) || 0,
+      unit: item.unit,
+      inProcess: !!l.inProcess,
+      label: (l.lotNumber || "Lot") + " · " + fmtDate(l.date) + " · " + fmtNum(l.qty) + " " + item.unit
+    });
+    const split = sourceLotOptions(data, line.itemType, line.itemId);
     return {
       key: line.itemType + ":" + line.itemId,
+      itemType: line.itemType, itemId: line.itemId,
       label: item.name + " (" + line.itemType + ")",
+      itemName: item.name, unit: item.unit,
       plannedQty: line.qty,
-      lots: (item.lots || []).map(l => ({
-        id: l.id,
-        qty: Number(l.qty) || 0,
-        unit: item.unit,
-        label: (l.lotNumber || "Lot") + " · " + fmtDate(l.date) + " · " + fmtNum(l.qty) + " " + item.unit
-      }))
+      lots: (item.lots || []).map(toOption),
+      available: split.available.map(toOption),
+      inStorage: split.inStorage.map(toOption)
     };
   }).filter(Boolean);
 }
@@ -15709,7 +16291,10 @@ function BatchLogModal({ data, kind, processId, onClose, update }) {
           qcChecks: composition.map(c => ({ id: uid(), componentId: c.componentId, mode: "estimated", measuredValue: "", concentration: c.percentage }))
         };
       }),
-      sources: sourceGroups.map(g => ({ id: uid(), groupKey: g.key, lotId: g.lots[0] ? g.lots[0].id : "", qty: g.plannedQty })),
+      // Default to a lot the process may actually consume. Falling back to
+      // the first lot of any kind would preselect warehouse stock and open
+      // the modal already in breach.
+      sources: sourceGroups.map(g => ({ id: uid(), groupKey: g.key, lotId: g.available[0] ? g.available[0].id : "", qty: g.plannedQty })),
       actualEquipment: (process ? process.equipment : []).map(eq => ({ id: uid(), equipmentId: eq.equipmentId, hours: plannedHours })),
       actualLabor: []
     };
@@ -15781,7 +16366,32 @@ function BatchLogModal({ data, kind, processId, onClose, update }) {
     return lot && (Number(s.qty) || 0) > lot.qty;
   }).map(s => s.id);
 
-  const canSave = f.outputs.some(o => o.qty > 0) && overConsumedSourceIds.length === 0;
+  // A batch may only draw on what Operations is holding. Anything still in
+  // the warehouse blocks the log and instead offers the document that would
+  // release it.
+  const custodyIssues = batchCustodyIssues(data, f.sources);
+  const custodyBlockedIds = custodyIssues.map(i => i.sourceId);
+  const [requestRaised, setRequestRaised] = useState(null);
+
+  const canSave = f.outputs.some(o => o.qty > 0)
+    && overConsumedSourceIds.length === 0
+    && custodyIssues.length === 0;
+
+  const requestBlockedMaterial = () => {
+    const lines = requestLinesForIssues(custodyIssues);
+    if (!lines.length) return;
+    let res = null;
+    update(d => {
+      res = tx.raiseMaterialRequest(d, {
+        requestedFor: process.name, requestedDate: f.date, submit: true,
+        notes: "Raised from the batch log for " + process.name,
+        lines: lines.map(l => ({ itemType: l.itemType, itemId: l.itemId, qty: l.qty }))
+      });
+    });
+    setRequestRaised(res && res.ok
+      ? { ok: true, reference: res.request.reference, count: lines.length }
+      : { ok: false, error: (res && res.error) || "Could not raise the request." });
+  };
 
   const wastePreview = useMemo(() => {
     const consumed = f.sources.map(s => {
@@ -15880,6 +16490,7 @@ function BatchLogModal({ data, kind, processId, onClose, update }) {
         </div>
         <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 10 }}>
           One row per defined input, pre-filled with the planned quantity — pick the actual lot used and adjust the quantity if it differed.
+          Only material the line is holding can be consumed; anything still in warehouse storage is listed but not selectable, and needs a material request first.
         </div>
         {f.sources.length === 0 && <div style={{ fontSize: 12, color: "#8A9099" }}>This process has no defined inputs to source from.</div>}
         {f.sources.map((s, idx) => {
@@ -15887,27 +16498,50 @@ function BatchLogModal({ data, kind, processId, onClose, update }) {
           const groupLots = g ? g.lots : [];
           const selectedLot = groupLots.find(l => l.id === s.lotId);
           const overConsumed = selectedLot && (Number(s.qty) || 0) > selectedLot.qty;
+          const inStorage = custodyBlockedIds.indexOf(s.id) !== -1;
+          const bad = overConsumed || inStorage;
           return (
             <div key={s.id} style={{ marginBottom: 6 }}>
               <div style={{
                 display: "grid", gridTemplateColumns: "1.3fr 1.3fr 0.7fr 28px", gap: 6,
-                padding: overConsumed ? 6 : 0, borderRadius: 6,
-                background: overConsumed ? "#F3DBD6" : "transparent",
-                border: overConsumed ? "1px solid #D97066" : "none"
+                padding: bad ? 6 : 0, borderRadius: 6,
+                background: overConsumed ? "#F3DBD6" : inStorage ? "#F6E6C8" : "transparent",
+                border: overConsumed ? "1px solid #D97066" : inStorage ? "1px solid #C99A3A" : "none"
               }}>
                 <select style={inputStyle} value={s.groupKey} onChange={e => {
                   const newGroup = sourceGroups.find(g => g.key === e.target.value);
-                  updateSource(idx, { groupKey: e.target.value, lotId: newGroup && newGroup.lots[0] ? newGroup.lots[0].id : "" });
+                  updateSource(idx, { groupKey: e.target.value, lotId: newGroup && newGroup.available[0] ? newGroup.available[0].id : "" });
                 }}>
                   {sourceGroups.map(g => <option key={g.key} value={g.key}>{g.label}</option>)}
                 </select>
-                <select style={inputStyle} value={s.lotId} onChange={e => updateSource(idx, { lotId: e.target.value })}>
-                  {groupLots.length === 0 && <option value="">No lots available</option>}
-                  {groupLots.map(l => <option key={l.id} value={l.id}>{l.label}</option>)}
+                {/* Storage lots are shown but not selectable. Hiding them would
+                    read as "we have none"; naming them says what to do next. */}
+                <select style={{ ...inputStyle, borderColor: inStorage ? "#C99A3A" : "#D7DAD3" }} value={s.lotId} onChange={e => updateSource(idx, { lotId: e.target.value })}>
+                  {g && g.available.length === 0 && <option value="">No material in process</option>}
+                  {g && g.available.length > 0 && (
+                    <optgroup label="In process — available">
+                      {g.available.map(l => <option key={l.id} value={l.id}>{l.label}</option>)}
+                    </optgroup>
+                  )}
+                  {g && g.inStorage.length > 0 && (
+                    <optgroup label="Inventory in storage — request material">
+                      {g.inStorage.map(l => <option key={l.id} value={l.id} disabled>{l.label}</option>)}
+                    </optgroup>
+                  )}
+                  {/* A selection that has since gone out of custody still has to
+                      render, or the row would silently blank out. */}
+                  {s.lotId && selectedLot && !selectedLot.inProcess && (
+                    <option value={s.lotId}>{selectedLot.label} — in storage</option>
+                  )}
                 </select>
                 <input type="number" step="0.01" style={{ ...inputStyle, borderColor: overConsumed ? "#D97066" : "#D7DAD3" }} value={s.qty} onChange={e => updateSource(idx, { qty: parseFloat(e.target.value) || 0 })} />
                 <IconBtn onClick={() => removeSource(idx)} title="Remove" danger><Trash2 size={12} /></IconBtn>
               </div>
+              {inStorage && (
+                <div style={{ fontSize: 11.5, color: "#7A5205", marginTop: 3, fontWeight: 600 }}>
+                  This lot is in warehouse storage, not in process — raise a material request to have it issued.
+                </div>
+              )}
               {overConsumed && (
                 <div style={{ fontSize: 11.5, color: "#8A2E20", marginTop: 3, fontWeight: 600 }}>
                   This batch needs {fmtNum(s.qty)} {selectedLot.unit}, but this lot only has {fmtNum(selectedLot.qty)} {selectedLot.unit} — add another source lot to cover the rest before logging.
@@ -15916,6 +16550,37 @@ function BatchLogModal({ data, kind, processId, onClose, update }) {
             </div>
           );
         })}
+
+        {custodyIssues.length > 0 && (
+          <div style={{ background: "#F6E6C8", border: "1px solid #C99A3A", borderRadius: 8, padding: 10, marginTop: 10 }}>
+            <div style={{ fontSize: 12.5, fontWeight: 700, color: "#7A5205", marginBottom: 4 }}>
+              Inventory in storage — request material
+            </div>
+            <div style={{ fontSize: 11.5, color: "#7A5205", marginBottom: 8 }}>
+              A batch can only draw on material the line is holding. {custodyIssues.length === 1 ? "One source is" : custodyIssues.length + " sources are"} still
+              in the warehouse, so this batch cannot be logged until {custodyIssues.length === 1 ? "it has" : "they have"} been issued through a material request.
+            </div>
+            <ul style={{ margin: "0 0 10px 16px", padding: 0, fontSize: 11.5, color: "#7A5205" }}>
+              {custodyIssues.map(i => (
+                <li key={i.sourceId || i.lotId}>{i.itemName} · lot {i.lotNumber || "—"} · {fmtNum(i.qty)} {i.unit}</li>
+              ))}
+            </ul>
+            {requestRaised && requestRaised.ok ? (
+              <div style={{ fontSize: 12, color: "#1F5B3E", fontWeight: 600 }}>
+                Raised {requestRaised.reference} for {requestRaised.count} {requestRaised.count === 1 ? "item" : "items"} — the warehouse will pick it into a To/From position.
+              </div>
+            ) : (
+              <>
+                <Btn variant="secondary" onClick={requestBlockedMaterial} style={{ padding: "6px 10px", fontSize: 12 }}>
+                  <Plus size={13} />Request this material
+                </Btn>
+                {requestRaised && !requestRaised.ok && (
+                  <div style={{ fontSize: 11.5, color: "#8A2E20", marginTop: 6 }}>{requestRaised.error}</div>
+                )}
+              </>
+            )}
+          </div>
+        )}
       </div>
 
       <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 12, marginBottom: 14 }}>
@@ -16055,6 +16720,12 @@ function BatchLogModal({ data, kind, processId, onClose, update }) {
       {overConsumedSourceIds.length > 0 && (
         <div style={{ background: "#F3DBD6", border: "1px solid #D97066", borderRadius: 8, padding: "10px 12px", marginBottom: 4, fontSize: 12.5, color: "#8A2E20", fontWeight: 600 }}>
           {overConsumedSourceIds.length} source lot{overConsumedSourceIds.length === 1 ? " is" : "s are"} over-consumed, highlighted above — add an additional lot for each to cover the shortfall before this batch can be logged.
+        </div>
+      )}
+
+      {custodyIssues.length > 0 && (
+        <div style={{ background: "#F6E6C8", border: "1px solid #C99A3A", borderRadius: 8, padding: "10px 12px", marginBottom: 4, fontSize: 12.5, color: "#7A5205", fontWeight: 600 }}>
+          {custodyIssues.length} source lot{custodyIssues.length === 1 ? " is" : "s are"} in warehouse storage rather than in process — request the material before logging this batch.
         </div>
       )}
 

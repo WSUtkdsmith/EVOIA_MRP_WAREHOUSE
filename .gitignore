@@ -15,6 +15,9 @@ node_modules/
 mrp/test/rendertest/app.tsx
 mrp/test/rendertest/app.js
 mrp/test/rendertest/*.js.map
+# The render harness, rebuilt by mrp/tools/mkapp.sh on every `npm run test:render`.
+mrp/test/app.js
+mrp/.render-harness.jsx
 
 # Source snapshots — kept in git history on the original patch branches,
 # not carried in the integrated tree (they duplicate the canonical files).

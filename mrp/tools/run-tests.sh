@@ -41,7 +41,7 @@ done
 
 echo
 echo "=== render suite ==="
-echo "  run separately from mrp/test/rendertest : node render.js"
+echo "  npm run test:render  (mrp/tools/mkapp.sh + mrp/test/render.test.js)"
 
 echo
 echo "TOTAL: $TOTAL logic assertions, $FAILED failed"

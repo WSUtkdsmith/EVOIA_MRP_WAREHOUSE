@@ -35,6 +35,8 @@ through the phase notes below and easy to lose.
 | 1 | **No authentication anywhere.** Every endpoint is open; anyone with the URL can read or write. | Fine for the sanitized build, unacceptable with real inventory and costs. Owned by the downstream security developer — see *Handoff to security*. Client-side `rolePermissions` is **not** a boundary. |
 | 2 | **Go-live seeding runs warehouse → MRP, not MRP → warehouse.** Not built. | At go-live the **warehouse is the source of truth for what is on the floor**; the MRP starts empty. The seeded demo is the opposite way round (MRP rich, warehouse empty), which is an artifact of the sample data, not the real shape. Onboarding needs a one-time path that reads existing pallets and creates the matching MRP lots (batch, expiry, quantity, location already known) so the MRP starts life agreeing with the floor. Same ledger/idempotency shape as Phase 4 step 4, pointed the other way. |
 | 3 | **Placement does not scale by hand.** | 442 in-stock lots in the seed alone. Whichever direction the initial load runs, it needs a bulk/CSV path — nobody is clicking Place 442 times. |
+| 4 | **The consumption gate is enforced in the UI, not in `tx.logProductionBatch`.** | The batch log will not let you select warehouse stock, and blocks Save if a selection goes stale — but the transaction itself still consumes whatever it is handed. Anything that writes a batch without going through the modal (an import, an API caller, a future mobile client) bypasses the rule entirely. Enforcing it in the transaction is the right end state; it is not done yet because **it would refuse every batch against existing data**, where no lot carries `inProcess`. That is not a bug in the rule, it is flag 2 arriving early: until go-live seeding sets custody correctly, hard enforcement and the seeded dataset cannot both be true. **Decide together with flag 2, not separately.** |
+| 5 | **Go-live seeding must decide the custody of every existing lot.** | With the gate in place, a lot with no `inProcess` flag is unconsumable. At go-live essentially everything on the floor is warehouse stock — correct, and it means production's first act is to raise material requests, which is the intended protocol. But **anything genuinely mid-process at cutover must be flagged In Process during seeding** or the line will be unable to log the batch it is standing in front of. Needs an explicit step in the onboarding path, not an afterthought. |
 
 ### Design notes to preserve (so they are not "fixed" by mistake)
 
@@ -60,6 +62,24 @@ through the phase notes below and easy to lose.
   table must be registered there or it will export correctly and import to
   nothing. Bit `packagings`, then `purchase_order_lines`. The CSV round-trip test
   is what caught both — keep it.
+- **The batch log may only consume In Process material.** Production used to be
+  able to draw any lot in the MRP, which meant taking material off the rack with
+  no pick, no document and no position — the receiving bypass again, in the other
+  direction. Warehouse stock is now **listed but not selectable**, under its own
+  "Inventory in storage — request material" heading. It is listed rather than
+  hidden on purpose: hiding it reads as "we have none", which is false. Do not
+  "improve" this by filtering it out, and do not add a quick-consume shortcut.
+- **Produced goods start In Process, and that is not a bug.** A lot the line just
+  made has no Material Request behind it, so custody begins with Operations and a
+  Material Return is what ends it. The visible effect is that new output does not
+  appear as warehouse stock until it is returned — correct, and the reason
+  Manufacturing cannot quietly assume the warehouse role.
+- **The render suite was dead from Phase 0 to Phase 5** — `mrp/test/render.test.js`
+  was committed but the `app.js` bundle it requires never was, so 284 assertions
+  ran nowhere. `mrp/tools/mkapp.sh` rebuilds it and `npm test` runs it. It derives
+  its export list from the test's own `A.<name>` references, so a renamed
+  component fails the bundle loudly instead of testing nothing. **A committed test
+  with an uncommitted build step is worse than no test** — it reads as coverage.
 - **Ownership split, MRP vs warehouse:** the MRP owns the lot (produced quantity,
   cost, genealogy); the warehouse owns placement (pallet, slot, working quantity
   for picking). Where the two disagree the difference is **shown, not

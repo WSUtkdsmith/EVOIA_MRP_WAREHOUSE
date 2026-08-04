@@ -4,7 +4,8 @@
 import { seedData, tx, repo, TRANSIT_POSITIONS, freeTransitPositions,
          occupiedTransitPositions, fefoLots, suggestFefoLot, waitingForPosition,
          inProcessLots, materialRequestStatus, materialReturnStatus,
-         materialBalance, nextMaterialRef } from '/tmp/core.mjs';
+         materialBalance, nextMaterialRef,
+         lotCustody, sourceLotOptions, batchCustodyIssues, requestLinesForIssues } from '/tmp/core.mjs';
 
 let pass = 0, fail = 0;
 const ok = (n, c, x) => { if (c) { pass++; console.log('  PASS  ' + n); }
@@ -287,6 +288,125 @@ console.log('\n--- one bad action does not stop the rest ---');
      tx.applyWarehouseMaterialActions(D, [{ kind: 'teleport' }]).failed.length === 1);
   ok('no actions is a no-op', tx.applyWarehouseMaterialActions(D, []).applied.length === 0);
   ok('null is a no-op', tx.applyWarehouseMaterialActions(D, null).applied.length === 0);
+}
+
+// The batch log used to reach every lot in the MRP, which let production draw
+// straight off the rack: no pick, no document, no position, and a warehouse
+// stock figure wrong the moment it happened. Same bypass as the Place button,
+// closed the same way - the material has to come through the door.
+console.log('\n--- a batch may only consume what the line is holding ---');
+{
+  const { D, raw } = plant();
+  ok('a lot on the rack is storage', lotCustody(raw.lots[0]) === 'storage');
+  ok('a lot out with Operations is in process', lotCustody({ inProcess: true }) === 'inprocess');
+  ok('a missing lot does not throw', lotCustody(null) === 'storage');
+
+  const before = sourceLotOptions(D, 'raw', raw.id);
+  ok('with nothing issued, nothing is consumable', before.available.length === 0);
+  ok('and all three lots read as in storage', before.inStorage.length === 3);
+
+  raw.lots[0].qty = 0;
+  const emptied = sourceLotOptions(D, 'raw', raw.id);
+  ok('an empty lot is offered under neither heading — nothing to draw, nothing to request',
+     emptied.inStorage.length === 2 && !emptied.inStorage.some(l => l.id === 'lotA'));
+  raw.lots[0].qty = 500;
+
+  ok('an unknown item yields no options',
+     sourceLotOptions(D, 'raw', 'nope').available.length === 0);
+}
+
+// Issuing a lot through the door is what makes it consumable. Nothing else does.
+{
+  const { D, raw } = plant();
+  const r = req(D, raw, 100);
+  tx.stageRequestLine(D, { materialRequestId: r.id, lineId: r.lines[0].id, lotId: 'lotB', qty: 100, position: 'TP1' });
+  ok('staging alone does not make it consumable — it is still in the door',
+     sourceLotOptions(D, 'raw', raw.id).available.length === 0);
+
+  tx.receiveRequestLine(D, { materialRequestId: r.id, lineId: r.lines[0].id });
+  const after = sourceLotOptions(D, 'raw', raw.id);
+  ok('once Operations signs for it, it can be consumed',
+     after.available.length === 1 && after.available[0].id === 'lotB');
+  ok('the rest stay in storage', after.inStorage.map(l => l.id).sort().join(',') === 'lotA,lotC');
+}
+
+// What the batch log blocks on, and the document that unblocks it.
+{
+  const { D, raw } = plant();
+  const key = 'raw:' + raw.id;
+  const sources = [{ id: 's1', groupKey: key, lotId: 'lotA', qty: 40 }];
+
+  const issues = batchCustodyIssues(D, sources);
+  ok('drawing on warehouse stock is refused', issues.length === 1);
+  ok('the refusal names the source row, so the UI can highlight it', issues[0].sourceId === 's1');
+  ok('and names the lot and quantity', issues[0].lotNumber === 'A' && issues[0].qty === 40);
+
+  raw.lots[0].inProcess = true;
+  ok('the same draw against issued material is fine',
+     batchCustodyIssues(D, sources).length === 0);
+  raw.lots[0].inProcess = false;
+
+  ok('a zero-quantity row is not a violation — nothing is being drawn',
+     batchCustodyIssues(D, [{ id: 's1', groupKey: key, lotId: 'lotA', qty: 0 }]).length === 0);
+  ok('a row with no lot chosen yet is not a violation',
+     batchCustodyIssues(D, [{ id: 's1', groupKey: key, lotId: '', qty: 40 }]).length === 0);
+  ok('a lot that no longer exists is left to the existing checks',
+     batchCustodyIssues(D, [{ id: 's1', groupKey: key, lotId: 'gone', qty: 40 }]).length === 0);
+  ok('a malformed group key does not throw',
+     batchCustodyIssues(D, [{ id: 's1', groupKey: 'nonsense', lotId: 'lotA', qty: 40 }]).length === 0);
+  ok('no sources is no violation', batchCustodyIssues(D, []).length === 0);
+  ok('null sources tolerated', batchCustodyIssues(D, null).length === 0);
+}
+
+// The answer to "you may not consume this" is a document, not a dead end.
+{
+  const { D, raw } = plant();
+  const key = 'raw:' + raw.id;
+  const issues = batchCustodyIssues(D, [
+    { id: 's1', groupKey: key, lotId: 'lotA', qty: 40 },
+    { id: 's2', groupKey: key, lotId: 'lotC', qty: 60 }
+  ]);
+  ok('two blocked draws on one material', issues.length === 2);
+  const lines = requestLinesForIssues(issues);
+  ok('ask for it once, not twice', lines.length === 1);
+  ok('for the whole amount the batch wants', lines[0].qty === 100);
+  ok('the request names the item, not the lot — the warehouse picks under FEFO',
+     lines[0].itemType === 'raw' && lines[0].itemId === raw.id && !('lotId' in lines[0]));
+
+  const res = tx.raiseMaterialRequest(D, {
+    requestedFor: 'Run 1', submit: true,
+    lines: lines.map(l => ({ itemType: l.itemType, itemId: l.itemId, qty: l.qty }))
+  });
+  ok('and it raises cleanly', res.ok === true && res.request.status === 'Requested');
+  ok('no issues yields no lines', requestLinesForIssues([]).length === 0);
+  ok('null issues tolerated', requestLinesForIssues(null).length === 0);
+}
+
+// Produced goods are born in Operations' custody: no Request issues them, and
+// a Return is what hands them over.
+{
+  const { D } = plant();
+  const proc = D.processes[0];
+  const out = proc.outputs[0];
+  const before = inProcessLots(D).length;
+  tx.logProductionBatch(D, {
+    processId: proc.id, date: '2026-08-10', notes: '',
+    sources: [], outputs: [{ outputId: out.id, lotNumber: 'NEW-1', qty: 12, qcChecks: [] }],
+    actualEquipment: [], actualLabor: []
+  });
+  const held = inProcessLots(D);
+  ok('what the line just made is held by the line', held.length === before + 1);
+  const made = held.find(h => h.lot.lotNumber === 'NEW-1');
+  ok('flagged from the moment it exists', made && made.lot.inProcess === true);
+  ok('with the date it came off the line', made && made.lot.inProcessSince === '2026-08-10');
+
+  const consumable = sourceLotOptions(D, made.itemType, made.itemId);
+  ok('so a downstream process can draw on it immediately, without a request',
+     consumable.available.some(l => l.id === made.lot.id));
+
+  tx.clearInProcess(D, { itemType: made.itemType, itemId: made.itemId, lotId: made.lot.id, reason: 'Handed to warehouse' });
+  ok('and once handed over it is warehouse stock again, not consumable',
+     !sourceLotOptions(D, made.itemType, made.itemId).available.some(l => l.id === made.lot.id));
 }
 
 console.log('\n============================');

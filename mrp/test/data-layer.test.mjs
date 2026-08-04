@@ -214,9 +214,11 @@ console.log('\n--- tx.logProductionBatch vs V1 inline ---');
      JSON.stringify(scrub(createdA)) + ' vs ' + JSON.stringify(scrub(createdB)));
   /* tx.logProductionBatch now also stamps producedQty, batchId and processId -
      an intentional divergence from V1, since lot-level costing and batch
-     records depend on them. Everything else must still match exactly. */
+     records depend on them - and inProcess/inProcessSince, because produced
+     goods are born in Operations' custody and V1 had no notion of custody at
+     all. Everything else must still match exactly. */
   const stripNew = (o) => JSON.parse(JSON.stringify(o), function (k, v) {
-    return ['producedQty','batchId','processId','unitCost'].indexOf(k) >= 0 ? undefined : v;
+    return ['producedQty','batchId','processId','unitCost','inProcess','inProcessSince'].indexOf(k) >= 0 ? undefined : v;
   });
   ok('output lots otherwise written identically',
      same(stripNew(a.intermediateProducts), stripNew(b.intermediateProducts)));
@@ -224,6 +226,11 @@ console.log('\n--- tx.logProductionBatch vs V1 inline ---');
     const newLot = b.intermediateProducts.flatMap(i => i.lots)
       .find(l => l.lotNumber === 'BATCH-TEST-01');
     ok('and the new lot records what it produced', newLot && newLot.producedQty === 3);
+    /* A lot the line just made is the line's, not the warehouse's. Without
+       this the warehouse would show stock it has never received, and the
+       Material Return that hands it over would have nothing to clear. */
+    ok('and starts in Operations custody, not on the rack',
+       newLot && newLot.inProcess === true && newLot.inProcessSince === payload.date);
     ok('and which batch and process made it',
        newLot && !!newLot.batchId && newLot.processId === payload.processId);
   }
