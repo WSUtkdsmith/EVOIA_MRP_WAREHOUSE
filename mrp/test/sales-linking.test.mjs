@@ -11,6 +11,8 @@ import { seedData, tx, repo, sortRows, filterRows, compareBy,
          plannedProductionSplit, ordersForRun, linkableRunsForLine,
          nextRunReference, nextSalesOrderReference, backfillRunReferences,
          runListRows, planScheduleFIFO, familiesOf,
+         lineAllocations, lineRequiredQty, lineAllocatedQty, lineUnallocatedQty,
+         lineIsReleased, lineRunIds, runCommittedQty, runCapacity, planRunLink,
          normalizeData } from '/tmp/core.mjs';
 
 let pass = 0, fail = 0;
@@ -111,11 +113,226 @@ console.log('\n--- linking a line to a run that already exists ---');
   ok('an unknown run cannot be linked',
      tx.linkSalesOrderLineToRun(D2, { salesOrderId: o2.id, lineId: o2.lines[0].id, scheduleId: 'nope' }).ok === false);
 
-  // A run smaller than the order is a real situation with a real answer, so it
-  // is allowed - refusing would only push the planner into a duplicate run.
+  /* REVERSED on review. This used to allocate the whole line to a run too
+     small to make it, on "shown, not blocked" grounds. That was wrong: the
+     shortfall was invisible, so a run could be committed to more than it
+     makes and nobody would find out until the goods failed to appear. A link
+     now takes the run's balance and no more, and the caller is handed the
+     remainder to do something about. */
   const small = run(D2, f2, { qty: 10 });
-  ok('a run that cannot cover the whole line still links — shown, not blocked',
-     tx.linkSalesOrderLineToRun(D2, { salesOrderId: o2.id, lineId: o2.lines[0].id, scheduleId: small.id }).ok === true);
+  const partial = tx.linkSalesOrderLineToRun(D2, {
+    salesOrderId: o2.id, lineId: o2.lines[0].id, scheduleId: small.id });
+  ok('a run too small still links', partial.ok === true);
+  ok('but only for what it can actually make', partial.allocated === 10);
+  ok('and the shortfall is handed back rather than swallowed', partial.remainder === 90);
+  ok('the line is not counted as released', lineIsReleased(o2.lines[0]) === false);
+  ok('nor the order', o2.status !== 'Released');
+}
+
+console.log('\n--- a run cannot be committed to more than it makes ---');
+{
+  // The rule: a run makes a finite quantity, several lines can draw on it, and
+  // the allocations may not exceed it. Without a quantity on the link there
+  // was nothing to add up, so nothing to enforce.
+  const { D, cust, fg } = plant();
+  const r = run(D, fg, { qty: 100 });
+
+  const cap0 = runCapacity(D, r.id, null);
+  ok('a fresh run is entirely available', cap0.planned === 100 && cap0.available === 100);
+  ok('and nothing is committed', cap0.committed === 0);
+  ok('nor over-committed', cap0.overCommitted === false);
+
+  const a = order(D, cust, fg, { lines: [{ finishedGoodId: fg.id, qty: 60 }] }).order;
+  tx.reviewSalesOrderLine(D, { salesOrderId: a.id, lineId: a.lines[0].id, decision: 'Accept' });
+  const first = tx.linkSalesOrderLineToRun(D, { salesOrderId: a.id, lineId: a.lines[0].id, scheduleId: r.id });
+  ok('the first line takes what it needs', first.allocated === 60);
+  ok('with nothing left over', first.remainder === 0);
+  ok('and is released in full', lineIsReleased(a.lines[0]) === true);
+  ok('the run reports what is left', runCapacity(D, r.id, null).available === 40);
+
+  const b = order(D, cust, fg, { lines: [{ finishedGoodId: fg.id, qty: 70 }] }).order;
+  tx.reviewSalesOrderLine(D, { salesOrderId: b.id, lineId: b.lines[0].id, decision: 'Accept' });
+  const second = tx.linkSalesOrderLineToRun(D, { salesOrderId: b.id, lineId: b.lines[0].id, scheduleId: r.id });
+  ok('a second line gets only the balance', second.allocated === 40,
+     'taking all 70 would commit the run to 130 of a 100 run');
+  ok('and is told what is still uncovered', second.remainder === 30);
+  ok('so it is not released', lineIsReleased(b.lines[0]) === false);
+  ok('the run is now fully committed', runCapacity(D, r.id, null).available === 0);
+  ok('and exactly, not over', runCapacity(D, r.id, null).committed === 100);
+  ok('which is the invariant the whole change exists for',
+     runCommittedQty(D, r.id) <= 100.0001);
+
+  const c = order(D, cust, fg, { lines: [{ finishedGoodId: fg.id, qty: 10 }] }).order;
+  tx.reviewSalesOrderLine(D, { salesOrderId: c.id, lineId: c.lines[0].id, decision: 'Accept' });
+  const third = tx.linkSalesOrderLineToRun(D, { salesOrderId: c.id, lineId: c.lines[0].id, scheduleId: r.id });
+  ok('a full run refuses a third line outright', third.ok === false);
+  ok('and says why', /fully committed/.test(third.error));
+}
+
+// "Add remainder as a new run": release covers the balance only.
+{
+  const { D, cust, fg } = plant();
+  const small = run(D, fg, { qty: 40 });
+  const o = order(D, cust, fg, { lines: [{ finishedGoodId: fg.id, qty: 100 }] }).order;
+  const line = o.lines[0];
+  tx.reviewSalesOrderLine(D, { salesOrderId: o.id, lineId: line.id, decision: 'Accept' });
+  tx.linkSalesOrderLineToRun(D, { salesOrderId: o.id, lineId: line.id, scheduleId: small.id });
+  ok('40 of 100 covered', lineAllocatedQty(line) === 40 && lineUnallocatedQty(line) === 60);
+
+  const rel = tx.releaseSalesOrderLine(D, { salesOrderId: o.id, lineId: line.id });
+  ok('releasing raises a run for the remainder', rel.ok === true);
+  ok('for exactly the balance, not the whole line again', rel.run.qty === 60,
+     'raising 100 again would double the plant\u2019s commitment');
+  ok('the line is now covered in full', lineIsReleased(line) === true);
+  ok('across two runs', lineRunIds(line).length === 2);
+  ok('and the order reads as released', o.status === 'Released');
+
+  ok('releasing again is refused — there is nothing left',
+     tx.releaseSalesOrderLine(D, { salesOrderId: o.id, lineId: line.id }).ok === false);
+  ok('and so is linking again',
+     tx.linkSalesOrderLineToRun(D, { salesOrderId: o.id, lineId: line.id,
+       scheduleId: run(D, fg).id }).ok === false);
+}
+
+// "Link additional runs": several runs, one line.
+{
+  const { D, cust, fg } = plant();
+  const r1 = run(D, fg, { qty: 30 }), r2 = run(D, fg, { qty: 30 }), r3 = run(D, fg, { qty: 100 });
+  const o = order(D, cust, fg, { lines: [{ finishedGoodId: fg.id, qty: 75 }] }).order;
+  const line = o.lines[0];
+  tx.reviewSalesOrderLine(D, { salesOrderId: o.id, lineId: line.id, decision: 'Accept' });
+
+  tx.linkSalesOrderLineToRun(D, { salesOrderId: o.id, lineId: line.id, scheduleId: r1.id });
+  tx.linkSalesOrderLineToRun(D, { salesOrderId: o.id, lineId: line.id, scheduleId: r2.id });
+  ok('two runs cover 60 of 75', lineAllocatedQty(line) === 60);
+  const last = tx.linkSalesOrderLineToRun(D, { salesOrderId: o.id, lineId: line.id, scheduleId: r3.id });
+  ok('the third takes only the 15 still needed', last.allocated === 15,
+     'a link is capped by what the LINE needs as well as by what the run has');
+  ok('leaving the big run mostly free', runCapacity(D, r3.id, null).available === 85);
+  ok('the line is covered', lineIsReleased(line) === true);
+  ok('by three runs', lineRunIds(line).length === 3);
+
+  ok('the same run cannot be linked twice',
+     tx.linkSalesOrderLineToRun(D, { salesOrderId: o.id, lineId: line.id, scheduleId: r1.id }).ok === false);
+}
+
+// Unlinking gives the capacity back.
+{
+  const { D, cust, fg } = plant();
+  const r1 = run(D, fg, { qty: 50 }), r2 = run(D, fg, { qty: 50 });
+  const o = order(D, cust, fg, { lines: [{ finishedGoodId: fg.id, qty: 80 }] }).order;
+  const line = o.lines[0];
+  tx.reviewSalesOrderLine(D, { salesOrderId: o.id, lineId: line.id, decision: 'Accept' });
+  tx.linkSalesOrderLineToRun(D, { salesOrderId: o.id, lineId: line.id, scheduleId: r1.id });
+  tx.linkSalesOrderLineToRun(D, { salesOrderId: o.id, lineId: line.id, scheduleId: r2.id });
+  ok('covered by two runs', lineIsReleased(line) === true);
+
+  const un = tx.unlinkSalesOrderLine(D, { salesOrderId: o.id, lineId: line.id, scheduleId: r1.id });
+  ok('one run can be unlinked by name', un.ok === true && un.removed === 1);
+  ok('returning its capacity', runCapacity(D, r1.id, null).available === 50);
+  ok('the other allocation survives', lineRunIds(line).length === 1);
+  ok('and the line is short again', lineUnallocatedQty(line) === 50);
+  ok('so the order is no longer released', o.status !== 'Released');
+
+  ok('unlinking a run the line does not use is refused',
+     tx.unlinkSalesOrderLine(D, { salesOrderId: o.id, lineId: line.id, scheduleId: r1.id }).ok === false);
+
+  tx.unlinkSalesOrderLine(D, { salesOrderId: o.id, lineId: line.id });
+  ok('unlinking with no run named removes them all', lineAllocations(line).length === 0);
+  ok('and every run is free again',
+     runCapacity(D, r2.id, null).available === 50);
+}
+
+// A cancelled order is not a commitment, so it must not hold capacity.
+{
+  const { D, cust, fg } = plant();
+  const r = run(D, fg, { qty: 100 });
+  const o = order(D, cust, fg, { lines: [{ finishedGoodId: fg.id, qty: 100 }] }).order;
+  tx.reviewSalesOrderLine(D, { salesOrderId: o.id, lineId: o.lines[0].id, decision: 'Accept' });
+  tx.linkSalesOrderLineToRun(D, { salesOrderId: o.id, lineId: o.lines[0].id, scheduleId: r.id });
+  ok('the run is fully committed', runCapacity(D, r.id, null).available === 0);
+  o.status = 'Cancelled';
+  ok('cancelling the order frees the capacity', runCapacity(D, r.id, null).available === 100,
+     'otherwise a withdrawn order would keep the plant booked against nothing');
+}
+
+// An adjusted line is measured against what the plant agreed to, not what
+// was asked for.
+{
+  const { D, cust, fg } = plant();
+  const r = run(D, fg, { qty: 100 });
+  const o = order(D, cust, fg, { lines: [{ finishedGoodId: fg.id, qty: 90 }] }).order;
+  const line = o.lines[0];
+  tx.reviewSalesOrderLine(D, { salesOrderId: o.id, lineId: line.id, decision: 'Adjust', approvedQty: 40 });
+  ok('the line needs the approved quantity', lineRequiredQty(line) === 40);
+  const res = tx.linkSalesOrderLineToRun(D, { salesOrderId: o.id, lineId: line.id, scheduleId: r.id });
+  ok('and takes only that', res.allocated === 40);
+  ok('leaving the rest of the run free', runCapacity(D, r.id, null).available === 60);
+}
+
+// Working out the link before writing it, for the prompt.
+{
+  const { D, cust, fg } = plant();
+  const r = run(D, fg, { qty: 25 });
+  const o = order(D, cust, fg, { lines: [{ finishedGoodId: fg.id, qty: 100 }] }).order;
+  const line = o.lines[0];
+  tx.reviewSalesOrderLine(D, { salesOrderId: o.id, lineId: line.id, decision: 'Accept' });
+
+  const plan = planRunLink(D, line, r.id, null);
+  ok('the plan says what would be taken', plan.qty === 25);
+  ok('and what would be left over', plan.remainder === 75);
+  ok('and that it is not a full cover', plan.full === false && plan.none === false);
+  ok('nothing was written', lineAllocations(line).length === 0);
+
+  const big = run(D, fg, { qty: 500 });
+  const full = planRunLink(D, line, big.id, null);
+  ok('a big enough run covers it', full.qty === 100 && full.remainder === 0 && full.full === true);
+  ok('asking for less takes less', planRunLink(D, line, big.id, 30).qty === 30);
+  ok('asking for more than the line needs is still capped',
+     planRunLink(D, line, big.id, 9999).qty === 100);
+
+  tx.linkSalesOrderLineToRun(D, { salesOrderId: o.id, lineId: line.id, scheduleId: big.id });
+  ok('once covered, a further link plans nothing', planRunLink(D, line, r.id, null).none === true);
+}
+
+// Data written before allocations existed.
+{
+  const { D, cust, fg } = plant();
+  const r = run(D, fg, { qty: 100 });
+  const o = order(D, cust, fg, { lines: [{ finishedGoodId: fg.id, qty: 60 }] }).order;
+  tx.reviewSalesOrderLine(D, { salesOrderId: o.id, lineId: o.lines[0].id, decision: 'Accept' });
+  // The old shape: a bare id, no quantity anywhere.
+  o.lines[0].scheduleId = r.id;
+  delete o.lines[0].runAllocations;
+
+  const back = normalizeData(JSON.parse(JSON.stringify(D)));
+  const migrated = back.salesOrders.find(x => x.reference === o.reference).lines[0];
+  ok('a bare scheduleId becomes an allocation', lineAllocations(migrated).length === 1);
+  ok('for what the line needs, which is what the old link meant',
+     lineAllocatedQty(migrated) === 60);
+  ok('so the line reads as released', lineIsReleased(migrated) === true);
+  ok('and the run reports the commitment', runCommittedQty(back, r.id) === 60);
+
+  // Migrating twice must not double the allocation.
+  const twice = normalizeData(JSON.parse(JSON.stringify(back)));
+  ok('normalising again changes nothing',
+     lineAllocatedQty(twice.salesOrders.find(x => x.reference === o.reference).lines[0]) === 60);
+
+  ok('every seeded released line carries an allocation',
+     seedData().salesOrders.flatMap(x => x.lines).filter(l => l.scheduleId)
+       .every(l => lineAllocations(l).length > 0));
+}
+
+// Robustness.
+{
+  ok('a line with nothing allocated needs everything',
+     lineUnallocatedQty({ qty: 10, reviewDecision: 'Accept' }) === 10);
+  ok('a null line needs nothing', lineRequiredQty(null) === 0);
+  ok('and has no allocations', lineAllocations(null).length === 0);
+  ok('an allocation with no run is ignored',
+     lineAllocations({ runAllocations: [{ qty: 5 }] }).length === 0);
+  ok('an unknown run has no capacity', runCapacity(seedData(), 'nope', null).planned === 0);
+  ok('null data does not throw', runCommittedQty(null, 'x') === 0);
 }
 
 console.log('\n--- one run, several orders ---');

@@ -124,6 +124,25 @@ through the phase notes below and easy to lose.
   returns null, and the roll-up reports `productsWithoutNetContent` so a total
   with a hole in it says so. Zero would read as "we sold none", which is a
   different and much more dangerous claim than "we do not know".
+- **A run cannot be committed to more than it makes, and this REVERSES an
+  earlier decision.** Linking a sales order line to a run originally allocated
+  the whole line even to a run too small to make it, on "show, don't block"
+  grounds. That was wrong: the shortfall was invisible, so a run could be
+  committed to more than it produced and nobody would find out until the goods
+  failed to appear. A link now takes the run's remaining balance and no more,
+  and hands the caller the `remainder` so it can offer another run or raise one
+  for the balance. Do not reinstate the permissive version.
+- **`line.scheduleId` is superseded — read `lineAllocations(line)`.** A line can
+  be filled from several runs, and a single id cannot say how much came from
+  which. The column survives only so existing data migrates (`normalizeData`
+  turns a bare `scheduleId` into one allocation for the line's full requirement)
+  and so the CSV round trip stays stable. Nothing in the app reads it. Adding a
+  second reader would recreate exactly the dual-source-of-truth this avoids.
+- **`releaseSalesOrderLine` raises a run for the UNALLOCATED balance only.**
+  That is what makes "add remainder as a new run" safe. Raising the full line
+  quantity again for a part-covered line would double the plant's commitment.
+- **A cancelled order releases its capacity.** `runCommittedQty` skips cancelled
+  orders, so a withdrawn order stops holding a run booked against nothing.
 - **Ownership split, MRP vs warehouse:** the MRP owns the lot (produced quantity,
   cost, genealogy); the warehouse owns placement (pallet, slot, working quantity
   for picking). Where the two disagree the difference is **shown, not

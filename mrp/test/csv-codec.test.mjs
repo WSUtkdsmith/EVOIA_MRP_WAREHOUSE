@@ -104,8 +104,12 @@ console.log('\n--- SPREADSHEET IMPORT: no ids at all, natural keys only ---');
   // Audit records keyed on a production run. A run has no natural key, and
   // nobody authors a cancellation log in a spreadsheet, so requiring the id
   // here is correct rather than a gap.
+  // Allocations hang off a sales order LINE, and a line has no natural key of
+  // its own - only its parent order does. A run is now referenceable by number,
+  // but that is only half the link, so this stays id-linked like the rest.
+  // Allocating production to an order line is not a spreadsheet job anyway.
   const MACHINE_LINKED = ['schedule_revisions', 'schedule_fulfillment_lots',
-                          'fulfilment_cancellations'];
+                          'fulfilment_cancellations', 'sales_order_run_allocations'];
   bundle.filter(b => MACHINE_LINKED.indexOf(b.table) < 0).forEach(b => {
     const { header, rows } = parseCsvText(b.csv);
     const keep = header.filter(h => !ID_COLS.has(h));

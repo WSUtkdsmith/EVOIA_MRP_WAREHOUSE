@@ -1027,8 +1027,27 @@ const SCHEMA = {
           requestedDate: "date",
           reviewDecision: "enum:Pending|Accept|Reject|Adjust!",
           approvedQty: "num", approvedDate: "date", reviewNote: "str",
-          // the production run raised from this line, once released
+          /* The first run this line was released to.
+
+             SUPERSEDED by the runAllocations child below, and kept only so
+             existing data migrates and the CSV round trip stays stable.
+             Nothing reads it any more: a line can be filled from several
+             runs, and a single id cannot say how much came from which.
+             `normalizeData` turns a bare scheduleId into one allocation.
+             Read `lineAllocations(line)` instead. */
           scheduleId: "str"
+        },
+        children: {
+          /* How much of this line each run is committing to.
+
+             A run has a finite quantity and several order lines can draw on
+             it, so a link without a quantity is a promise nobody counted.
+             This is what stops a run being over-committed: allocations
+             against a run may not exceed what it makes. */
+          runAllocations: {
+            table: "sales_order_run_allocations", fk: "salesOrderLineId", pk: "id",
+            columns: { id: "str", scheduleId: "ref:schedule!", qty: "num!", allocatedDate: "date" }
+          }
         }
       }
     }
@@ -1530,6 +1549,10 @@ const IMPORT_ORDER = [
   "batch_runs",
   "sales_orders", "sales_order_lines", "fulfilment_cancellations",
   "production_schedule", "schedule_revisions",
+  // After BOTH sales_order_lines and production_schedule: an allocation points
+  // at each, so neither may still be missing. This list is hand-maintained and
+  // has bitten us twice.
+  "sales_order_run_allocations",
   "lots", "lot_sources", "lot_actual_equipment", "lot_actual_labor", "lot_qc_checks",
   "purchase_receipts",
   "schedule_fulfillment_lots", "customer_addresses", "customer_price_list",
@@ -2944,17 +2967,23 @@ const tx = {
      The product has to match. Everything else about a run can be argued over,
      but an order for one product filled by a run making another is not a
      linkage, it is a mistake with a reference number. */
-  linkSalesOrderLineToRun(db, { salesOrderId, lineId, scheduleId }) {
+  linkSalesOrderLineToRun(db, { salesOrderId, lineId, scheduleId, qty }) {
     const order = repo.find(db, "salesOrders", salesOrderId);
     if (!order) return { ok: false, error: "That sales order no longer exists." };
     const line = (order.lines || []).find(l => l.id === lineId);
     if (!line) return { ok: false, error: "That line no longer exists." };
-    if (line.scheduleId) return { ok: false, error: "That line is already linked to a run." };
 
     const decision = line.reviewDecision || "Pending";
     if (decision !== "Accept" && decision !== "Adjust") {
       return { ok: false, error: "Only accepted or adjusted lines can be linked to a run." };
     }
+    if (lineUnallocatedQty(line) <= 0.0001) {
+      return { ok: false, error: "That line is already covered in full." };
+    }
+    if (lineRunIds(line).indexOf(scheduleId) !== -1) {
+      return { ok: false, error: "That line is already drawing on that run." };
+    }
+
     const run = repo.find(db, "schedule", scheduleId);
     if (!run) return { ok: false, error: "That run no longer exists." };
     if (run.status === "Cancelled") return { ok: false, error: "That run was cancelled." };
@@ -2962,37 +2991,74 @@ const tx = {
       return { ok: false, error: "That run does not make the product on this line." };
     }
 
-    line.scheduleId = run.id;
+    /* A run makes a finite quantity, and a link is a claim on it. Taking more
+       than is left would commit the plant to production nobody has planned,
+       and - because the shortfall would be invisible - nobody would find out
+       until the goods failed to appear. */
+    const plan = planRunLink(db, line, scheduleId, qty);
+    if (plan.none) {
+      return { ok: false, error: plan.capacity.available <= 0
+        ? "That run is fully committed - its " + fmtNum(plan.capacity.planned) +
+          " is already spoken for."
+        : "There is nothing left of this line to allocate." };
+    }
+
+    line.runAllocations = [...lineAllocations(line), {
+      id: uid(), scheduleId: run.id, qty: plan.qty, allocatedDate: todayStr()
+    }];
+    // Kept in step for anything reading the legacy column, and for the CSV.
+    // Nothing in the app reads it - see the schema note.
+    if (!line.scheduleId) line.scheduleId = run.id;
+
     // One run can legitimately fill several orders, so an existing customer is
     // not overwritten - the run stops belonging to any single one of them.
     if (!run.customerId) run.customerId = order.customerId;
     const label = "Linked to " + order.reference;
-    run.notes = run.notes ? run.notes + " · " + label : label;
+    if (String(run.notes || "").indexOf(label) === -1) {
+      run.notes = run.notes ? run.notes + " · " + label : label;
+    }
 
     const unreleased = (order.lines || []).filter(l => {
       const dec = l.reviewDecision || "Pending";
-      return (dec === "Accept" || dec === "Adjust") && !l.scheduleId;
+      return (dec === "Accept" || dec === "Adjust") && !lineIsReleased(l);
     });
     if (!unreleased.length) order.status = "Released";
-    return { ok: true, run, line, order };
+    /* `remainder` is the whole point of the restriction: the caller is told
+       what is still uncovered so it can offer another run or a new one,
+       rather than the shortfall going quietly unrecorded. */
+    return { ok: true, run, line, order, allocated: plan.qty, remainder: plan.remainder };
   },
 
   /* Undo a link. Only ever the link: a run raised by releasing a line stays
      scheduled, because the plant may well have started it. Deleting it is a
      separate, deliberate act. */
-  unlinkSalesOrderLine(db, { salesOrderId, lineId }) {
+  unlinkSalesOrderLine(db, { salesOrderId, lineId, scheduleId }) {
     const order = repo.find(db, "salesOrders", salesOrderId);
     if (!order) return { ok: false, error: "That sales order no longer exists." };
     const line = (order.lines || []).find(l => l.id === lineId);
     if (!line) return { ok: false, error: "That line no longer exists." };
-    if (!line.scheduleId) return { ok: false, error: "That line is not linked to a run." };
-    const run = repo.find(db, "schedule", line.scheduleId);
-    if (run && run.status === "Complete") {
+
+    const current = lineAllocations(line);
+    if (!current.length) return { ok: false, error: "That line is not linked to a run." };
+
+    // Named run, or all of them. A line can now draw on several, so removing
+    // "the" link is no longer a well-formed request without saying which.
+    const doomed = scheduleId ? current.filter(a => a.scheduleId === scheduleId) : current;
+    if (!doomed.length) return { ok: false, error: "That line is not drawing on that run." };
+
+    const completed = doomed
+      .map(a => repo.find(db, "schedule", a.scheduleId))
+      .filter(r => r && r.status === "Complete");
+    if (completed.length) {
       return { ok: false, error: "That run is already complete - unlinking would lose what filled the order." };
     }
-    line.scheduleId = "";
-    if (order.status === "Released") order.status = "Reviewed";
-    return { ok: true, line, order };
+
+    const keep = current.filter(a => doomed.indexOf(a) === -1);
+    line.runAllocations = keep;
+    line.scheduleId = keep.length ? keep[0].scheduleId : "";
+    if (order.status === "Released" && !lineIsReleased(line)) order.status = "Reviewed";
+    return { ok: true, line, order, removed: doomed.length,
+             released: round3(doomed.reduce((n, a) => n + (Number(a.qty) || 0), 0)) };
   },
 
   reviewSalesOrderLine(db, { salesOrderId, lineId, decision, approvedQty, approvedDate, note }) {
@@ -3001,7 +3067,7 @@ const tx = {
     const line = (order.lines || []).find(l => l.id === lineId);
     if (!line) return { ok: false, error: "That line no longer exists." };
     if (SO_DECISIONS.indexOf(decision) < 0) return { ok: false, error: "Unknown decision." };
-    if (line.scheduleId) {
+    if (lineAllocations(line).length) {
       return { ok: false, error: "That line has already been released to production." };
     }
 
@@ -3034,14 +3100,19 @@ const tx = {
     if (!order) return { ok: false, error: "That sales order no longer exists." };
     const line = (order.lines || []).find(l => l.id === lineId);
     if (!line) return { ok: false, error: "That line no longer exists." };
-    if (line.scheduleId) return { ok: false, error: "Already released." };
-
     const decision = line.reviewDecision || "Pending";
     if (decision !== "Accept" && decision !== "Adjust") {
       return { ok: false, error: "Only accepted or adjusted lines can be released." };
     }
-    const qty = decision === "Adjust" ? Number(line.approvedQty) || 0 : Number(line.qty) || 0;
-    if (!(qty > 0)) return { ok: false, error: "Nothing to make on that line." };
+    /* Only what is not already covered. A line part-filled from an existing
+       run needs a run for the REMAINDER, not a second run for the whole
+       thing - that is the "add remainder as a new run" path, and raising the
+       full quantity again would double the plant's commitment. */
+    const qty = lineUnallocatedQty(line);
+    if (!(qty > 0)) {
+      return { ok: false, error: lineAllocations(line).length
+        ? "That line is already covered in full." : "Nothing to make on that line." };
+    }
 
     const dueDate = line.approvedDate || line.requestedDate || order.requestedDate || todayStr();
     const run = repo.create(db, "schedule", {
@@ -3057,14 +3128,17 @@ const tx = {
       fulfillmentLots: [], revisions: []
     });
 
-    line.scheduleId = run.id;
+    line.runAllocations = [...lineAllocations(line), {
+      id: uid(), scheduleId: run.id, qty, allocatedDate: date || todayStr()
+    }];
+    if (!line.scheduleId) line.scheduleId = run.id;
 
     const unreleased = (order.lines || []).filter(l => {
       const dec = l.reviewDecision || "Pending";
-      return (dec === "Accept" || dec === "Adjust") && !l.scheduleId;
+      return (dec === "Accept" || dec === "Adjust") && !lineIsReleased(l);
     });
     if (!unreleased.length) order.status = "Released";
-    return { ok: true, run, line, order };
+    return { ok: true, run, line, order, allocated: qty };
   },
 
   /* Cancel part or all of a run's held allocation. The goods stay in the lot
@@ -4574,6 +4648,11 @@ function seedData() {
         };
         schedule.push(run);
         line.scheduleId = run.id;
+        // The allocation is what says HOW MUCH of the run this line takes,
+        // and is what everything reads. Seeding only the id would leave the
+        // seeded orders looking unreleased.
+        line.runAllocations = [{ id: uid(), scheduleId: run.id,
+                                 qty: Number(run.qty) || 0, allocatedDate: so.orderDate }];
       });
       so.status = "Released";
     }
@@ -4807,9 +4886,38 @@ function normalizeSalesOrders(list) {
       approvedQty: Number(l.approvedQty) || 0,
       approvedDate: l.approvedDate || "",
       reviewNote: l.reviewNote || "",
-      scheduleId: l.scheduleId || ""
+      scheduleId: l.scheduleId || "",
+      runAllocations: normalizeRunAllocations(l)
     }))
   }));
+}
+
+/* Turn a bare scheduleId into a real allocation.
+
+   Lines written before allocations existed recorded only WHICH run they were
+   released to, never HOW MUCH of it they were taking - which is precisely why
+   a run could be over-committed without anyone noticing. Migrating on load
+   gives every such line one allocation for the whole of what it needs, which
+   is what the old single link actually meant.
+
+   Once allocations are present the scheduleId is ignored: a line filled from
+   two runs cannot be described by one id, and keeping both authoritative
+   would guarantee they eventually disagree. */
+function normalizeRunAllocations(line) {
+  const rows = Array.isArray(line && line.runAllocations) ? line.runAllocations : null;
+  if (rows && rows.length) {
+    return rows.filter(a => a && a.scheduleId).map(a => ({
+      id: a.id || uid(),
+      scheduleId: a.scheduleId,
+      qty: Number(a.qty) || 0,
+      allocatedDate: a.allocatedDate || ""
+    }));
+  }
+  if (rows) return [];                       // explicitly empty stays empty
+  if (!line || !line.scheduleId) return [];
+  const decision = line.reviewDecision || "Pending";
+  const need = decision === "Adjust" ? (Number(line.approvedQty) || 0) : (Number(line.qty) || 0);
+  return [{ id: uid(), scheduleId: line.scheduleId, qty: need, allocatedDate: "" }];
 }
 
 /* Orders loaded from a database that predates them. */
@@ -5603,7 +5711,7 @@ function shipmentAdherenceEvents(data) {
   (data.salesOrders || []).forEach(o => {
     if (!o || o.status === "Cancelled") return;
     (o.lines || []).forEach(l => {
-      if (l && l.scheduleId && !lineByRun[l.scheduleId]) lineByRun[l.scheduleId] = { order: o, line: l };
+      lineRunIds(l).forEach(rid => { if (!lineByRun[rid]) lineByRun[rid] = { order: o, line: l }; });
     });
   });
 
@@ -6732,9 +6840,11 @@ function plannedProductionSplit(data) {
   ((data && data.salesOrders) || []).forEach(o => {
     if (!o || o.status === "Cancelled") return;
     (o.lines || []).forEach(l => {
-      if (!l || !l.scheduleId) return;
-      if (!linked[l.scheduleId]) linked[l.scheduleId] = [];
-      linked[l.scheduleId].push({ orderId: o.id, reference: o.reference || "", lineId: l.id });
+      if (!l) return;
+      lineRunIds(l).forEach(rid => {
+        if (!linked[rid]) linked[rid] = [];
+        linked[rid].push({ orderId: o.id, reference: o.reference || "", lineId: l.id });
+      });
     });
   });
 
@@ -6757,6 +6867,113 @@ function plannedProductionSplit(data) {
     // there is no plan at all: 0% reads as "all spoken for", which is a
     // different statement from "there is nothing scheduled".
     unassignedPct: total > 0 ? Math.round((unassignedQty / total) * 100) : null
+  };
+}
+
+/* ------------------------------------------------------------------
+   Run capacity, and how much of it each order line has taken.
+
+   A production run makes a finite quantity. Several order lines can draw on
+   it, so a link without a quantity is a promise nobody counted - which is how
+   a run ends up committed to more than it makes, with nothing anywhere saying
+   so. Allocations carry the quantity; these work out what is left.
+----------------------------------------------------------------*/
+function lineAllocations(line) {
+  return (line && Array.isArray(line.runAllocations) ? line.runAllocations : [])
+    .filter(a => a && a.scheduleId);
+}
+
+const round3 = (n) => Math.round((Number(n) || 0) * 1000) / 1000;
+
+/* What this line actually needs made: the approved quantity where the plant
+   adjusted it, otherwise what was ordered. */
+function lineRequiredQty(line) {
+  if (!line) return 0;
+  const decision = line.reviewDecision || "Pending";
+  return decision === "Adjust" ? (Number(line.approvedQty) || 0) : (Number(line.qty) || 0);
+}
+
+function lineAllocatedQty(line) {
+  return round3(lineAllocations(line).reduce((n, a) => n + (Number(a.qty) || 0), 0));
+}
+
+/* Still to be found production for. Zero means the line is fully covered;
+   this is what "Released" now means rather than "has a scheduleId". */
+function lineUnallocatedQty(line) {
+  return round3(Math.max(0, lineRequiredQty(line) - lineAllocatedQty(line)));
+}
+
+function lineIsReleased(line) {
+  return lineAllocations(line).length > 0 && lineUnallocatedQty(line) <= 0.0001;
+}
+
+function lineRunIds(line) {
+  const seen = {}, out = [];
+  lineAllocations(line).forEach(a => {
+    if (!seen[a.scheduleId]) { seen[a.scheduleId] = true; out.push(a.scheduleId); }
+  });
+  return out;
+}
+
+/* How much of a run is already spoken for, across every order line.
+
+   Cancelled orders are excluded: a withdrawn order is not a commitment, and
+   leaving its allocation in place would keep capacity locked up against
+   nothing. */
+function runCommittedQty(data, scheduleId, ignoreLineId) {
+  let n = 0;
+  ((data && data.salesOrders) || []).forEach(o => {
+    if (!o || o.status === "Cancelled") return;
+    (o.lines || []).forEach(l => {
+      if (!l || (ignoreLineId && l.id === ignoreLineId)) return;
+      lineAllocations(l).forEach(a => {
+        if (a.scheduleId === scheduleId) n += Number(a.qty) || 0;
+      });
+    });
+  });
+  return round3(n);
+}
+
+/* What is left of a run to promise anyone.
+
+   Never negative: an already over-committed run - which existing data can
+   contain, since nothing used to prevent it - reports zero available rather
+   than a negative balance that would read as spare capacity if it were ever
+   added up. `overCommitted` says so plainly instead. */
+function runCapacity(data, scheduleId, ignoreLineId) {
+  const run = ((data && data.schedule) || []).find(s => s && s.id === scheduleId) || null;
+  const planned = round3(run ? run.qty : 0);
+  const committed = runCommittedQty(data, scheduleId, ignoreLineId);
+  return {
+    run, planned, committed,
+    available: round3(Math.max(0, planned - committed)),
+    overCommitted: committed > planned + 0.0001,
+    overBy: committed > planned ? round3(committed - planned) : 0
+  };
+}
+
+/* What a link would do, worked out before anything is written.
+
+   The caller needs three things to put a sensible prompt on screen: how much
+   this run can take, how much of the line that leaves, and whether the answer
+   is "nothing" - and it needs them without having to attempt the write first. */
+function planRunLink(data, line, scheduleId, requestedQty) {
+  const cap = runCapacity(data, scheduleId, null);
+  const outstanding = lineUnallocatedQty(line);
+  const asked = requestedQty == null || requestedQty === ""
+    ? outstanding : round3(Math.max(0, Number(requestedQty) || 0));
+  const canTake = round3(Math.min(asked, outstanding, cap.available));
+  return {
+    capacity: cap,
+    outstanding,
+    asked,
+    // What the link will actually allocate - the run's balance, never more.
+    qty: canTake,
+    // What is still unaccounted for afterwards. Non-zero is the case that
+    // needs a decision rather than a silent shortfall.
+    remainder: round3(outstanding - canTake),
+    full: canTake > 0 && round3(outstanding - canTake) <= 0.0001,
+    none: canTake <= 0.0001
   };
 }
 
@@ -6838,7 +7055,7 @@ function ordersForRun(data, runId) {
   ((data && data.salesOrders) || []).forEach(o => {
     if (!o || o.status === "Cancelled") return;
     (o.lines || []).forEach(l => {
-      if (l && l.scheduleId === runId) {
+      if (l && lineRunIds(l).indexOf(runId) !== -1) {
         out.push({ order: o, line: l, reference: o.reference || "" });
       }
     });
@@ -7651,8 +7868,15 @@ function salesOrderLineDetail(data, order, line) {
     approvedDate,
     adjusted: decision === "Adjust" && (approvedQty !== qty ||
       (line.approvedDate && line.approvedDate !== (line.requestedDate || order.requestedDate))),
-    released: !!line.scheduleId,
-    scheduleId: line.scheduleId || "",
+    released: lineIsReleased(line),
+    // Several runs can fill one line now, so the singular id is the first of
+    // them and the full picture is in allocations.
+    scheduleId: (lineRunIds(line)[0] || ""),
+    runIds: lineRunIds(line),
+    allocations: lineAllocations(line),
+    allocatedQty: lineAllocatedQty(line),
+    unallocatedQty: lineUnallocatedQty(line),
+    requiredQty: lineRequiredQty(line),
     unitCost,
     // Margin at the conceded price, which is the number worth arguing about.
     marginPerUnit: netPrice === null ? null : netPrice - unitCost,
@@ -12903,10 +13127,12 @@ function SalesOrderModal({ data, orderId, onClose, update }) {
     if (outcome && !outcome.ok) setError(outcome.error);
   };
 
-  const linkedRun = (l) => l.line.scheduleId
-    ? (data.schedule || []).find(r => r.id === l.line.scheduleId) || null : null;
+  // A line can now draw on several runs, so this is all of them.
+  const linkedRuns = (l) => lineRunIds(l.line)
+    .map(id => (data.schedule || []).find(r => r.id === id)).filter(Boolean);
   const linkable = (l) => linkableRunsForLine(data, l.line.finishedGoodId)
-    .filter(r => r.id !== l.line.scheduleId);
+    .filter(r => lineRunIds(l.line).indexOf(r.id) === -1)
+    .filter(r => runCapacity(data, r.id, null).available > 0.0001);
 
   const unlink = (l) => {
     setError("");
@@ -13029,11 +13255,11 @@ function SalesOrderModal({ data, orderId, onClose, update }) {
                   <Badge tone="good">Released to production</Badge>
                   {/* Which run is filling this line, by the number the floor
                       uses - traceability from SO-xxxxx to RUN-xxxxx. */}
-                  {linkedRun(l) && (
-                    <span className="mono" style={{ fontSize: 12, fontWeight: 700 }}>
-                      {linkedRun(l).reference || "\u2014"}
+                  {linkedRuns(l).map(r => (
+                    <span key={r.id} className="mono" style={{ fontSize: 12, fontWeight: 700 }}>
+                      {r.reference || "\u2014"}
                     </span>
-                  )}
+                  ))}
                   <span style={{ fontSize: 12, color: "#5B6470" }}>
                     {fmtNum(l.approvedQty)} {l.unit} due {fmtDate(l.approvedDate)}
                   </span>
@@ -13042,6 +13268,25 @@ function SalesOrderModal({ data, orderId, onClose, update }) {
                 </>
               ) : (
                 <>
+                  {/* Partly covered: allocations exist but do not add up to
+                      what the line needs. Reading as plain "unreleased" would
+                      hide the production already committed to it. */}
+                  {l.allocatedQty > 0 && (
+                    <>
+                      <Badge tone="warn">Part released</Badge>
+                      {linkedRuns(l).map(r => (
+                        <span key={r.id} className="mono" style={{ fontSize: 12, fontWeight: 700 }}>
+                          {r.reference || "\u2014"}
+                        </span>
+                      ))}
+                      <span style={{ fontSize: 12, color: "#7A5205", fontWeight: 600 }}>
+                        {fmtNum(l.allocatedQty)} of {fmtNum(l.requiredQty)} allocated ·
+                        {" "}{fmtNum(l.unallocatedQty)} {l.unit} still uncovered
+                      </span>
+                      <Btn variant="ghost" onClick={() => unlink(l)}
+                           style={{ padding: "3px 9px", fontSize: 11.5 }}>Unlink all</Btn>
+                    </>
+                  )}
                   <span style={{ fontSize: 12, color: "#7A8079" }}>Add to schedule:</span>
                   <div role="button" tabIndex={0} onClick={() => decide(l, "Accept")}
                     onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); decide(l, "Accept"); } }}
@@ -13056,7 +13301,7 @@ function SalesOrderModal({ data, orderId, onClose, update }) {
                     <>
                       <Btn variant="secondary" onClick={() => release(l)}
                            style={{ padding: "3px 10px", fontSize: 11.5 }}>
-                        Release to schedule
+                        {l.allocatedQty > 0 ? "Raise a run for the remainder" : "Release to schedule"}
                       </Btn>
                       {/* Releasing raises a NEW run. When one is already
                           planned - forecast production, a campaign, something
@@ -13145,60 +13390,144 @@ function SalesOrderModal({ data, orderId, onClose, update }) {
    and refusing the link would only push the planner into inventing a duplicate
    run. Shown, not blocked - the same rule over-placement follows. */
 function LinkRunModal({ data, orderId, detail, runs, update, onClose, onError }) {
-  const need = detail.decision === "Adjust"
-    ? (Number(detail.line.approvedQty) || 0) : (Number(detail.qty) || 0);
+  const line = detail.line;
+  const outstanding = lineUnallocatedQty(line);
   const [chosen, setChosen] = useState(runs[0] ? runs[0].id : "");
   const [err, setErr] = useState("");
+  // What the last link left uncovered. Non-null puts the two follow-on
+  // choices on screen rather than letting a shortfall pass unnoticed.
+  const [shortfall, setShortfall] = useState(null);
+
+  const plan = chosen ? planRunLink(data, line, chosen, null) : null;
 
   const link = () => {
     let outcome = null;
     update(d => {
       outcome = tx.linkSalesOrderLineToRun(d, {
-        salesOrderId: orderId, lineId: detail.line.id, scheduleId: chosen });
+        salesOrderId: orderId, lineId: line.id, scheduleId: chosen });
+    });
+    if (!outcome || !outcome.ok) {
+      setErr((outcome && outcome.error) || "Could not link that run.");
+      return;
+    }
+    onError && onError("");
+    if (outcome.remainder > 0.0001) {
+      // Covered in part. The remainder is a decision, not a footnote.
+      setShortfall({ allocated: outcome.allocated, remainder: outcome.remainder });
+      setChosen("");
+    } else {
+      onClose();
+    }
+  };
+
+  /* "Add remainder as a new run" - releaseSalesOrderLine now raises a run for
+     the UNALLOCATED balance only, so this cannot double the commitment. */
+  const releaseRemainder = () => {
+    let outcome = null;
+    update(d => {
+      outcome = tx.releaseSalesOrderLine(d, { salesOrderId: orderId, lineId: line.id });
     });
     if (outcome && outcome.ok) { onError && onError(""); onClose(); }
-    else setErr((outcome && outcome.error) || "Could not link that run.");
+    else setErr((outcome && outcome.error) || "Could not raise a run for the remainder.");
   };
+
+  const remaining = runs.filter(r => lineRunIds(line).indexOf(r.id) === -1);
+
+  if (shortfall) {
+    const stillShort = lineUnallocatedQty(line);
+    return (
+      <Modal title={"Part of " + detail.productName + " is still uncovered"} onClose={onClose}>
+        <div style={{ background: "#F1F6F2", border: "1px solid #CFE0D3", borderRadius: 8,
+                      padding: "10px 12px", marginBottom: 12, fontSize: 12.5 }}>
+          Allocated <b>{fmtNum(shortfall.allocated)} {detail.unit}</b> — all that run had left.
+          <div style={{ marginTop: 4, color: "#7A5205", fontWeight: 600 }}>
+            {fmtNum(stillShort)} {detail.unit} of this line still has no production behind it.
+          </div>
+        </div>
+        <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 12 }}>
+          A run makes a finite quantity, so a link can only ever take what is left of it. The rest has to
+          come from somewhere — pick another planned run, or raise a new one for exactly the balance.
+        </div>
+        {err && <div style={{ fontSize: 12, color: "#8A2E20", marginBottom: 8, fontWeight: 600 }}>{err}</div>}
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, flexWrap: "wrap" }}>
+          <Btn variant="secondary" onClick={onClose}>Leave it uncovered</Btn>
+          {remaining.length > 0 && (
+            <Btn variant="secondary" onClick={() => { setShortfall(null); setChosen(remaining[0].id); }}>
+              Link additional runs ({remaining.length})
+            </Btn>
+          )}
+          <Btn onClick={releaseRemainder}>Add remainder as new run</Btn>
+        </div>
+      </Modal>
+    );
+  }
 
   return (
     <Modal title={"Link " + detail.productName + " to an existing run"} onClose={onClose}>
       <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 12 }}>
-        This line needs <b>{fmtNum(need)} {detail.unit}</b>. Releasing would raise a new run; linking
-        points the line at production that is already planned, so the plant does not end up making the
-        same goods twice.
+        This line still needs <b>{fmtNum(outstanding)} {detail.unit}</b>
+        {lineAllocatedQty(line) > 0 &&
+          <> — {fmtNum(lineAllocatedQty(line))} of {fmtNum(lineRequiredQty(line))} is already allocated</>}.
+        {" "}A link takes only what the run has left, so the plant is never committed to more than it planned.
       </div>
-      {runs.length === 0 && (
+      {remaining.length === 0 && (
         <div style={{ fontSize: 12.5, color: "#B87510" }}>
-          No open run makes this product. Release the line instead — it will raise one.
+          No other open run makes this product. Release the line instead — it will raise one for the balance.
         </div>
       )}
-      {runs.map(r => {
+      {remaining.map(r => {
+        const cap = runCapacity(data, r.id, null);
+        const takes = Math.min(outstanding, cap.available);
         const taken = ordersForRun(data, r.id);
-        const short = (Number(r.qty) || 0) < need;
+        const full = cap.available <= 0.0001;
         return (
-          <label key={r.id} style={{ display: "flex", gap: 10, alignItems: "flex-start", cursor: "pointer",
+          <label key={r.id} style={{ display: "flex", gap: 10, alignItems: "flex-start",
+                                     cursor: full ? "not-allowed" : "pointer",
+                                     opacity: full ? 0.55 : 1,
                                      padding: "8px 10px", marginBottom: 6, borderRadius: 8,
                                      background: chosen === r.id ? "#F1F6F2" : "#fff",
                                      border: "1px solid " + (chosen === r.id ? "#CFE0D3" : "#E7E9E4") }}>
-            <input type="radio" name="run" checked={chosen === r.id} onChange={() => setChosen(r.id)}
-              style={{ marginTop: 3 }} />
+            <input type="radio" name="run" checked={chosen === r.id} disabled={full}
+              onChange={() => setChosen(r.id)} style={{ marginTop: 3 }} />
             <span style={{ flex: 1 }}>
               <span style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                 <span className="mono" style={{ fontWeight: 700, fontSize: 13 }}>{r.reference || "\u2014"}</span>
                 <Badge tone={r.status === "In progress" ? "info" : "neutral"}>{r.status}</Badge>
-                <span className="mono" style={{ fontSize: 12.5 }}>{fmtNum(r.qty)}</span>
                 <span style={{ fontSize: 12, color: "#8A9099" }}>due {fmtDate(r.dueDate)}</span>
                 {r.frozen && <Badge tone="info">Frozen</Badge>}
               </span>
-              {short && (
+              {/* The balance is the whole point: makes X, Y already spoken
+                  for, Z left to promise anyone. */}
+              <span style={{ display: "block", fontSize: 11.5, color: "#5B6470", marginTop: 2 }}>
+                Makes <span className="mono">{fmtNum(cap.planned)}</span>
+                {cap.committed > 0 && <> · <span className="mono">{fmtNum(cap.committed)}</span> already allocated</>}
+                {" · "}
+                <b className="mono" style={{ color: full ? "#8A2E20" : "#1F5B3E" }}>
+                  {fmtNum(cap.available)} available
+                </b>
+              </span>
+              {full ? (
+                <span style={{ display: "block", fontSize: 11.5, color: "#8A2E20", marginTop: 2 }}>
+                  Fully committed — nothing left to allocate.
+                </span>
+              ) : takes < outstanding ? (
                 <span style={{ display: "block", fontSize: 11.5, color: "#B87510", marginTop: 2 }}>
-                  Makes {fmtNum(r.qty)}, this line needs {fmtNum(need)} — the shortfall has to come from
-                  stock or another run.
+                  Would cover {fmtNum(takes)} of {fmtNum(outstanding)} — {fmtNum(outstanding - takes)} would
+                  still need a run.
+                </span>
+              ) : (
+                <span style={{ display: "block", fontSize: 11.5, color: "#2E7D5B", marginTop: 2 }}>
+                  Covers this line in full.
+                </span>
+              )}
+              {cap.overCommitted && (
+                <span style={{ display: "block", fontSize: 11.5, color: "#8A2E20", marginTop: 2 }}>
+                  Already over-committed by {fmtNum(cap.overBy)} — from before allocations were counted.
                 </span>
               )}
               {taken.length > 0 && (
                 <span style={{ display: "block", fontSize: 11.5, color: "#8A9099", marginTop: 2 }}>
-                  Already filling {taken.map(t => t.reference).join(", ")}
+                  Filling {taken.map(t => t.reference).join(", ")}
                 </span>
               )}
             </span>
@@ -13208,7 +13537,9 @@ function LinkRunModal({ data, orderId, detail, runs, update, onClose, onError })
       {err && <div style={{ fontSize: 12, color: "#8A2E20", marginTop: 8, fontWeight: 600 }}>{err}</div>}
       <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
         <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
-        <Btn onClick={link} style={{ opacity: chosen ? 1 : 0.5 }}>Link run</Btn>
+        <Btn onClick={link} style={{ opacity: plan && !plan.none ? 1 : 0.5 }}>
+          {plan && !plan.none ? "Link " + fmtNum(plan.qty) + " " + detail.unit : "Link run"}
+        </Btn>
       </div>
     </Modal>
   );

@@ -1270,7 +1270,14 @@ console.log('\n--- linking an order to production that already exists ---');
   ok('the run picker renders', !pick.err, pick.err);
   const ph = (pick.html || '').replace(/<!-- -->/g, '');
   ok('runs are offered by number', ph.includes('RUN-00042'));
-  ok('and it says why linking beats releasing', ph.includes('making the same goods twice'));
+  // A run makes a finite quantity, and a link is a claim on it.
+  ok('each run shows what it makes and what is left of it',
+     ph.includes('Makes') && ph.includes('available'));
+  ok('and whether it covers the line', ph.includes('Covers this line in full') ||
+     ph.includes('would still need a run'));
+  ok('the link button says how much it will take',
+     /Link [\d,.]+ /.test(ph), ph.slice(0, 0));
+  ok('and the rule is stated', ph.includes('takes only what the run has left'));
 }
 
 console.log('\n--- the run list reads on its own ---');
