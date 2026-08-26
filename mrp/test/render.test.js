@@ -1435,6 +1435,18 @@ console.log('\n--- the dashboard revisions ---');
      h.includes('several units of measure in one bar'));
   ok('every raw material is offered', h.includes('Green coffee') || h.includes('Sachet'));
 
+  // The four figures beside the chart, and the fact that two are period
+  // figures and two are as-of-now.
+  ok('ordered in the period is shown', h.includes('>Ordered<'));
+  ok('consumed in the period too', h.includes('>Consumed<'));
+  ok('current inventory', h.includes('Current inventory'));
+  ok('and, across everything, a count below reorder point rather than a summed one',
+     h.includes('Below reorder point'));
+  ok('period figures are labelled as such', h.includes('Last 13 weeks'));
+  ok('and as-of-now figures as such', h.includes('>now<'));
+  ok('the mixed-unit caveat reaches the figures too',
+     h.includes('mix units of measure across materials'));
+
   // Valuation.
   ok('raw material on hand is valued', h.includes('Raw material on hand'));
   ok('intermediates too', h.includes('Intermediate products'));

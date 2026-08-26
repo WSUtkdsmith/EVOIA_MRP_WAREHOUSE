@@ -5516,6 +5516,65 @@ function orderCompletionEvents(data) {
     .map(s => ({ date: s.completedDate, series: "orders", value: 1, qty: Number(s.qty) || 0, entry: s }));
 }
 
+/* The four figures that go beside the raw material flow chart.
+
+   Ordered and consumed are period figures, stock and reorder point are
+   as-of-now - they answer different questions and are labelled accordingly.
+   Ordered is deliberately NOT the same as the chart's received series: an
+   order raised is a commitment, an order received is stock, and the gap
+   between them is often the thing worth noticing.
+
+   `mixedUnits` is the honest part. Asked about every raw material at once,
+   the sums add kilogrammes to metres to litres, and the reorder point is not
+   even a sum - one material being below its point tells you nothing about the
+   total. Scoped to one material, all four are real numbers with a unit on
+   them. The caller is told which case it is in rather than left to guess. */
+function rawFlowSummary(data, rawMaterialId, range) {
+  // The event helpers below reach straight into collections, so a null here
+  // has to be turned into an empty dataset rather than passed on.
+  const db = data && typeof data === "object" ? data : {};
+  const from = (range && range.from) || "", to = (range && range.to) || "";
+  const inRange = (d) => (!from || d >= from) && (!to || d <= to);
+
+  const materials = (db.rawMaterials || [])
+    .filter(r => r && (!rawMaterialId || r.id === rawMaterialId));
+  const scoped = rawMaterialId ? (materials[0] || null) : null;
+
+  const ordered = purchaseOrderedEvents(db, rawMaterialId || undefined)
+    .filter(e => inRange(e.date))
+    .reduce((n, e) => n + (Number(e.value) || 0), 0);
+
+  const consumed = consumptionEvents(db)
+    .filter(e => e.series === "raw")
+    .filter(e => !rawMaterialId || e.itemId === rawMaterialId)
+    .filter(e => inRange(e.date))
+    .reduce((n, e) => n + (Number(e.value) || 0), 0);
+
+  const onHand = materials.reduce((n, r) => n + rawStockOnHand(r), 0);
+  // Only meaningful for a single material. Summing reorder points across
+  // materials produces a number that cannot be compared with anything.
+  const reorderPoint = scoped ? (Number(scoped.reorderPoint) || 0) : null;
+
+  const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+  return {
+    material: scoped,
+    unit: scoped ? (scoped.unit || "") : "",
+    mixedUnits: !rawMaterialId && new Set(materials.map(r => r.unit).filter(Boolean)).size > 1,
+    materials: materials.length,
+    ordered: r2(ordered),
+    consumed: r2(consumed),
+    onHand: r2(onHand),
+    reorderPoint,
+    // Below its reorder point is the whole reason anyone looks at these two
+    // side by side.
+    belowReorder: scoped ? onHand <= (Number(scoped.reorderPoint) || 0) : null,
+    // How many are short, when looking at everything at once - the only
+    // aggregate that survives mixed units, because it is a count.
+    belowReorderCount: rawMaterialId ? null
+      : materials.filter(r => rawStockOnHand(r) <= (Number(r.reorderPoint) || 0)).length
+  };
+}
+
 /* Did the goods reach the customer by the date we promised?
 
    A different question from whether the RUN hit its date, and the one the
@@ -10319,6 +10378,81 @@ function ConsumeLotModal({ data, itemType, itemId, lot, onClose, update, onLocal
 /* ---------------------------------------------------------------
    Dashboard
 ----------------------------------------------------------------*/
+/* Ordered, consumed, on hand and reorder point, beside the flow chart.
+
+   Two of these are period figures and two are as-of-now, which is exactly the
+   sort of thing that gets misread if the labels do not say so - hence the
+   "in period" and "now" tags rather than four bare numbers.
+
+   Ordered is what was committed to on purchase orders, NOT what arrived. The
+   chart already draws received; ordered against received is the gap worth
+   noticing, so conflating them would lose the point.
+
+   Across every material the sums add kilogrammes to metres to litres, and a
+   summed reorder point is not even arithmetic - one material being short says
+   nothing about a total. So in that mode the figures are shown with the unit
+   problem stated, and the reorder point is replaced by the one aggregate that
+   survives: a count of how many materials are below theirs. */
+function RawFlowFigures({ summary, rangeLabel }) {
+  const u = summary.unit ? " " + summary.unit : "";
+  const row = (label, value, when, tone) => (
+    <div key={label} style={{ padding: "8px 0", borderBottom: "1px solid #F1F2EE" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 6 }}>
+        <span style={{ fontSize: 11, color: "#7A8079", fontWeight: 600 }}>{label}</span>
+        <span style={{ fontSize: 9.5, color: "#A6ABA2", textTransform: "uppercase", letterSpacing: 0.3 }}>{when}</span>
+      </div>
+      <div className="mono" style={{ fontSize: 16, fontWeight: 700,
+                                     color: tone === "bad" ? "#8A2E20" : tone === "good" ? "#1F5B3E" : "#20262B" }}>
+        {value}
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{ background: "#fff", border: "1px solid #E2E4DD", borderRadius: 10,
+                  padding: "10px 14px", marginBottom: 14 }}>
+      <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 2 }}>
+        {summary.material ? summary.material.name : "All raw materials"}
+      </div>
+      <div style={{ fontSize: 10.5, color: "#8A9099", marginBottom: 4 }}>
+        {summary.material
+          ? (summary.material.sku || "") + (summary.unit ? " · " + summary.unit : "")
+          : summary.materials + " material(s)"}
+      </div>
+
+      {row("Ordered", fmtNum(summary.ordered) + u, rangeLabel)}
+      {row("Consumed", fmtNum(summary.consumed) + u, rangeLabel)}
+      {row("Current inventory", fmtNum(summary.onHand) + u, "now",
+           summary.belowReorder ? "bad" : undefined)}
+
+      {summary.reorderPoint != null
+        ? row("Reorder point", fmtNum(summary.reorderPoint) + u, "now",
+              summary.belowReorder ? "bad" : "good")
+        : row("Below reorder point", summary.belowReorderCount + " of " + summary.materials, "now",
+              summary.belowReorderCount > 0 ? "bad" : "good")}
+
+      {summary.belowReorder && (
+        <div style={{ fontSize: 11, color: "#8A2E20", fontWeight: 600, marginTop: 8 }}>
+          At or below its reorder point.
+        </div>
+      )}
+      {summary.mixedUnits && (
+        /* Four numbers with no unit on them would read as comparable. They
+           are not: this is kilogrammes plus metres plus litres. */
+        <div style={{ fontSize: 10.5, color: "#7A5205", marginTop: 8, lineHeight: 1.45 }}>
+          Ordered, consumed and inventory mix units of measure across materials. Pick one material for
+          figures with a unit on them.
+        </div>
+      )}
+      {!summary.material && !summary.mixedUnits && (
+        <div style={{ fontSize: 10.5, color: "#8A9099", marginTop: 8, lineHeight: 1.45 }}>
+          Totalled across every raw material.
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* What the stock is worth, now and over time.
 
    The current figure is computed; the history is not. A valuation recomputed
@@ -10627,6 +10761,9 @@ function Dashboard({ data, setTab, onEditTargets, update }) {
     { key: "raw", label: rawScope ? "Received (" + (rawScope.unit || "units") + ")" : "Raw material received", color: "#5FA8A0" },
     { key: "consumed", label: rawScope ? "Consumed (" + (rawScope.unit || "units") + ")" : "Raw material consumed", color: "#C08A3E" }
   ], [rawScope]);
+
+  const rawFlow = useMemo(() => rawFlowSummary(data, rawScopeId, tr.range),
+    [data, rawScopeId, tr.range]);
 
   const flowRows = useMemo(() => {
     const received = receiptEvents(data)
@@ -10956,6 +11093,10 @@ function Dashboard({ data, setTab, onEditTargets, update }) {
           </div>
         } />
 
+      {/* The chart and its figures side by side: the shape on the left, the
+          numbers anyone would reach for next on the right. */}
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(0, 1fr) 230px", gap: 14,
+                    alignItems: "start" }}>
       <ChartCard
         title="Raw material flow"
         subtitle={rawScope
@@ -10981,6 +11122,10 @@ function Dashboard({ data, setTab, onEditTargets, update }) {
             and litres added together. Useful as a shape; pick a material for a figure you can act on.
           </div>
         ) : null} />
+
+      <RawFlowFigures summary={rawFlow}
+        rangeLabel={(RANGE_PRESETS.find(p => p.key === tr.preset) || {}).label || "selected period"} />
+      </div>
     </div>
   );
 }

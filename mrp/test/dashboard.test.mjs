@@ -14,7 +14,8 @@
 //     last month — a figure recomputed today can only answer "now".
 
 import { seedData, tx, repo, shipmentAdherenceEvents, inventoryValuation,
-         receiptEvents, consumptionEvents, normalizeData } from '/tmp/core.mjs';
+         receiptEvents, consumptionEvents, rawFlowSummary,
+         normalizeData } from '/tmp/core.mjs';
 
 let pass = 0, fail = 0;
 const ok = (n, c, x) => { if (c) { pass++; console.log('  PASS  ' + n); }
@@ -137,6 +138,90 @@ console.log('\n--- raw material flow, one material at a time ---');
   const units = new Set((D.rawMaterials || []).map(r => r.unit).filter(Boolean));
   ok('the raw materials really do span several units of measure', units.size > 1,
      'units present: ' + [...units].join(', '));
+}
+
+console.log('\n--- the figures beside the flow chart ---');
+{
+  const D = seedData();
+  const raw = D.rawMaterials[0];
+  const wide = { from: '2000-01-01', to: '2099-12-31' };
+  const one = rawFlowSummary(D, raw.id, wide);
+
+  ok('it names the material it is about', one.material && one.material.id === raw.id);
+  ok('and carries its unit, so the figures mean something', one.unit === raw.unit);
+  ok('ordered is a real quantity', one.ordered > 0);
+  ok('consumed too', one.consumed > 0);
+  ok('current inventory matches the lots on hand',
+     Math.abs(one.onHand - (raw.lots || []).reduce((n, l) => n + (Number(l.qty) || 0), 0)) < 0.01);
+  ok('and the reorder point is the one set on the material',
+     one.reorderPoint === (Number(raw.reorderPoint) || 0));
+  ok('with a plain answer on whether it is short',
+     one.belowReorder === (one.onHand <= one.reorderPoint));
+
+  // Ordered is a commitment, received is stock. Conflating them would lose
+  // the gap, which is usually the interesting part.
+  const received = receiptEvents(D).filter(e => e.itemId === raw.id)
+    .reduce((n, e) => n + (Number(e.value) || 0), 0);
+  ok('ordered is not simply the received figure under another name',
+     one.ordered !== received, 'ordered=' + one.ordered + ' received=' + received);
+
+  // Period figures really are bounded by the period.
+  const narrow = rawFlowSummary(D, raw.id, { from: '2099-01-01', to: '2099-12-31' });
+  ok('nothing was ordered in an empty window', narrow.ordered === 0);
+  ok('nor consumed', narrow.consumed === 0);
+  ok('but the stock on hand is as of now, not of the window', narrow.onHand === one.onHand);
+  ok('and so is the reorder point', narrow.reorderPoint === one.reorderPoint);
+
+  // A cancelled order was never a commitment.
+  const D2 = seedData();
+  const before = rawFlowSummary(D2, D2.rawMaterials[0].id, wide).ordered;
+  (D2.purchaseOrders || []).forEach(po => { po.status = 'Cancelled'; });
+  ok('a cancelled purchase order stops counting as ordered',
+     rawFlowSummary(D2, D2.rawMaterials[0].id, wide).ordered < before);
+}
+
+// Across every material the sums add kilogrammes to metres to litres, and a
+// summed reorder point is not even arithmetic.
+{
+  const D = seedData();
+  const wide = { from: '2000-01-01', to: '2099-12-31' };
+  const all = rawFlowSummary(D, '', wide);
+
+  ok('asked about everything, it says so', all.material === null);
+  ok('and counts the materials it covered', all.materials === (D.rawMaterials || []).length);
+  ok('the mixed units are flagged rather than left to be noticed', all.mixedUnits === true);
+  ok('no unit is claimed for the totals', all.unit === '');
+
+  ok('there is no summed reorder point', all.reorderPoint === null,
+     'one material being short says nothing about a total');
+  ok('a count of materials below their point is offered instead',
+     typeof all.belowReorderCount === 'number');
+  ok('which is a count, so it survives the mixed units',
+     all.belowReorderCount === (D.rawMaterials || [])
+       .filter(r => (r.lots || []).reduce((n, l) => n + (Number(l.qty) || 0), 0) <= (Number(r.reorderPoint) || 0)).length);
+
+  ok('and per material there is no such count — the point itself is the answer',
+     rawFlowSummary(D, D.rawMaterials[0].id, wide).belowReorderCount === null);
+
+  const summed = (D.rawMaterials || []).reduce(
+    (n, r) => n + (r.lots || []).reduce((m, l) => m + (Number(l.qty) || 0), 0), 0);
+  ok('the totals really are totals', Math.abs(all.onHand - summed) < 0.02);
+}
+
+// Robustness.
+{
+  const wide = { from: '2000-01-01', to: '2099-12-31' };
+  ok('null data does not throw', rawFlowSummary(null, '', wide).onHand === 0);
+  ok('empty data yields zeroes', rawFlowSummary({}, '', wide).ordered === 0);
+  ok('an unknown material yields zeroes, not everything',
+     rawFlowSummary(seedData(), 'nope', wide).onHand === 0);
+  ok('and reports no material rather than pretending', rawFlowSummary(seedData(), 'nope', wide).material === null);
+  ok('no range means no bound rather than no data',
+     rawFlowSummary(seedData(), '', {}).consumed > 0);
+  // A single-unit catalogue is not mixed, so it should not be warned about.
+  ok('one unit of measure across everything is not flagged as mixed',
+     rawFlowSummary({ rawMaterials: [{ id: 'a', unit: 'kg', lots: [] }, { id: 'b', unit: 'kg', lots: [] }] },
+       '', wide).mixedUnits === false);
 }
 
 console.log('\n--- what the stock is worth ---');
