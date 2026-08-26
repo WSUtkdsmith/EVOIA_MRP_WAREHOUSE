@@ -1362,6 +1362,53 @@ console.log('\n--- volume tiers say what their columns are ---');
      h.includes('Units (min qty)') && h.includes('Price per unit') && h.includes('Gross margin'));
 }
 
+console.log('\n--- product families roll up along whichever axis is picked ---');
+{
+  const D8 = A.seedData();
+  const tab = tryRender('fam1', React.createElement(A.FamilySalesTab, {
+    data: D8, onManage: noop }));
+  ok('the family sales tab renders', !tab.err, tab.err);
+  const h = (tab.html || '').replace(/<!-- -->/g, '');
+  ok('the axes are offered as groupings',
+     h.includes('Blend') && h.includes('Form') && h.includes('Pack'));
+  ok('every family is offered as a filter',
+     h.includes('Premium Reserve') && h.includes('Foodservice') && h.includes('Dry powder'));
+  ok('the faceted rule is stated rather than left to be discovered',
+     h.includes('same axis widens, different axes narrow'));
+  ok('revenue leads, because it is the only measure that adds up everywhere',
+     h.includes('revenue'));
+
+  // The arithmetic the report refuses to do, said out loud.
+  ok('it says why units are never summed across formats',
+     h.includes('never added across formats'));
+  ok('naming the case that makes it obvious', h.includes('500g pouch'));
+
+  const manage = tryRender('fam2', React.createElement(A.ProductFamiliesModal, {
+    data: D8, update: noop, onClose: noop }));
+  ok('the family manager renders', !manage.err, manage.err);
+  const mh = (manage.html || '').replace(/<!-- -->/g, '');
+  ok('it explains what the axis is for', mh.includes('two tags on the same') ||
+     mh.includes('same axis widen') || mh.includes('axis'));
+  ok('and shows how many products each family holds', mh.includes('product(s)'));
+
+  const tags = tryRender('fam3', React.createElement(A.FamilyTagsField, {
+    data: D8, value: [], onChange: noop }));
+  ok('the tag picker renders', !tags.err, tags.err);
+  const th2 = (tags.html || '').replace(/<!-- -->/g, '');
+  ok('grouped by axis, so tagging two blends is a decision not a slip',
+     th2.includes('Blend') && th2.includes('Form'));
+  ok('and it says a product can be in several at once', th2.includes('several at once'));
+
+  // Net content is what makes a cross-format total mean anything.
+  const fgModal = tryRender('fam4', React.createElement(A.FinishedGoodModal, {
+    data: D8, id: D8.finishedGoods[0].id, onClose: noop, update: noop }));
+  ok('the finished good form renders', !fgModal.err, fgModal.err);
+  const fh = (fgModal.html || '').replace(/<!-- -->/g, '');
+  ok('it asks for net content per unit', fh.includes('Net content per unit'));
+  ok('and the unit it is measured in', fh.includes('Net content unit'));
+  ok('and carries the family tags', fh.includes('Product families'));
+}
+
 console.log('\n============================');
 console.log('  ' + pass + ' passed, ' + fail + ' failed');
 console.log('============================\n');

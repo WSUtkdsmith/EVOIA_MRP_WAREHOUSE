@@ -103,6 +103,25 @@ through the phase notes below and easy to lose.
   on that run is four labour-hours. `runHoursForBatch` derives both from one
   elapsed time and the run's operator count. Typing both by hand is exactly where
   that distinction used to get lost.
+- **Product family totals never sum units, and never sum across units of
+  measure.** Every format carries `unit: "ea"`, but an "ea" is a 50g sachet
+  pack or a 500g pouch, so a summed unit count across formats is a number that
+  means nothing — `familySalesRollup` returns units **per product only**, with
+  no group total. Quantities roll up by **net content**, and `netByUnit` is a
+  map keyed by unit rather than a single figure, because the moment a liquid
+  line exists a "Form" roll-up would otherwise add litres to kilogrammes.
+  Revenue is the only measure that adds up across everything, which is why it
+  leads. Do not "helpfully" add a units column to the group rows.
+- **Family selection is faceted, and the axis is why.** Tags on the same
+  `dimension` widen a selection (Premium Reserve *or* Classic Gold); tags on
+  different dimensions narrow it (Premium Reserve *in* foodservice). Plain OR
+  returns half the catalogue for the second question and plain AND returns
+  nothing for the first, which is why `dimension` is required on a family
+  rather than optional. `mode: "any"|"all"` exists as an explicit override.
+- **A product with no net content is a gap, not a zero.** `netContentOf`
+  returns null, and the roll-up reports `productsWithoutNetContent` so a total
+  with a hole in it says so. Zero would read as "we sold none", which is a
+  different and much more dangerous claim than "we do not know".
 - **Ownership split, MRP vs warehouse:** the MRP owns the lot (produced quantity,
   cost, genealogy); the warehouse owns placement (pallet, slot, working quantity
   for picking). Where the two disagree the difference is **shown, not

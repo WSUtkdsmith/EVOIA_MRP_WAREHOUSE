@@ -486,6 +486,19 @@ const COMPOSITION_TABLE = {
   columns: { id: "str", componentId: "ref:components!", percentage: "num", costWeight: "num" }
 };
 
+/* Which families an item belongs to. Many-to-many on purpose: one product is
+   a Premium Reserve AND a dry powder AND a retail jar, and each of those is a
+   line somebody wants to report on. A single familyId would force a choice
+   between them and the other axes would simply be unreportable.
+
+   Polymorphic like packagings, so intermediates can be tagged later without a
+   second table - "how much Premium Reserve" does not stop being an interesting
+   question one stage upstream. */
+const FAMILY_TAGS_TABLE = {
+  table: "family_tags", pk: "id", polymorphic: OWNER,
+  columns: { id: "str", familyId: "ref:productFamilies!" }
+};
+
 const SCHEMA = {
   components: {
     table: "components",
@@ -554,13 +567,19 @@ const SCHEMA = {
     columns: {
       id: "str", name: "str!", sku: "str!", unit: "str", notes: "str",
       autoComposition: "bool", hazardClass: "str",
-      shelfLifeDays: "num", physicallyStored: "bool"
+      shelfLifeDays: "num", physicallyStored: "bool",
+      // What is actually inside one selling unit. `unit` reads "ea" for a
+      // sachet pack, a jar and a pouch alike, so without this a family total
+      // can only ever be money: adding a 50g sachet pack to a 500g pouch and
+      // reporting "2" is arithmetic that means nothing.
+      netContentQty: "num", netContentUnit: "str"
     },
     embeds: {},
     children: {
       lots: LOTS_TABLE,
       composition: COMPOSITION_TABLE,
-      packagings: PACKAGINGS_TABLE
+      packagings: PACKAGINGS_TABLE,
+      families: FAMILY_TAGS_TABLE
     }
   },
 
@@ -891,6 +910,32 @@ const SCHEMA = {
      (the original start and finish) plus the reason, which is enough to show
      what was changed and why - and it keeps this out of IMPORT_ORDER's way,
      which has caught us twice already. */
+  /* A reporting grouping. Deliberately thin: a family is a name and the axis
+     it belongs to, and nothing else.
+
+     `dimension` is what makes several tags per product workable. Blend, Form
+     and Pack are separate axes, and knowing which axis a tag sits on is what
+     lets a filter behave the way people expect - two tags from the SAME axis
+     widen the selection (Premium Reserve OR Classic Gold), two from DIFFERENT
+     axes narrow it (Premium Reserve AND liquid). Without the axis, a filter
+     has to guess, and it will guess wrong half the time.
+
+     A reference rather than free text, so a family can be renamed once and
+     every report follows - and so "Premium Reserve" and "Premium reserve"
+     cannot quietly become two product lines. */
+  productFamilies: {
+    table: "product_families",
+    label: "Product family",
+    pk: "id",
+    naturalKey: "code",
+    columns: {
+      id: "str", name: "str!", code: "str!",
+      dimension: "str!", notes: "str", sortOrder: "num"
+    },
+    embeds: {},
+    children: {}
+  },
+
   batchRuns: {
     table: "batch_runs",
     label: "Batch run",
@@ -1444,6 +1489,9 @@ const IMPORT_ORDER = [
   "equipment", "customers", "waste_streams", "processes",
   "composition", "packagings", "process_inputs", "process_equipment", "process_outputs",
   "maintenance", "production_targets", "purchase_orders", "purchase_order_lines", "warehouse_receipts",
+  // Families before family_tags, and family_tags after finished_goods: a tag
+  // points at both. This list is hand-maintained and has bitten us twice.
+  "product_families", "family_tags",
   "material_requests", "material_request_lines",
   "material_returns", "material_return_lines",
   // After processes: a run points at one.
@@ -2721,6 +2769,63 @@ const tx = {
   /* Record a review decision on a sales order line. Accepting or adjusting
      does not itself raise a run - that is releaseSalesOrderLine - so a
      decision can be revisited before anything hits the schedule. */
+  /* --------------------------------------------------------------
+     Product families - reporting groupings, many per product.
+  ----------------------------------------------------------------*/
+  saveProductFamily(db, { id, name, code, dimension, notes, sortOrder }) {
+    const nm = String(name || "").trim();
+    const dim = String(dimension || "").trim();
+    if (!nm) return { ok: false, error: "A family needs a name." };
+    if (!dim) {
+      return { ok: false, error: "A family needs an axis - Blend, Form, Pack and so on. " +
+                              "Without one, a filter cannot tell widening from narrowing." };
+    }
+    const cd = String(code || "").trim() || nm.toUpperCase().replace(/[^A-Z0-9]+/g, "-").slice(0, 12);
+    const clash = (db.productFamilies || []).find(f => f && f.code === cd && f.id !== id);
+    if (clash) return { ok: false, error: "Code " + cd + " is already in use." };
+    const fam = repo.upsert(db, "productFamilies", id || null, {
+      name: nm, code: cd, dimension: dim, notes: notes || "",
+      sortOrder: Number(sortOrder) || 0
+    });
+    return { ok: true, family: fam };
+  },
+
+  /* Deleting a family that is in use would silently strip tags off products
+     and change every historical report with no record of why. So it is
+     refused while anything still carries it. */
+  deleteProductFamily(db, { id }) {
+    const fam = repo.find(db, "productFamilies", id);
+    if (!fam) return { ok: false, error: "That family no longer exists." };
+    const users = (db.finishedGoods || []).filter(f =>
+      (f.families || []).some(t => t && t.familyId === id));
+    if (users.length) {
+      return { ok: false, error: fam.name + " is still on " + users.length +
+        " product(s). Untag them first - removing it here would rewrite every report that used it." };
+    }
+    repo.remove(db, "productFamilies", id);
+    return { ok: true };
+  },
+
+  /* Replace a product's tags wholesale. One write rather than add/remove pairs,
+     because the editor hands over the finished set and a half-applied change
+     is a worse state than either end of it. */
+  setFamilyTags(db, { itemId, familyIds }) {
+    const item = repo.find(db, "finishedGoods", itemId);
+    if (!item) return { ok: false, error: "That product no longer exists." };
+    const seen = {};
+    const clean = (familyIds || []).filter(fid => {
+      if (!fid || seen[fid]) return false;              // a tag twice is still one tag
+      if (!repo.find(db, "productFamilies", fid)) return false;
+      seen[fid] = true;
+      return true;
+    }).map(fid => {
+      const existing = (item.families || []).find(t => t && t.familyId === fid);
+      return { id: (existing && existing.id) || uid(), familyId: fid };
+    });
+    item.families = clean;
+    return { ok: true, item, tags: clean };
+  },
+
   /* Raise a sales order.
 
      There was no way to create one at all: the console could review and
@@ -3529,12 +3634,40 @@ function seedData() {
     { key: "S25", label: "25 x 2g sachets", grams: 50, price: 2.85 },
     { key: "P500", label: "500g foodservice pouch", grams: 500, price: 9.75 }
   ];
+  /* Reporting families, on three axes.
+
+     Blend is the obvious one. Form exists because a liquid line made from the
+     same blends is a real prospect, and "dry versus liquid" is then a question
+     nobody can answer without it. Pack is what a category manager asks for -
+     retail jars against foodservice.
+
+     Every product carries one tag from each axis, which is what makes a filter
+     across axes meaningful. */
+  const famRows = [
+    { code: "BL-CLS", name: "Classic Gold", dimension: "Blend", sortOrder: 1 },
+    { code: "BL-RCH", name: "Rich Roast", dimension: "Blend", sortOrder: 2 },
+    { code: "BL-PRM", name: "Premium Reserve", dimension: "Blend", sortOrder: 3 },
+    { code: "FM-DRY", name: "Dry powder", dimension: "Form", sortOrder: 1,
+      notes: "Soluble powder formats. A liquid line would sit alongside this, not inside it." },
+    { code: "PK-RET", name: "Retail pack", dimension: "Pack", sortOrder: 1 },
+    { code: "PK-FS", name: "Foodservice", dimension: "Pack", sortOrder: 2 }
+  ];
+  const productFamilies = famRows.map(r => ({ id: uid(), notes: "", ...r }));
+  const famBy = {};
+  productFamilies.forEach(f => { famBy[f.code] = f.id; });
+  const tag = (code) => ({ id: uid(), familyId: famBy[code] });
+
   const finishedGoods = [];
   BLENDS.forEach(b => FORMATS.forEach(fmt => {
     finishedGoods.push(fg({
       name: b.label + " \u2014 " + fmt.label,
       sku: "FG-" + b.key + "-" + fmt.key,
       notes: fmt.grams + "g net. " + b.label + " blend.",
+      // The number that makes a cross-format total mean something. Without it
+      // the only honest family roll-up is money.
+      netContentQty: fmt.grams, netContentUnit: "g",
+      families: [tag("BL-" + b.key), tag("FM-DRY"),
+                 tag(fmt.key === "P500" ? "PK-FS" : "PK-RET")],
       _blend: b, _format: fmt
     }));
   }));
@@ -4472,7 +4605,7 @@ function seedData() {
     equipment, maintenance, customers, components, wasteStreams, shipments,
     operatingCalendars, productionTargets, purchaseOrders, salesOrders,
     fulfilmentCancellations, warehouseReceipts: [],
-    materialRequests: [], materialReturns: [], batchRuns: []
+    materialRequests: [], materialReturns: [], batchRuns: [], productFamilies
   });
 }
 
@@ -4793,6 +4926,7 @@ function normalizeData(raw) {
       materialRequests: Array.isArray(raw.materialRequests) ? raw.materialRequests : [],
       materialReturns: Array.isArray(raw.materialReturns) ? raw.materialReturns : [],
       batchRuns: Array.isArray(raw.batchRuns) ? raw.batchRuns : [],
+      productFamilies: Array.isArray(raw.productFamilies) ? raw.productFamilies : [],
       salesOrders: normalizeSalesOrders(raw.salesOrders),
       fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [],
       operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars),
@@ -4865,7 +4999,7 @@ function normalizeData(raw) {
   const shipments = normalizeShipments(raw.shipments);
 
   const migrated = migrateCompositionToComponents(rawMaterials, intermediateProducts, finishedGoods, raw.components);
-  return backfillRowIds({ rawMaterials: migrated.rawMaterials, intermediateProducts: migrated.intermediateProducts, finishedGoods: migrated.finishedGoods, components: migrated.components, wasteStreams, processes, schedule, equipment, maintenance, customers, shipments, productionTargets, purchaseOrders: normalizePurchaseOrders(raw.purchaseOrders), warehouseReceipts: Array.isArray(raw.warehouseReceipts) ? raw.warehouseReceipts : [], materialRequests: Array.isArray(raw.materialRequests) ? raw.materialRequests : [], materialReturns: Array.isArray(raw.materialReturns) ? raw.materialReturns : [], batchRuns: Array.isArray(raw.batchRuns) ? raw.batchRuns : [], salesOrders: normalizeSalesOrders(raw.salesOrders), fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [], operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars), seedVersion: raw.seedVersion || "" });
+  return backfillRowIds({ rawMaterials: migrated.rawMaterials, intermediateProducts: migrated.intermediateProducts, finishedGoods: migrated.finishedGoods, components: migrated.components, wasteStreams, processes, schedule, equipment, maintenance, customers, shipments, productionTargets, purchaseOrders: normalizePurchaseOrders(raw.purchaseOrders), warehouseReceipts: Array.isArray(raw.warehouseReceipts) ? raw.warehouseReceipts : [], materialRequests: Array.isArray(raw.materialRequests) ? raw.materialRequests : [], materialReturns: Array.isArray(raw.materialReturns) ? raw.materialReturns : [], batchRuns: Array.isArray(raw.batchRuns) ? raw.batchRuns : [], productFamilies: Array.isArray(raw.productFamilies) ? raw.productFamilies : [], salesOrders: normalizeSalesOrders(raw.salesOrders), fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [], operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars), seedVersion: raw.seedVersion || "" });
 }
 
 /* ---------------------------------------------------------------
@@ -6054,6 +6188,195 @@ function inProcessLots(data) {
     });
   });
   return out.sort((a, b) => String(a.since).localeCompare(String(b.since)));
+}
+
+/* ------------------------------------------------------------------
+   Product families.
+
+   A product belongs to several at once - Premium Reserve, dry powder, retail
+   pack - and each is an axis somebody reports along.
+----------------------------------------------------------------*/
+function familyById(data, id) {
+  return ((data && data.productFamilies) || []).find(f => f && f.id === id) || null;
+}
+
+function familiesOf(data, item) {
+  return ((item && item.families) || [])
+    .map(t => familyById(data, t && t.familyId))
+    .filter(Boolean);
+}
+
+/* The axes, in the order they should be offered. A family with no dimension
+   still has to appear somewhere or it becomes invisible and untaggable. */
+function familyDimensions(data) {
+  const byDim = {};
+  ((data && data.productFamilies) || []).forEach(f => {
+    if (!f) return;
+    const dim = String(f.dimension || "").trim() || "Ungrouped";
+    (byDim[dim] = byDim[dim] || []).push(f);
+  });
+  return Object.keys(byDim).sort().map(dim => ({
+    dimension: dim,
+    families: byDim[dim].slice().sort((a, b) =>
+      (Number(a.sortOrder) || 0) - (Number(b.sortOrder) || 0) ||
+      String(a.name).localeCompare(String(b.name)))
+  }));
+}
+
+/* Does this item match the selected tags?
+
+   Faceted, which is the behaviour people already expect from every filter
+   they use: tags on the SAME axis widen the selection, tags on DIFFERENT axes
+   narrow it. Picking Premium Reserve and Classic Gold means "either blend";
+   picking Premium Reserve and Foodservice means "Premium Reserve, in
+   foodservice". Treating both cases as plain OR would return half the
+   catalogue for the second question; treating both as AND returns nothing for
+   the first.
+
+   `mode` overrides it for the cases where someone genuinely wants raw set
+   logic: "any" is a union, "all" an intersection. */
+function matchesFamilySelection(data, item, selectedIds, mode) {
+  const wanted = (selectedIds || []).filter(Boolean);
+  if (!wanted.length) return true;                       // no filter is not an empty filter
+  const own = {};
+  ((item && item.families) || []).forEach(t => { if (t && t.familyId) own[t.familyId] = true; });
+
+  if (mode === "any") return wanted.some(id => own[id]);
+  if (mode === "all") return wanted.every(id => own[id]);
+
+  // Faceted: group the selection by axis, then require a hit on every axis.
+  const byDim = {};
+  wanted.forEach(id => {
+    const fam = familyById(data, id);
+    const dim = fam ? (String(fam.dimension || "").trim() || "Ungrouped") : "Ungrouped";
+    (byDim[dim] = byDim[dim] || []).push(id);
+  });
+  return Object.keys(byDim).every(dim => byDim[dim].some(id => own[id]));
+}
+
+/* Net content of one selling unit, as a quantity and a unit.
+
+   Returns null rather than zero when it is not recorded: zero would silently
+   drag a family total down and read as "we sold nothing", which is a
+   different and much more dangerous statement than "we do not know". */
+function netContentOf(item) {
+  const qty = Number(item && item.netContentQty) || 0;
+  if (!(qty > 0)) return null;
+  return { qty, unit: String((item && item.netContentUnit) || "").trim() || "" };
+}
+
+/* Sales roll-up across product families.
+
+   Two things this deliberately refuses to do.
+
+   It does not sum selling units across formats. A 25x2g sachet pack and a
+   500g pouch are both "1 ea", and reporting "2" invites someone to compare it
+   with last year's jars. Units come back broken out per product.
+
+   It does not sum net content across different units either. Once a liquid
+   line exists, rolling "dry powders" together with "liquid products" means
+   adding kilogrammes to litres. `netContent` is therefore a map keyed by unit,
+   not a number - and a caller that wants one figure has to say which unit it
+   means. Revenue is the only measure that adds up across everything, which is
+   why it leads. */
+function familySalesRollup(data, options) {
+  const opts = options || {};
+  const from = opts.from || "", to = opts.to || "";
+  const events = shipmentEvents(data).filter(e =>
+    (!from || e.date >= from) && (!to || e.date <= to));
+
+  const byItem = {};
+  events.forEach(e => {
+    const row = byItem[e.finishedGoodId] || (byItem[e.finishedGoodId] = {
+      finishedGoodId: e.finishedGoodId, units: 0, revenue: 0, cogs: 0,
+      shipments: 0, unpriced: 0
+    });
+    row.units += Number(e.qty) || 0;
+    row.revenue += Number(e.revenue) || 0;
+    row.cogs += Number(e.cogs) || 0;
+    row.shipments += 1;
+    if (!e.priced) row.unpriced += 1;
+  });
+
+  const detail = Object.keys(byItem).map(id => {
+    const item = getFinished(data, id);
+    const net = netContentOf(item);
+    const r = byItem[id];
+    return {
+      ...r,
+      itemName: item ? item.name : "(deleted product)",
+      sku: item ? item.sku : "",
+      unit: item ? (item.unit || "") : "",
+      netContentQty: net ? net.qty : null,
+      netContentUnit: net ? net.unit : "",
+      // Units x what is in one, so a jar and a pouch become comparable.
+      netTotal: net ? Math.round(r.units * net.qty * 1000) / 1000 : null,
+      familyIds: ((item && item.families) || []).map(t => t.familyId).filter(Boolean),
+      item
+    };
+  });
+
+  const summarise = (rows) => {
+    const netByUnit = {};
+    let unknownNet = 0;
+    rows.forEach(r => {
+      if (r.netTotal == null) { unknownNet += 1; return; }
+      const u = r.netContentUnit || "(unstated unit)";
+      netByUnit[u] = Math.round(((netByUnit[u] || 0) + r.netTotal) * 1000) / 1000;
+    });
+    const revenue = Math.round(rows.reduce((n, r) => n + r.revenue, 0) * 100) / 100;
+    const cogs = Math.round(rows.reduce((n, r) => n + r.cogs, 0) * 100) / 100;
+    return {
+      products: rows.length,
+      shipments: rows.reduce((n, r) => n + r.shipments, 0),
+      revenue, cogs,
+      margin: Math.round((revenue - cogs) * 100) / 100,
+      netByUnit,
+      // How many products in this group have no net content recorded. A total
+      // with a gap in it has to say so, or it reads as complete.
+      productsWithoutNetContent: unknownNet,
+      unpricedShipments: rows.reduce((n, r) => n + r.unpriced, 0)
+    };
+  };
+
+  const selected = (opts.tagIds || []).filter(Boolean);
+  const filtered = detail.filter(r =>
+    matchesFamilySelection(data, r.item, selected, opts.mode));
+
+  // Grouped by the chosen axis. A product with no tag on that axis is reported
+  // under "Untagged" rather than dropped - a family report that quietly loses
+  // rows is worse than one that shows an awkward bucket.
+  let groups = [];
+  if (opts.dimension) {
+    const dim = String(opts.dimension);
+    const fams = ((data && data.productFamilies) || [])
+      .filter(f => f && (String(f.dimension || "").trim() || "Ungrouped") === dim)
+      .slice()
+      .sort((a, b) => (Number(a.sortOrder) || 0) - (Number(b.sortOrder) || 0) ||
+                      String(a.name).localeCompare(String(b.name)));
+    groups = fams.map(f => {
+      const rows = filtered.filter(r => r.familyIds.indexOf(f.id) !== -1);
+      return { family: f, key: f.id, label: f.name, rows, totals: summarise(rows) };
+    });
+    const untagged = filtered.filter(r =>
+      !fams.some(f => r.familyIds.indexOf(f.id) !== -1));
+    if (untagged.length) {
+      groups.push({ family: null, key: "__untagged", label: "Untagged",
+                    rows: untagged, totals: summarise(untagged) });
+    }
+  }
+
+  return {
+    detail: filtered,
+    groups,
+    totals: summarise(filtered),
+    // A product can carry a tag on more than one axis, so group totals add up
+    // to more than the whole whenever a product is in two groups of the same
+    // grouping. Said plainly rather than left for someone to discover.
+    overlaps: opts.dimension
+      ? groups.reduce((n, g) => n + g.rows.length, 0) > filtered.length
+      : false
+  };
 }
 
 /* ------------------------------------------------------------------
@@ -8924,6 +9247,9 @@ const ADMIN_NAV_GROUPS = [
       { key: "salesOrders", label: "Sales orders", icon: ClipboardList },
       { key: "customers", label: "Customers", icon: Users },
       { key: "revenue", label: "Revenue", icon: DollarSign },
+      // One product sits in several families, so this is its own view rather
+      // than a filter on Revenue - the axis being grouped by is the question.
+      { key: "familySales", label: "Product families", icon: Layers },
       { key: "shipments", label: "Shipments", icon: Truck }
     ]
   }
@@ -9353,7 +9679,8 @@ export default function App() {
             onAdd={() => setModal({ type: "finished", id: null })}
             onEdit={(id) => setModal({ type: "finished", id })}
             onDelete={removeFinished}
-            onInventory={(id) => setModal({ type: "inventoryCard", itemType: "finished", id })} />
+            onInventory={(id) => setModal({ type: "inventoryCard", itemType: "finished", id })}
+            onManageFamilies={() => setModal({ type: "productFamilies" })} />
         )}
         {tab === "wasteStreams" && view === "admin" && (
           <WasteStreamsTab data={data} search={search} setSearch={setSearch} readOnly={false}
@@ -9370,6 +9697,9 @@ export default function App() {
         {/* Not gated on view: operators raise the requests and sign for the
             material, so they need this as much as admin does. */}
         {tab === "materialFlow" && <MaterialFlowTab data={data} update={update} />}
+        {tab === "familySales" && view === "admin" && (
+          <FamilySalesTab data={data} onManage={() => setModal({ type: "productFamilies" })} />
+        )}
         {tab === "flow" && view === "admin" && (
           <ProcessFlowTab data={data}
             onOpenProcess={(id) => setModal({ type: "process", id })} />
@@ -9523,6 +9853,9 @@ export default function App() {
       )}
       {modal && modal.type === "newSalesOrder" && (
         <NewSalesOrderModal data={data} onClose={() => setModal(null)} update={update} />
+      )}
+      {modal && modal.type === "productFamilies" && (
+        <ProductFamiliesModal data={data} onClose={() => setModal(null)} update={update} />
       )}
 
       {modal && modal.type === "shipmentTrace" && (
@@ -10692,21 +11025,351 @@ function IntermediateProductModal({ data, id, onClose, update }) {
 /* ---------------------------------------------------------------
    Finished Goods (catalog)
 ----------------------------------------------------------------*/
-function FinishedGoodsTab({ data, search, setSearch, onAdd, onEdit, onDelete, onInventory }) {
+function FinishedGoodsTab({ data, search, setSearch, onAdd, onEdit, onDelete, onInventory, onManageFamilies }) {
   const view = useProducedItemsView(data, "finished", "finishedGoods");
   return (
     <div>
       <PageHeader tabKey="finished" subtitle="Sellable-item catalog and stock — recipes live on the Processes tab"
-        action={<Btn onClick={onAdd}><Plus size={15} />Add finished good</Btn>} />
+        action={<div style={{ display: "flex", gap: 8 }}>
+          {onManageFamilies && <Btn variant="secondary" onClick={onManageFamilies}>Product families</Btn>}
+          <Btn onClick={onAdd}><Plus size={15} />Add finished good</Btn>
+        </div>} />
       <ListToolbar view={view} columns={PRODUCED_COLS} placeholder="Name, SKU, process…" />
       <ProducedItemsTable rows={view.rows} view={view} data={data} itemType="finished" onEdit={onEdit} onDelete={onDelete} onInventory={onInventory} emptyMessage="No finished goods yet." unitLabel="Product" />
     </div>
   );
 }
 
+/* Sales rolled up along whichever axis is asked for.
+
+   Everything here is shaped by one constraint: only money adds up across
+   formats. Units do not (a sachet pack and a pouch are both "1"), and net
+   content only adds up within a single unit of measure - the moment a liquid
+   line exists, kilogrammes and litres are in the same table and must not be
+   summed. So revenue leads, net content is reported per unit, and there is no
+   grand total column for units at all. */
+function FamilySalesTab({ data, onManage }) {
+  const tr = useTimeRange(data, "13w");
+  const dims = useMemo(() => familyDimensions(data), [data]);
+  const [dimension, setDimension] = useState(() => (dims[0] ? dims[0].dimension : ""));
+  const [tagIds, setTagIds] = useState([]);
+  const [mode, setMode] = useState("faceted");
+  const [expanded, setExpanded] = useState({});
+
+  const roll = useMemo(() => familySalesRollup(data, {
+    dimension, tagIds, mode, from: tr.range.from, to: tr.range.to
+  }), [data, dimension, tagIds, mode, tr.range]);
+
+  const toggleTag = (id) => setTagIds(cur =>
+    cur.indexOf(id) === -1 ? [...cur, id] : cur.filter(x => x !== id));
+
+  const netText = (byUnit) => {
+    const keys = Object.keys(byUnit);
+    if (!keys.length) return "\u2014";
+    // Never joined into one figure: these are different units of measure.
+    return keys.sort().map(u => fmtNum(byUnit[u]) + " " + u).join(" · ");
+  };
+
+  if (!dims.length) {
+    return (
+      <div>
+        <PageHeader tabKey="familySales" subtitle="Sales rolled up across product families"
+          action={<Btn onClick={onManage}><Plus size={15} />Manage families</Btn>} />
+        <div style={{ fontSize: 13, color: "#8A9099" }}>
+          No product families yet. Add some — a blend, a form, a pack type — then tag finished goods
+          into them, and sales will roll up along whichever axis you pick.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <PageHeader tabKey="familySales"
+        subtitle="One product sits in several families at once, so pick the axis to group by and narrow with the rest"
+        action={<Btn variant="secondary" onClick={onManage}>Manage families</Btn>} />
+
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
+        <TimeRangeControls state={tr} />
+        <span style={{ fontSize: 12, color: "#7A8079" }}>Group by</span>
+        <select style={{ ...inputStyle, width: "auto", minWidth: 130 }} value={dimension}
+          onChange={e => setDimension(e.target.value)}>
+          {dims.map(d => <option key={d.dimension} value={d.dimension}>{d.dimension}</option>)}
+        </select>
+        <span style={{ fontSize: 12, color: "#7A8079" }}>Match</span>
+        <select style={{ ...inputStyle, width: "auto", minWidth: 190 }} value={mode}
+          onChange={e => setMode(e.target.value)}>
+          <option value="faceted">Faceted (same axis widens, different axes narrow)</option>
+          <option value="any">Any selected tag</option>
+          <option value="all">All selected tags</option>
+        </select>
+        {tagIds.length > 0 && (
+          <Btn variant="ghost" onClick={() => setTagIds([])} style={{ padding: "4px 9px", fontSize: 12 }}>
+            Clear {tagIds.length} filter(s)
+          </Btn>
+        )}
+      </div>
+
+      <div style={{ background: "#fff", border: "1px solid #E7E9E4", borderRadius: 8,
+                    padding: "8px 12px", marginBottom: 12 }}>
+        {dims.map(d => (
+          <div key={d.dimension} style={{ display: "flex", alignItems: "center", gap: 6,
+                                          flexWrap: "wrap", marginBottom: 4 }}>
+            <span style={{ fontSize: 10.5, fontWeight: 700, color: "#7A8079", textTransform: "uppercase",
+                           letterSpacing: 0.3, minWidth: 60 }}>{d.dimension}</span>
+            {d.families.map(fam => {
+              const on = tagIds.indexOf(fam.id) !== -1;
+              return (
+                <button key={fam.id} type="button" onClick={() => toggleTag(fam.id)} style={{
+                  padding: "3px 10px", borderRadius: 999, fontSize: 11.5, cursor: "pointer",
+                  background: on ? "#1F6F78" : "#fff", color: on ? "#fff" : "#5B6470",
+                  border: "1px solid " + (on ? "#1F6F78" : "#D7DAD3"),
+                  fontWeight: on ? 700 : 500
+                }}>{fam.name}</button>
+              );
+            })}
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: "flex", gap: 20, flexWrap: "wrap", alignItems: "center",
+                    padding: "10px 14px", marginBottom: 12, borderRadius: 8, fontSize: 13,
+                    background: "#F1F6F2", border: "1px solid #CFE0D3" }}>
+        <div><b>{fmtMoney(roll.totals.revenue)}</b> revenue</div>
+        <div style={{ color: "#5B6470" }}>{fmtMoney(roll.totals.margin)} margin</div>
+        <div style={{ color: "#5B6470" }}>{netText(roll.totals.netByUnit)} shipped</div>
+        <div style={{ color: "#5B6470" }}>{roll.totals.products} product(s) · {roll.totals.shipments} shipment(s)</div>
+      </div>
+
+      {roll.totals.productsWithoutNetContent > 0 && (
+        <div style={{ background: "#F6E6C8", border: "1px solid #C99A3A", borderRadius: 8,
+                      padding: "8px 12px", marginBottom: 12, fontSize: 11.5, color: "#7A5205" }}>
+          {roll.totals.productsWithoutNetContent} product(s) have no net content recorded, so they count
+          towards revenue but not towards the quantity shipped. Set it on the finished good to close the gap.
+        </div>
+      )}
+      {roll.overlaps && (
+        <div style={{ background: "#FFF9EF", border: "1px solid #E8D5A8", borderRadius: 8,
+                      padding: "8px 12px", marginBottom: 12, fontSize: 11.5, color: "#7A5205" }}>
+          Some products carry more than one {dimension} tag, so the rows below add up to more than the
+          total above. That is the roll-up working, not a fault — but do not sum the column.
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr", gap: 8, fontSize: 11,
+                    fontWeight: 700, color: "#7A8079", textTransform: "uppercase", letterSpacing: 0.3,
+                    padding: "0 12px 6px" }}>
+        <span>{dimension}</span><span>Revenue</span><span>Margin</span><span>Shipped</span><span>Products</span>
+      </div>
+
+      {roll.groups.length === 0 && (
+        <div style={{ fontSize: 12.5, color: "#8A9099", padding: 20 }}>
+          Nothing shipped in this period matches the current selection.
+        </div>
+      )}
+
+      {roll.groups.map(g => (
+        <div key={g.key} style={{ marginBottom: 6, borderRadius: 8, background: "#fff",
+                                  border: "1px solid " + (g.family ? "#E7E9E4" : "#E8D5A8") }}>
+          <div role="button" tabIndex={0}
+            onClick={() => setExpanded(e => ({ ...e, [g.key]: !e[g.key] }))}
+            onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setExpanded(x => ({ ...x, [g.key]: !x[g.key] })); } }}
+            style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr", gap: 8,
+                     alignItems: "center", padding: "9px 12px", cursor: "pointer", fontSize: 12.5 }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              {expanded[g.key] ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+              <b>{g.label}</b>
+              {!g.family && <Badge tone="warn">no {dimension} tag</Badge>}
+            </span>
+            <span className="mono" style={{ fontWeight: 700 }}>{fmtMoney(g.totals.revenue)}</span>
+            <span className="mono">{fmtMoney(g.totals.margin)}</span>
+            <span className="mono">{netText(g.totals.netByUnit)}</span>
+            <span className="mono">{g.totals.products}</span>
+          </div>
+          {expanded[g.key] && (
+            <div style={{ borderTop: "1px solid #F1F2EE", padding: "6px 12px 10px" }}>
+              {/* Per product, because this is the only level at which a unit
+                  count is a real number. */}
+              <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr", gap: 8,
+                            fontSize: 10.5, fontWeight: 700, color: "#7A8079",
+                            textTransform: "uppercase", letterSpacing: 0.3, padding: "4px 0" }}>
+                <span>Product</span><span>Units</span><span>Net content</span><span>Shipped</span><span>Revenue</span>
+              </div>
+              {g.rows.slice().sort((a, b) => b.revenue - a.revenue).map(r => (
+                <div key={r.finishedGoodId} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr",
+                                                     gap: 8, fontSize: 12, padding: "3px 0",
+                                                     borderTop: "1px solid #F7F8F5" }}>
+                  <span>{r.itemName}</span>
+                  <span className="mono">{fmtNum(r.units)} {r.unit}</span>
+                  <span className="mono" style={{ color: r.netContentQty == null ? "#B87510" : "#5B6470" }}>
+                    {r.netContentQty == null ? "not set" : fmtNum(r.netContentQty) + " " + r.netContentUnit}
+                  </span>
+                  <span className="mono">
+                    {r.netTotal == null ? "\u2014" : fmtNum(r.netTotal) + " " + r.netContentUnit}
+                  </span>
+                  <span className="mono">{fmtMoney(r.revenue)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+
+      <div style={{ fontSize: 11, color: "#8A9099", marginTop: 10 }}>
+        Selling units are shown per product and never added across formats — a 25×2g sachet pack and a
+        500g pouch are both “1 ea”, so a combined count would mean nothing. Quantities roll up by net
+        content, and only within a single unit of measure.
+      </div>
+    </div>
+  );
+}
+
+/* Tag a product into its reporting families.
+
+   Grouped by axis and rendered as checkboxes rather than a multi-select: a
+   product belongs to one Blend and one Form and one Pack, and seeing the axes
+   laid out is what stops someone tagging two blends by accident. Several tags
+   from one axis are still allowed - a product genuinely can span two - but the
+   layout makes it a decision rather than a slip. */
+function FamilyTagsField({ data, value, onChange }) {
+  const dims = useMemo(() => familyDimensions(data), [data]);
+  const chosen = {};
+  (value || []).forEach(t => { if (t && t.familyId) chosen[t.familyId] = t; });
+
+  const toggle = (familyId) => {
+    const next = chosen[familyId]
+      ? (value || []).filter(t => t.familyId !== familyId)
+      : [...(value || []), { id: uid(), familyId }];
+    onChange(next);
+  };
+
+  if (!dims.length) {
+    return (
+      <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 14, marginBottom: 16 }}>
+        <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 4 }}>Product families</div>
+        <div style={{ fontSize: 11.5, color: "#B87510" }}>
+          No families defined yet — add some from the Finished goods tab, and they will appear here.
+        </div>
+      </div>
+    );
+  }
+  return (
+    <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 14, marginBottom: 16 }}>
+      <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 4 }}>Product families</div>
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 10 }}>
+        A product can belong to several at once — a blend, a form, a pack type — and each is an axis
+        sales can be rolled up along.
+      </div>
+      {dims.map(d => (
+        <div key={d.dimension} style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 10.5, fontWeight: 700, color: "#7A8079", textTransform: "uppercase",
+                        letterSpacing: 0.3, marginBottom: 4 }}>{d.dimension}</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {d.families.map(fam => {
+              const on = !!chosen[fam.id];
+              return (
+                <label key={fam.id} title={fam.notes || ""} style={{
+                  display: "inline-flex", alignItems: "center", gap: 6, cursor: "pointer",
+                  padding: "4px 10px", borderRadius: 999, fontSize: 12,
+                  background: on ? "#1F6F78" : "#fff", color: on ? "#fff" : "#5B6470",
+                  border: "1px solid " + (on ? "#1F6F78" : "#D7DAD3")
+                }}>
+                  <input type="checkbox" checked={on} onChange={() => toggle(fam.id)}
+                    style={{ margin: 0 }} />
+                  {fam.name}
+                </label>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* Add, rename and retire the families themselves. */
+function ProductFamiliesModal({ data, update, onClose }) {
+  const dims = useMemo(() => familyDimensions(data), [data]);
+  const [f, setF] = useState({ id: null, name: "", code: "", dimension: "", notes: "", sortOrder: 0 });
+  const [err, setErr] = useState("");
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+  const reset = () => setF({ id: null, name: "", code: "", dimension: "", notes: "", sortOrder: 0 });
+
+  const save = () => {
+    let res = null;
+    update(d => { res = tx.saveProductFamily(d, f); });
+    if (res && res.ok) { reset(); setErr(""); } else setErr((res && res.error) || "Could not save.");
+  };
+  const remove = (id) => {
+    let res = null;
+    update(d => { res = tx.deleteProductFamily(d, { id }); });
+    setErr(res && res.ok ? "" : ((res && res.error) || "Could not delete."));
+  };
+  const usage = (id) => (data.finishedGoods || [])
+    .filter(x => (x.families || []).some(t => t && t.familyId === id)).length;
+
+  return (
+    <Modal title="Product families" onClose={onClose} wide>
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 12 }}>
+        Reporting groupings. The <b>axis</b> is what lets a filter behave sensibly: two tags on the same
+        axis widen a selection (either blend), two on different axes narrow it (that blend, in foodservice).
+      </div>
+
+      {dims.map(d => (
+        <div key={d.dimension} style={{ marginBottom: 12 }}>
+          <div style={{ fontSize: 10.5, fontWeight: 700, color: "#7A8079", textTransform: "uppercase",
+                        letterSpacing: 0.3, marginBottom: 4 }}>{d.dimension}</div>
+          {d.families.map(fam => (
+            <div key={fam.id} style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap",
+                                       padding: "6px 10px", marginBottom: 4, borderRadius: 8,
+                                       background: "#fff", border: "1px solid #E7E9E4", fontSize: 12.5 }}>
+              <span style={{ fontWeight: 600 }}>{fam.name}</span>
+              <span className="mono" style={{ fontSize: 11, color: "#8A9099" }}>{fam.code}</span>
+              <span style={{ fontSize: 11.5, color: "#8A9099" }}>{usage(fam.id)} product(s)</span>
+              <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+                <Btn variant="ghost" onClick={() => { setErr(""); setF({ ...fam }); }}
+                  style={{ padding: "3px 8px", fontSize: 11.5 }}>Edit</Btn>
+                <Btn variant="ghost" onClick={() => remove(fam.id)}
+                  style={{ padding: "3px 8px", fontSize: 11.5 }}>Delete</Btn>
+              </span>
+            </div>
+          ))}
+        </div>
+      ))}
+
+      <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 12 }}>
+        <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8 }}>
+          {f.id ? "Edit family" : "Add a family"}
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr 0.8fr 0.6fr", gap: 8 }}>
+          <Field label="Name"><input style={inputStyle} value={f.name} onChange={e => set("name", e.target.value)} placeholder="Premium Reserve" /></Field>
+          <Field label="Axis" hint="Blend, Form, Pack…">
+            <input style={inputStyle} value={f.dimension} onChange={e => set("dimension", e.target.value)}
+              list="familyDims" placeholder="Blend" />
+            <datalist id="familyDims">{dims.map(d => <option key={d.dimension} value={d.dimension} />)}</datalist>
+          </Field>
+          <Field label="Code" hint="Left blank, derived from the name">
+            <input style={inputStyle} value={f.code} onChange={e => set("code", e.target.value)} placeholder="BL-PRM" />
+          </Field>
+          <Field label="Order"><input type="number" style={inputStyle} value={f.sortOrder} onChange={e => set("sortOrder", parseInt(e.target.value, 10) || 0)} /></Field>
+        </div>
+        {err && <div style={{ fontSize: 12, color: "#8A2E20", marginTop: 6, fontWeight: 600 }}>{err}</div>}
+        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+          <Btn onClick={save}>{f.id ? "Save changes" : "Add family"}</Btn>
+          {f.id && <Btn variant="secondary" onClick={() => { reset(); setErr(""); }}>Cancel edit</Btn>}
+        </div>
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 18 }}>
+        <Btn variant="secondary" onClick={onClose}>Close</Btn>
+      </div>
+    </Modal>
+  );
+}
+
 function FinishedGoodModal({ data, id, onClose, update }) {
   const existing = id ? getFinished(data, id) : null;
-  const [f, setF] = useState(existing ? structuredClone(existing) : { name: "", sku: "", unit: "ea", notes: "", composition: [], autoComposition: false, hazardClass: "N/A", lots: [], shelfLifeDays: null, physicallyStored: true, packagings: [] });
+  const [f, setF] = useState(existing ? structuredClone(existing) : { name: "", sku: "", unit: "ea", notes: "", composition: [], autoComposition: false, hazardClass: "N/A", lots: [], shelfLifeDays: null, physicallyStored: true, packagings: [], families: [], netContentQty: "", netContentUnit: "" });
   const set = (k, v) => setF(prev => ({ ...prev, [k]: v }));
 
   const save = () => {
@@ -10722,6 +11385,17 @@ function FinishedGoodModal({ data, id, onClose, update }) {
         <Field label="Name" span={2}><input style={inputStyle} value={f.name} onChange={e => set("name", e.target.value)} placeholder="Product name" /></Field>
         <Field label="SKU"><input style={inputStyle} value={f.sku} onChange={e => set("sku", e.target.value)} placeholder="FG-0001" /></Field>
         <Field label="Unit of measure"><input style={inputStyle} value={f.unit} onChange={e => set("unit", e.target.value)} placeholder="ea, pallet, case…" /></Field>
+        {/* What is in one of those units. "ea" is the same word for a 50g
+            sachet pack and a 500g pouch, so this is the only thing that makes
+            a family total anything other than money. */}
+        <Field label="Net content per unit" hint="What is actually inside one — 100, 500, 1.5…">
+          <input type="number" step="any" style={inputStyle} value={f.netContentQty === null || f.netContentQty === undefined ? "" : f.netContentQty}
+            onChange={e => set("netContentQty", e.target.value === "" ? "" : parseFloat(e.target.value))} />
+        </Field>
+        <Field label="Net content unit" hint="g, kg, mL, L — what family totals add up in">
+          <input style={inputStyle} value={f.netContentUnit || ""}
+            onChange={e => set("netContentUnit", e.target.value)} placeholder="g" />
+        </Field>
         <Field label="Hazard classification">
           <select style={inputStyle} value={f.hazardClass} onChange={e => set("hazardClass", e.target.value)}>
             {HAZARD_CLASS_OPTIONS.map(o => <option key={o} value={o}>{o}</option>)}
@@ -10742,6 +11416,8 @@ function FinishedGoodModal({ data, id, onClose, update }) {
           ? <ComputedCompositionView itemType="finished" itemId={id} data={data} />
           : <CompositionEditor composition={f.composition} onChange={(c) => set("composition", c)} componentOptions={data.components} data={data} showCostWeight={false} />}
       </div>
+
+      <FamilyTagsField data={data} value={f.families || []} onChange={(v) => set("families", v)} />
 
       <CatalogWarehouseSection f={f} set={set} showHazard={false} />
 
