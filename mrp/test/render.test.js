@@ -99,7 +99,12 @@ console.log('\n--- production calendar ---');
     data: D3, onAdd: noop, onEdit: noop, onDelete: noop }));
   ok('Schedule tab renders', !r.err, r.err);
   const h = r.html || '';
-  ok('calendar/list switch present', h.includes('Calendar') && h.includes('List'));
+  // The internal Calendar/List toggle was removed deliberately: the calendar
+  // answers "when" and the list answers "what and where is it up to", and
+  // toggling between them inside one tab hid the list from anyone who never
+  // found the switch. They are two nav destinations now.
+  ok('the calendar view leads with its planning modes, not a layout switch',
+     h.includes('Capacity plan') && h.includes('Due dates'));
   ok('capacity plan mode present', h.includes('Capacity plan'));
   ok('due-dates mode present', h.includes('Due dates'));
   ok('month label rendered', /\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) 20\d\d/.test(h), h.slice(0,0));
@@ -1208,6 +1213,153 @@ console.log('\n--- the SOP travels with the operation ---');
      body.includes('<SopBadge'));
   ok('and the clock, so the run is timed where it is run',
      body.includes('<BatchRunControl'));
+}
+
+console.log('\n--- sales orders can actually be raised ---');
+{
+  // Review found no way to create one at all: the console could review and
+  // release the orders that arrived with the seed data and nothing else.
+  const D7 = A.seedData();
+  const tab = tryRender('so1', React.createElement(A.SalesOrdersTab, {
+    data: D7, onOpenOrder: noop, onNewOrder: noop }));
+  ok('the sales order tab renders', !tab.err, tab.err);
+  const th = (tab.html || '').replace(/<!-- -->/g, '');
+  ok('and offers a clear way to add one', th.includes('New sales order'));
+  ok('the list is sortable', th.includes('Sort'));
+  ok('and searchable', th.includes('Order, customer, rep'));
+
+  const modal = tryRender('so2', React.createElement(A.NewSalesOrderModal, {
+    data: D7, update: noop, onClose: noop }));
+  ok('the new-order form renders', !modal.err, modal.err);
+  const mh = (modal.html || '').replace(/<!-- -->/g, '');
+  ok('it asks who keyed it in, as well as whose sale it is',
+     mh.includes('Entered by') && mh.includes('Sales rep'));
+  ok('and says that will come from the login later', mh.includes('once auth lands'));
+  ok('it explains where the price comes from', mh.includes('price list at the quantity'));
+  ok('a draft is possible as well as a submission',
+     mh.includes('Save as draft') && mh.includes('Submit for review'));
+  ok('the line grid is labelled', mh.includes('Unit price') && mh.includes('Line value'));
+}
+
+console.log('\n--- linking an order to production that already exists ---');
+{
+  const D7 = A.seedData();
+  D7.salesOrders = []; D7.schedule = [];
+  const cust = D7.customers[0], fg = D7.finishedGoods[0];
+  const o = A.tx.raiseSalesOrder(D7, { customerId: cust.id, salesRep: 'R', enteredBy: 'C',
+    submit: true, lines: [{ finishedGoodId: fg.id, qty: 100 }] }).order;
+  A.repo.create(D7, 'schedule', { reference: 'RUN-00042', productType: 'finished',
+    productId: fg.id, qty: 500, dueDate: '2026-09-01', status: 'Planned', notes: '',
+    customerId: '', completedDate: '', createdDate: '2026-08-01', frozen: false,
+    frozenDate: '', baselineQty: '', baselineDueDate: '', standardCostAtFulfillment: '',
+    fulfillmentLots: [], revisions: [] });
+  A.tx.reviewSalesOrderLine(D7, { salesOrderId: o.id, lineId: o.lines[0].id, decision: 'Accept' });
+
+  const rev = tryRender('so3', React.createElement(A.SalesOrderModal, {
+    data: D7, orderId: o.id, onClose: noop, update: noop }));
+  ok('the review modal renders', !rev.err, rev.err);
+  const rh = (rev.html || '').replace(/<!-- -->/g, '');
+  ok('who entered the order is shown', rh.includes('Entered by'));
+  ok('and an accepted line offers the existing run as an alternative to a new one',
+     rh.includes('Link to existing run'));
+
+  const detail = A.salesOrderRecords(D7).find(r => r.order.id === o.id).lines[0];
+  const pick = tryRender('so4', React.createElement(A.LinkRunModal, {
+    data: D7, orderId: o.id, detail, runs: A.linkableRunsForLine(D7, fg.id),
+    update: noop, onClose: noop, onError: noop }));
+  ok('the run picker renders', !pick.err, pick.err);
+  const ph = (pick.html || '').replace(/<!-- -->/g, '');
+  ok('runs are offered by number', ph.includes('RUN-00042'));
+  ok('and it says why linking beats releasing', ph.includes('making the same goods twice'));
+}
+
+console.log('\n--- the run list reads on its own ---');
+{
+  const D7 = A.seedData();
+  const list = tryRender('sl1', React.createElement(A.ScheduleTab, {
+    data: D7, tabKey: 'scheduleList', onAdd: noop, onEdit: noop, onDelete: noop }));
+  ok('the run list renders as its own tab', !list.err, list.err);
+  const lh = (list.html || '').replace(/<!-- -->/g, '');
+  // Four colours with no key made the timeline read as decoration.
+  ok('the colour key is present', lh.includes('Raw material lead time'));
+  ok('naming production separately from lead time',
+     lh.includes('Finished goods production') && lh.includes('Intermediate production'));
+  ok('and the today marker', lh.includes('Today'));
+  ok('runs carry a number for traceability', /RUN-\d{5}/.test(lh));
+  ok('it says which runs have no order behind them', lh.includes('No sales order'));
+  ok('and can be filtered by that', lh.includes('Not against an order'));
+  ok('and by status', lh.includes('All statuses'));
+
+  const cal = tryRender('sl2', React.createElement(A.ScheduleTab, {
+    data: D7, tabKey: 'schedule', onAdd: noop, onEdit: noop, onDelete: noop }));
+  const ch = (cal.html || '').replace(/<!-- -->/g, '');
+  ok('the calendar tab still renders', !cal.err, cal.err);
+  ok('and no longer carries an internal List/Calendar switch — they are two tabs now',
+     !ch.includes('Capacity plan (FIFO)') || !/>List</.test(ch));
+
+  const legend = tryRender('sl3', React.createElement(A.ScheduleLegend, {}));
+  ok('the legend renders standalone', !legend.err, legend.err);
+}
+
+console.log('\n--- assigned versus unassigned production, on the dashboard ---');
+{
+  const D7 = A.seedData();
+  const dash = tryRender('dash9', React.createElement(A.Dashboard, { data: D7, setTab: noop }));
+  ok('the dashboard still renders', !dash.err, dash.err);
+  const dh = (dash.html || '').replace(/<!-- -->/g, '');
+  ok('planned production is split by whether anyone ordered it',
+     dh.includes('Planned production') && dh.includes('Unassigned'));
+  ok('with a route to the detail', dh.includes('Open run list'));
+  // Mixed units across products, so the honest framing is a share.
+  ok('and it says the total is a share, not a quantity to trust',
+     dh.includes('Mixed units'));
+}
+
+console.log('\n--- lists sort and filter ---');
+{
+  const D7 = A.seedData();
+  // Named one by one on purpose: mkapp.sh derives the bundle's export list from
+  // the literal A.<name> references in this file, so a component reached
+  // through A[variable] is never exported and renders as undefined.
+  const catalogProps = { data: D7, search: '', setSearch: noop, onAdd: noop, onEdit: noop,
+                         onDelete: noop, onInventory: noop };
+  const plainProps = { data: D7, search: '', setSearch: noop, onAdd: noop, onEdit: noop, onDelete: noop };
+  [['RawMaterialsTab', A.RawMaterialsTab, catalogProps],
+   ['IntermediateProductsTab', A.IntermediateProductsTab, catalogProps],
+   ['FinishedGoodsTab', A.FinishedGoodsTab, catalogProps],
+   ['ComponentsTab', A.ComponentsTab, plainProps],
+   ['EquipmentTab', A.EquipmentTab, plainProps]
+  ].forEach(([name, Cmp, props]) => {
+    const r = tryRender(name, React.createElement(Cmp, props));
+    ok(name + ' renders', !r.err, r.err);
+    const h = (r.html || '').replace(/<!-- -->/g, '');
+    ok(name + ' offers sorting and search', h.includes('Sort') && h.includes('↕'));
+  });
+
+  // The arrow marks the column in force. One on every heading would say
+  // nothing about which is actually sorting.
+  const rm = (tryRender('rm', React.createElement(A.RawMaterialsTab, { data: D7, search: '',
+    setSearch: noop, onAdd: noop, onEdit: noop, onDelete: noop, onInventory: noop })).html || '');
+  // Scoped to the header row: the toolbar carries its own direction button,
+  // which is a different control and legitimately shows an arrow too.
+  const head = rm.slice(rm.indexOf('<thead>'), rm.indexOf('</thead>'));
+  ok('exactly one column shows the active sort direction',
+     (head.match(/↑/g) || []).length + (head.match(/↓/g) || []).length === 1,
+     'up=' + (head.match(/↑/g) || []).length + ' down=' + (head.match(/↓/g) || []).length);
+  ok('the rest are marked sortable, not sorted', (head.match(/↕/g) || []).length >= 5);
+}
+
+console.log('\n--- volume tiers say what their columns are ---');
+{
+  const D7 = A.seedData();
+  const withTiers = (D7.customers || []).find(c =>
+    (c.priceList || []).some(p => (p.tiers || []).length > 0)) || D7.customers[0];
+  const m = tryRender('cust9', React.createElement(A.CustomerModal, {
+    data: D7, id: withTiers.id, onClose: noop, update: noop }));
+  ok('the customer form renders', !m.err, m.err);
+  const h = (m.html || '').replace(/<!-- -->/g, '');
+  ok('three unlabelled number boxes are now labelled',
+     h.includes('Units (min qty)') && h.includes('Price per unit') && h.includes('Gross margin'));
 }
 
 console.log('\n============================');

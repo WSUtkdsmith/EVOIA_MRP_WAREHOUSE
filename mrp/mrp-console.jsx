@@ -672,7 +672,13 @@ const SCHEMA = {
     label: "Production run",
     pk: "id",
     columns: {
-      id: "str", productType: "enum:intermediate|finished!", productId: "str!",
+      id: "str",
+      // A number people can say out loud and write on a traveller. The id is a
+      // random string that exists for the database's benefit; this exists for
+      // the floor's, and is what a sales order quotes when it says which run
+      // is filling it.
+      reference: "str",
+      productType: "enum:intermediate|finished!", productId: "str!",
       qty: "num", dueDate: "date", status: "str", notes: "str",
       customerId: "ref:customers", completedDate: "date", createdDate: "date",
       // Baseline: what was committed to at the moment of freezing. Written
@@ -919,6 +925,11 @@ const SCHEMA = {
       id: "str", reference: "str!", customerId: "ref:customers!", addressId: "str",
       salesRep: "str", orderDate: "date!", requestedDate: "date",
       status: "enum:Draft|Submitted|Reviewed|Released|Cancelled!",
+      // Who keyed it in, as distinct from whose sale it is. The rep owns the
+      // commercial relationship; this is who typed the numbers, which is the
+      // question asked when a line turns out to be wrong. Free text for now -
+      // it becomes the logged-in user once authentication lands.
+      enteredBy: "str", enteredAt: "date",
       notes: "str"
     },
     embeds: {},
@@ -2710,6 +2721,112 @@ const tx = {
   /* Record a review decision on a sales order line. Accepting or adjusting
      does not itself raise a run - that is releaseSalesOrderLine - so a
      decision can be revisited before anything hits the schedule. */
+  /* Raise a sales order.
+
+     There was no way to create one at all: the console could review and
+     release orders that arrived with the seed data, and that was it. */
+  raiseSalesOrder(db, { reference, customerId, addressId, salesRep, enteredBy,
+                        orderDate, requestedDate, notes, lines, submit }) {
+    const customer = repo.find(db, "customers", customerId);
+    if (!customer) return { ok: false, error: "Pick a customer." };
+
+    const clean = (lines || [])
+      .filter(l => l && l.finishedGoodId && (Number(l.qty) || 0) > 0)
+      .map(l => {
+        const priceLine = (customer.priceList || []).find(p => p.finishedGoodId === l.finishedGoodId);
+        const qty = Number(l.qty) || 0;
+        // The list price is whatever the customer's own price list says at
+        // this quantity. Capturing it here rather than deriving it later is
+        // what makes the concession visible: the list moves, the order does not.
+        const listPrice = l.listPrice !== undefined && l.listPrice !== ""
+          ? Number(l.listPrice)
+          : (priceLine ? getEffectivePrice(priceLine, qty) : 0);
+        return {
+          id: l.id || uid(), finishedGoodId: l.finishedGoodId, qty,
+          listPrice, discountPct: Number(l.discountPct) || 0,
+          requestedDate: l.requestedDate || requestedDate || "",
+          reviewDecision: "Pending", approvedQty: "", approvedDate: "",
+          reviewNote: "", scheduleId: "", notes: l.notes || ""
+        };
+      });
+    if (!clean.length) return { ok: false, error: "An order needs at least one product and quantity." };
+
+    const ref = String(reference || "").trim() || nextSalesOrderReference(db);
+    if ((db.salesOrders || []).some(o => o.reference === ref)) {
+      return { ok: false, error: "Reference " + ref + " is already in use." };
+    }
+    const order = repo.create(db, "salesOrders", {
+      reference: ref, customerId, addressId: addressId || "",
+      salesRep: salesRep || "", enteredBy: enteredBy || "",
+      enteredAt: todayStr(),
+      orderDate: orderDate || todayStr(), requestedDate: requestedDate || "",
+      status: submit ? "Submitted" : "Draft", notes: notes || "", lines: clean
+    });
+    return { ok: true, order };
+  },
+
+  /* Point a sales order line at a run that already exists.
+
+     Releasing a line creates a run; this is the other direction, for the run
+     that was already planned before the order arrived - forecast production,
+     a campaign, a run someone scheduled by hand. Without it the only way to
+     satisfy an order from planned stock was to release a second run for the
+     same goods and then remember to delete one.
+
+     The product has to match. Everything else about a run can be argued over,
+     but an order for one product filled by a run making another is not a
+     linkage, it is a mistake with a reference number. */
+  linkSalesOrderLineToRun(db, { salesOrderId, lineId, scheduleId }) {
+    const order = repo.find(db, "salesOrders", salesOrderId);
+    if (!order) return { ok: false, error: "That sales order no longer exists." };
+    const line = (order.lines || []).find(l => l.id === lineId);
+    if (!line) return { ok: false, error: "That line no longer exists." };
+    if (line.scheduleId) return { ok: false, error: "That line is already linked to a run." };
+
+    const decision = line.reviewDecision || "Pending";
+    if (decision !== "Accept" && decision !== "Adjust") {
+      return { ok: false, error: "Only accepted or adjusted lines can be linked to a run." };
+    }
+    const run = repo.find(db, "schedule", scheduleId);
+    if (!run) return { ok: false, error: "That run no longer exists." };
+    if (run.status === "Cancelled") return { ok: false, error: "That run was cancelled." };
+    if (run.productType !== "finished" || run.productId !== line.finishedGoodId) {
+      return { ok: false, error: "That run does not make the product on this line." };
+    }
+
+    line.scheduleId = run.id;
+    // One run can legitimately fill several orders, so an existing customer is
+    // not overwritten - the run stops belonging to any single one of them.
+    if (!run.customerId) run.customerId = order.customerId;
+    const label = "Linked to " + order.reference;
+    run.notes = run.notes ? run.notes + " · " + label : label;
+
+    const unreleased = (order.lines || []).filter(l => {
+      const dec = l.reviewDecision || "Pending";
+      return (dec === "Accept" || dec === "Adjust") && !l.scheduleId;
+    });
+    if (!unreleased.length) order.status = "Released";
+    return { ok: true, run, line, order };
+  },
+
+  /* Undo a link. Only ever the link: a run raised by releasing a line stays
+     scheduled, because the plant may well have started it. Deleting it is a
+     separate, deliberate act. */
+  unlinkSalesOrderLine(db, { salesOrderId, lineId }) {
+    const order = repo.find(db, "salesOrders", salesOrderId);
+    if (!order) return { ok: false, error: "That sales order no longer exists." };
+    const line = (order.lines || []).find(l => l.id === lineId);
+    if (!line) return { ok: false, error: "That line no longer exists." };
+    if (!line.scheduleId) return { ok: false, error: "That line is not linked to a run." };
+    const run = repo.find(db, "schedule", line.scheduleId);
+    if (run && run.status === "Complete") {
+      return { ok: false, error: "That run is already complete - unlinking would lose what filled the order." };
+    }
+    line.scheduleId = "";
+    if (order.status === "Released") order.status = "Reviewed";
+    return { ok: true, line, order };
+  },
+
   reviewSalesOrderLine(db, { salesOrderId, lineId, decision, approvedQty, approvedDate, note }) {
     const order = repo.find(db, "salesOrders", salesOrderId);
     if (!order) return { ok: false, error: "That sales order no longer exists." };
@@ -2760,6 +2877,7 @@ const tx = {
 
     const dueDate = line.approvedDate || line.requestedDate || order.requestedDate || todayStr();
     const run = repo.create(db, "schedule", {
+      reference: nextRunReference(db),
       productType: "finished", productId: line.finishedGoodId,
       qty, dueDate, status: "Planned",
       notes: "Released from " + order.reference +
@@ -4350,7 +4468,7 @@ function seedData() {
   return backfillRowIds({
     seedVersion: SEED_VERSION,
     rawMaterials, intermediateProducts, finishedGoods, processes,
-    schedule: schedule.map(normalizeScheduleEntry),
+    schedule: backfillRunReferences(schedule.map(normalizeScheduleEntry)),
     equipment, maintenance, customers, components, wasteStreams, shipments,
     operatingCalendars, productionTargets, purchaseOrders, salesOrders,
     fulfilmentCancellations, warehouseReceipts: [],
@@ -4547,9 +4665,54 @@ function normalizeEquipment(list) {
 /* A run loaded from storage may predate freezing, baselines or the revision
    log. Absent means never frozen, which is the safe reading - it leaves the
    run editable rather than locking history nobody committed to. */
+/* Give every run a number, once.
+
+   Existing runs predate the reference column, so they need backfilling - but
+   the number has to be STABLE. Deriving it from array position on every load
+   would renumber the whole schedule the moment a run is inserted or deleted,
+   and a traveller printed last week would then point at the wrong job. So a
+   reference is assigned only where one is missing, and whatever is already
+   stored is never touched. The first save makes it permanent. */
+function backfillRunReferences(list) {
+  const rows = Array.isArray(list) ? list : [];
+  const used = {};
+  rows.forEach(r => { if (r && r.reference) used[String(r.reference)] = true; });
+  let n = 1;
+  return rows.map(r => {
+    if (!r || r.reference) return r;
+    let ref;
+    do { ref = "RUN-" + String(n++).padStart(5, "0"); } while (used[ref]);
+    used[ref] = true;
+    return { ...r, reference: ref };
+  });
+}
+
+function nextRunReference(data) {
+  const used = {};
+  ((data && data.schedule) || []).forEach(r => { if (r && r.reference) used[String(r.reference)] = true; });
+  let n = Object.keys(used).length + 1;
+  for (;;) {
+    const ref = "RUN-" + String(n).padStart(5, "0");
+    if (!used[ref]) return ref;
+    n++;
+  }
+}
+
+function nextSalesOrderReference(data) {
+  const used = {};
+  ((data && data.salesOrders) || []).forEach(o => { if (o && o.reference) used[String(o.reference)] = true; });
+  let n = Object.keys(used).length + 1;
+  for (;;) {
+    const ref = "SO-" + String(n).padStart(5, "0");
+    if (!used[ref]) return ref;
+    n++;
+  }
+}
+
 function normalizeScheduleEntry(s) {
   return {
     ...s,
+    reference: s.reference || "",
     customerId: s.customerId || "",
     completedDate: s.completedDate || "",
     createdDate: s.createdDate || "",
@@ -4618,7 +4781,7 @@ function normalizeData(raw) {
         equipment: Array.isArray(p.equipment) ? p.equipment : [],
         outputs: Array.isArray(p.outputs) ? p.outputs : []
       })),
-      schedule: (Array.isArray(raw.schedule) ? raw.schedule : []).map(normalizeScheduleEntry),
+      schedule: backfillRunReferences((Array.isArray(raw.schedule) ? raw.schedule : []).map(normalizeScheduleEntry)),
       productionTargets: Array.isArray(raw.productionTargets) ? raw.productionTargets : [],
       equipment: normalizeEquipment(raw.equipment),
       maintenance: (Array.isArray(raw.maintenance) ? raw.maintenance : []).map(m => ({ ...m, durationHours: migrateHours(m, "durationHours", "durationDays", 24) })),
@@ -4693,7 +4856,7 @@ function normalizeData(raw) {
     }
   });
 
-  const schedule = (Array.isArray(raw.schedule) ? raw.schedule : []).map(normalizeScheduleEntry);
+  const schedule = backfillRunReferences((Array.isArray(raw.schedule) ? raw.schedule : []).map(normalizeScheduleEntry));
   const productionTargets = Array.isArray(raw.productionTargets) ? raw.productionTargets : [];
   const equipment = normalizeEquipment(raw.equipment);
   const maintenance = (Array.isArray(raw.maintenance) ? raw.maintenance : []).map(m => ({ ...m, durationHours: migrateHours(m, "durationHours", "durationDays", 24) }));
@@ -5894,6 +6057,125 @@ function inProcessLots(data) {
 }
 
 /* ------------------------------------------------------------------
+   Sorting, shared.
+
+   Every list in the console grew its own ordering, most of them fixed and
+   none of them stated. Sorting lives here so a list's order is a property of
+   the data rather than of whichever component happened to render it.
+
+   Numbers compare as numbers and dates as strings, which ISO dates allow.
+   The part worth getting right is empty values: a blank due date is not
+   "the earliest", and sorting it to the top puts the least informative rows
+   where the eye lands first. Blanks sort last in both directions.
+----------------------------------------------------------------*/
+function compareBy(a, b, key, dir, kind) {
+  const av = a == null ? null : a[key], bv = b == null ? null : b[key];
+  const aEmpty = av === undefined || av === null || av === "";
+  const bEmpty = bv === undefined || bv === null || bv === "";
+  if (aEmpty && bEmpty) return 0;
+  if (aEmpty) return 1;          // blanks last, whichever way we are sorting
+  if (bEmpty) return -1;
+  let n;
+  if (kind === "num") n = (Number(av) || 0) - (Number(bv) || 0);
+  else n = String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: "base" });
+  return dir === "desc" ? -n : n;
+}
+
+function sortRows(rows, sort, columns) {
+  const list = Array.isArray(rows) ? rows.slice() : [];
+  if (!sort || !sort.key) return list;
+  const col = (columns || []).find(c => c.key === sort.key);
+  const kind = col ? col.kind : "str";
+  // A stable sort with a defined tiebreak: two rows equal on the sort key must
+  // not swap places between renders, or the list flickers under the cursor.
+  return list
+    .map((row, i) => ({ row, i }))
+    .sort((x, y) => compareBy(x.row, y.row, sort.key, sort.dir, kind) || (x.i - y.i))
+    .map(x => x.row);
+}
+
+/* Free-text filter across whichever fields a list says are searchable. */
+function filterRows(rows, query, fields) {
+  const q = String(query || "").trim().toLowerCase();
+  if (!q) return Array.isArray(rows) ? rows : [];
+  return (Array.isArray(rows) ? rows : []).filter(r => {
+    if (!r) return false;
+    return (fields || []).some(f => {
+      const v = typeof f === "function" ? f(r) : r[f];
+      return v != null && String(v).toLowerCase().includes(q);
+    });
+  });
+}
+
+/* Planned production, split by whether anyone has asked for it.
+
+   A run with no sales order behind it is not a fault - forecast production
+   and campaign runs are deliberate, and building to stock is a decision, not
+   an oversight. But it is a number worth watching: unassigned production is
+   working capital sitting on a rack, and a large or growing share of it is
+   the plant making things nobody has ordered.
+
+   Runs that are done or cancelled are excluded. The question is what is
+   coming, not what already came. */
+function plannedProductionSplit(data) {
+  const linked = {};
+  ((data && data.salesOrders) || []).forEach(o => {
+    if (!o || o.status === "Cancelled") return;
+    (o.lines || []).forEach(l => {
+      if (!l || !l.scheduleId) return;
+      if (!linked[l.scheduleId]) linked[l.scheduleId] = [];
+      linked[l.scheduleId].push({ orderId: o.id, reference: o.reference || "", lineId: l.id });
+    });
+  });
+
+  const assigned = [], unassigned = [];
+  ((data && data.schedule) || []).forEach(run => {
+    if (!run) return;
+    if (run.status === "Complete" || run.status === "Cancelled") return;
+    (linked[run.id] ? assigned : unassigned).push(run);
+  });
+
+  const qty = rows => Math.round(rows.reduce((n, r) => n + (Number(r.qty) || 0), 0) * 100) / 100;
+  const assignedQty = qty(assigned), unassignedQty = qty(unassigned);
+  const total = assignedQty + unassignedQty;
+  return {
+    assigned, unassigned, linked,
+    counts: { assigned: assigned.length, unassigned: unassigned.length,
+              total: assigned.length + unassigned.length },
+    qty: { assigned: assignedQty, unassigned: unassignedQty, total },
+    // Share of planned output nobody has ordered. Null rather than zero when
+    // there is no plan at all: 0% reads as "all spoken for", which is a
+    // different statement from "there is nothing scheduled".
+    unassignedPct: total > 0 ? Math.round((unassignedQty / total) * 100) : null
+  };
+}
+
+/* Which sales order lines a run is filling, if any. */
+function ordersForRun(data, runId) {
+  const out = [];
+  ((data && data.salesOrders) || []).forEach(o => {
+    if (!o || o.status === "Cancelled") return;
+    (o.lines || []).forEach(l => {
+      if (l && l.scheduleId === runId) {
+        out.push({ order: o, line: l, reference: o.reference || "" });
+      }
+    });
+  });
+  return out;
+}
+
+/* Runs a given sales order line could be linked to: same product, still open,
+   not already spoken for by this same line. Soonest due first, because the
+   planner is nearly always looking for the next one that will do. */
+function linkableRunsForLine(data, finishedGoodId) {
+  return ((data && data.schedule) || [])
+    .filter(r => r && r.productType === "finished" && r.productId === finishedGoodId
+                 && r.status !== "Cancelled" && r.status !== "Complete")
+    .slice()
+    .sort((a, b) => String(a.dueDate).localeCompare(String(b.dueDate)));
+}
+
+/* ------------------------------------------------------------------
    Batch run clock.
 
    Elapsed time is derived, never stored: a stored duration and a stored
@@ -6718,6 +7000,8 @@ function salesOrderRecords(data, options) {
       customerName: customer ? customer.name : "(deleted customer)",
       addressLabel: address ? address.label : "",
       salesRep: order.salesRep || "",
+      enteredBy: order.enteredBy || "",
+      enteredAt: order.enteredAt || "",
       orderDate: order.orderDate,
       requestedDate: order.requestedDate,
       status: order.status || "Draft",
@@ -8595,6 +8879,10 @@ const ADMIN_NAV_GROUPS = [
     items: [
       { key: "dashboard", label: "Overview", icon: LayoutDashboard },
       { key: "schedule", label: "Production schedule", icon: Calendar },
+      // The calendar answers "when", the list answers "what and where is it
+      // up to". Two questions, two destinations - toggling between them
+      // inside one tab hid the list from anyone who never found the switch.
+      { key: "scheduleList", label: "Run list", icon: ClipboardList },
       // Equipment sits with the schedule rather than with Processes: its
       // units and operating hours are what the capacity plan is built from.
       { key: "equipment", label: "Equipment", icon: Wrench },
@@ -8645,6 +8933,7 @@ const ADMIN_NAV_GROUPS = [
    from every destination being visible without a click. */
 const OPERATOR_NAV = [
   { key: "schedule", label: "Production schedule", icon: Calendar },
+  { key: "scheduleList", label: "Run list", icon: ClipboardList },
   { key: "receiving", label: "Raw material receiving", icon: Package },
   // Operators are the ones who ask for material and sign for it, so this is
   // not an admin-only view.
@@ -9094,7 +9383,8 @@ export default function App() {
         )}
         {tab === "salesOrders" && view === "admin" && (
           <SalesOrdersTab data={data}
-            onOpenOrder={(id) => setModal({ type: "salesOrder", id })} />
+            onOpenOrder={(id) => setModal({ type: "salesOrder", id })}
+            onNewOrder={() => setModal({ type: "newSalesOrder" })} />
         )}
         {tab === "customers" && (
           <CustomersTab data={data} search={search} setSearch={setSearch}
@@ -9102,8 +9392,8 @@ export default function App() {
             onEdit={(id) => setModal({ type: "customer", id })}
             onDelete={removeCustomer} />
         )}
-        {tab === "schedule" && (
-          <ScheduleTab data={data} readOnly={view === "operator"}
+        {(tab === "schedule" || tab === "scheduleList") && (
+          <ScheduleTab data={data} readOnly={view === "operator"} tabKey={tab}
             onAdd={() => setModal({ type: "schedule", id: null })}
             onEdit={(id) => setModal({ type: "schedule", id })}
             onDelete={removeSchedule}
@@ -9230,6 +9520,9 @@ export default function App() {
       {modal && modal.type === "salesOrder" && (
         <SalesOrderModal data={data} orderId={modal.id}
           onClose={() => setModal(null)} update={update} />
+      )}
+      {modal && modal.type === "newSalesOrder" && (
+        <NewSalesOrderModal data={data} onClose={() => setModal(null)} update={update} />
       )}
 
       {modal && modal.type === "shipmentTrace" && (
@@ -9431,6 +9724,7 @@ function Dashboard({ data, setTab, onEditTargets }) {
      double counting, so it is the honest default. Everything else is one
      click away and says what it is measuring. */
   const [prodScope, setProdScope] = useState("finished");
+  const planSplit = useMemo(() => plannedProductionSplit(data), [data]);
   const [showScheduled, setShowScheduled] = useState(true);
 
   /* What the output chart is counting. Mixing kilogrammes of powder with
@@ -9662,6 +9956,60 @@ function Dashboard({ data, setTab, onEditTargets }) {
         })}
       </div>
 
+      {/* How much of what is planned has actually been asked for.
+
+          Not a fault condition - forecast production and campaign runs are
+          deliberate decisions - so this is stated, not warned about. What
+          makes it worth a panel is that unassigned production is working
+          capital going onto a rack, and nothing else on this page says how
+          much of it there is. */}
+      <div style={{ background: "#fff", border: "1px solid #E2E4DD", borderRadius: 10,
+                    padding: "12px 16px", marginBottom: 20 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline",
+                      flexWrap: "wrap", gap: 10, marginBottom: 8 }}>
+          <div style={{ fontWeight: 700, fontSize: 14 }}>Planned production</div>
+          <div style={{ fontSize: 12, color: "#7A8079" }}>
+            {planSplit.counts.total > 0
+              ? <>
+                  <b>{planSplit.counts.assigned}</b> run(s) against a sales order ·{" "}
+                  <b>{planSplit.counts.unassigned}</b> to stock
+                </>
+              : "Nothing scheduled."}
+          </div>
+        </div>
+        {planSplit.counts.total > 0 && (
+          <>
+            <div style={{ display: "flex", height: 12, borderRadius: 6, overflow: "hidden",
+                          background: "#EEF0EA", marginBottom: 8 }}>
+              <div title={"Against a sales order: " + fmtNum(planSplit.qty.assigned)}
+                style={{ width: (100 - (planSplit.unassignedPct || 0)) + "%", background: "#1F6F78" }} />
+              <div title={"Not against an order: " + fmtNum(planSplit.qty.unassigned)}
+                style={{ width: (planSplit.unassignedPct || 0) + "%", background: "#C9CFC0" }} />
+            </div>
+            <div style={{ display: "flex", gap: 18, flexWrap: "wrap", fontSize: 12, color: "#5B6470" }}>
+              <span>
+                <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 2,
+                               background: "#1F6F78", marginRight: 6 }} />
+                Assigned <span className="mono" style={{ fontWeight: 700 }}>{fmtNum(planSplit.qty.assigned)}</span>
+              </span>
+              <span>
+                <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 2,
+                               background: "#C9CFC0", marginRight: 6 }} />
+                Unassigned <span className="mono" style={{ fontWeight: 700 }}>{fmtNum(planSplit.qty.unassigned)}</span>
+                {planSplit.unassignedPct != null && <span> ({planSplit.unassignedPct}% of planned output)</span>}
+              </span>
+              <a onClick={() => setTab("scheduleList")}
+                style={{ color: "#1F6F78", fontWeight: 600, cursor: "pointer", textDecoration: "underline" }}>
+                Open run list
+              </a>
+            </div>
+            <div style={{ fontSize: 11, color: "#8A9099", marginTop: 6 }}>
+              Mixed units across products — a share, not a total. Completed and cancelled runs are excluded.
+            </div>
+          </>
+        )}
+      </div>
+
       {earliestOverdue && (
         <div style={{ background: "#F3DBD6", border: "1px solid #E3B9B2", borderRadius: 10, padding: "12px 16px", marginBottom: 14, display: "flex", alignItems: "center", gap: 10, color: "#8A2E20", fontSize: 13.5 }}>
           <AlertTriangle size={17} />
@@ -9871,24 +10219,45 @@ function SearchBox({ value, onChange, placeholder }) {
 /* ---------------------------------------------------------------
    Raw Materials Tab (admin)
 ----------------------------------------------------------------*/
+const RM_COLS = [
+  { key: "name", label: "Material", kind: "str" },
+  { key: "supplier", label: "Supplier", kind: "str" },
+  { key: "unitCost", label: "Unit cost", kind: "num" },
+  { key: "certification", label: "Certification", kind: "str" },
+  { key: "leadTimeDays", label: "Lead time", kind: "num" },
+  { key: "stock", label: "Stock (lots)", kind: "num" },
+  { key: "reorderPoint", label: "Reorder pt", kind: "num" },
+  { key: "onOrder", label: "On order", kind: "num" }
+];
+
 function RawMaterialsTab({ data, search, setSearch, onAdd, onEdit, onDelete, onInventory }) {
-  const rows = data.rawMaterials.filter(r =>
-    !search || r.name.toLowerCase().includes(search.toLowerCase()) || r.sku.toLowerCase().includes(search.toLowerCase()) || r.supplier.toLowerCase().includes(search.toLowerCase())
-  );
+  // Flattened once: sorting compares values rather than recomputing stock and
+  // open-order quantity on every comparison.
+  const source = useMemo(() => (data.rawMaterials || []).map(r => ({
+    ...r, stock: lotQty(r.lots), onOrder: openOrderQty(data, r.id)
+  })), [data]);
+  const view = useListView(source, {
+    columns: RM_COLS,
+    fields: ["name", "sku", "supplier", "certification"],
+    initialSort: { key: "name", dir: "asc" }
+  });
+  const rows = view.rows;
   return (
     <div>
       <PageHeader tabKey="materials" subtitle="Supplier, cost, certification, lead-time and lot-level detail for every input material"
-        action={<div style={{ display: "flex", gap: 10 }}><SearchBox value={search} onChange={setSearch} placeholder="Search materials…" /><Btn onClick={onAdd}><Plus size={15} />Add material</Btn></div>} />
+        action={<Btn onClick={onAdd}><Plus size={15} />Add material</Btn>} />
+      <ListToolbar view={view} columns={RM_COLS} placeholder="Name, SKU, supplier…" />
       <div style={{ background: "#fff", border: "1px solid #E2E4DD", borderRadius: 10, overflow: "hidden" }}>
         <table className="mrp-table">
           <thead>
             <tr>
-              <th>Material</th><th>Supplier</th><th>Unit cost</th><th>Certification</th><th>Lead time</th><th>Stock (lots)</th><th>Reorder pt</th><th>On order</th><th></th>
+              {RM_COLS.map(c => <SortableTh key={c.key} view={view} col={c} />)}
+              <th></th>
             </tr>
           </thead>
           <tbody>
             {rows.map(r => {
-              const stock = lotQty(r.lots);
+              const stock = r.stock;
               const low = stock <= r.reorderPoint;
               return (
                 <tr key={r.id}>
@@ -10069,17 +10438,31 @@ function RawMaterialModal({ data, id, onClose, update }) {
 /* ---------------------------------------------------------------
    Intermediate Products (catalog)
 ----------------------------------------------------------------*/
-function ProducedItemsTable({ rows, data, itemType, onEdit, onDelete, onInventory, emptyMessage, unitLabel }) {
+const PRODUCED_COLS = [
+  { key: "name", label: "Item", kind: "str" },
+  { key: "producerName", label: "Produced by", kind: "str" },
+  { key: "unitCost", label: "Unit cost", kind: "num" },
+  { key: "hazardClass", label: "Hazard", kind: "str" },
+  { key: "stock", label: "Stock (lots)", kind: "num" }
+];
+
+/* Shared by intermediate products and finished goods, so sorting them is one
+   change rather than two that drift apart. */
+function ProducedItemsTable({ rows, data, itemType, onEdit, onDelete, onInventory, emptyMessage, unitLabel, view }) {
+  const cols = PRODUCED_COLS.map(c => c.key === "name" ? { ...c, label: unitLabel } : c);
   return (
     <div style={{ background: "#fff", border: "1px solid #E2E4DD", borderRadius: 10, overflow: "hidden" }}>
       <table className="mrp-table">
         <thead>
-          <tr><th>{unitLabel}</th><th>Produced by</th><th>Unit cost</th><th>Hazard</th><th>Stock (lots)</th><th></th></tr>
+          <tr>
+            {cols.map(c => <SortableTh key={c.key} view={view} col={c} />)}
+            <th></th>
+          </tr>
         </thead>
         <tbody>
           {rows.map(item => {
-            const stock = lotQty(item.lots);
-            const unitCost = computeItemUnitCost(data, itemType, item.id);
+            const stock = item.stock;
+            const unitCost = item.unitCost;
             const producer = findProcessForOutput(data, itemType, item.id);
             const composition = computeEffectiveComposition(data, itemType, item.id);
             return (
@@ -10110,13 +10493,31 @@ function ProducedItemsTable({ rows, data, itemType, onEdit, onDelete, onInventor
   );
 }
 
+function useProducedItemsView(data, itemType, collection) {
+  const source = useMemo(() => (data[collection] || []).map(i => {
+    const producer = findProcessForOutput(data, itemType, i.id);
+    return {
+      ...i,
+      stock: lotQty(i.lots),
+      unitCost: computeItemUnitCost(data, itemType, i.id),
+      producerName: producer ? producer.name : ""
+    };
+  }), [data, itemType, collection]);
+  return useListView(source, {
+    columns: PRODUCED_COLS,
+    fields: ["name", "sku", "producerName", "hazardClass"],
+    initialSort: { key: "name", dir: "asc" }
+  });
+}
+
 function IntermediateProductsTab({ data, search, setSearch, onAdd, onEdit, onDelete, onInventory }) {
-  const rows = data.intermediateProducts.filter(i => !search || i.name.toLowerCase().includes(search.toLowerCase()) || i.sku.toLowerCase().includes(search.toLowerCase()));
+  const view = useProducedItemsView(data, "intermediate", "intermediateProducts");
   return (
     <div>
       <PageHeader tabKey="intermediateProducts" subtitle="Sub-assembly catalog and stock — recipes live on the Processes tab"
-        action={<div style={{ display: "flex", gap: 10 }}><SearchBox value={search} onChange={setSearch} placeholder="Search intermediate products…" /><Btn onClick={onAdd}><Plus size={15} />Add intermediate product</Btn></div>} />
-      <ProducedItemsTable rows={rows} data={data} itemType="intermediate" onEdit={onEdit} onDelete={onDelete} onInventory={onInventory} emptyMessage="No intermediate products yet." unitLabel="Sub-assembly" />
+        action={<Btn onClick={onAdd}><Plus size={15} />Add intermediate product</Btn>} />
+      <ListToolbar view={view} columns={PRODUCED_COLS} placeholder="Name, SKU, process…" />
+      <ProducedItemsTable rows={view.rows} view={view} data={data} itemType="intermediate" onEdit={onEdit} onDelete={onDelete} onInventory={onInventory} emptyMessage="No intermediate products yet." unitLabel="Sub-assembly" />
     </div>
   );
 }
@@ -10292,12 +10693,13 @@ function IntermediateProductModal({ data, id, onClose, update }) {
    Finished Goods (catalog)
 ----------------------------------------------------------------*/
 function FinishedGoodsTab({ data, search, setSearch, onAdd, onEdit, onDelete, onInventory }) {
-  const rows = data.finishedGoods.filter(f => !search || f.name.toLowerCase().includes(search.toLowerCase()) || f.sku.toLowerCase().includes(search.toLowerCase()));
+  const view = useProducedItemsView(data, "finished", "finishedGoods");
   return (
     <div>
       <PageHeader tabKey="finished" subtitle="Sellable-item catalog and stock — recipes live on the Processes tab"
-        action={<div style={{ display: "flex", gap: 10 }}><SearchBox value={search} onChange={setSearch} placeholder="Search finished goods…" /><Btn onClick={onAdd}><Plus size={15} />Add finished good</Btn></div>} />
-      <ProducedItemsTable rows={rows} data={data} itemType="finished" onEdit={onEdit} onDelete={onDelete} onInventory={onInventory} emptyMessage="No finished goods yet." unitLabel="Product" />
+        action={<Btn onClick={onAdd}><Plus size={15} />Add finished good</Btn>} />
+      <ListToolbar view={view} columns={PRODUCED_COLS} placeholder="Name, SKU, process…" />
+      <ProducedItemsTable rows={view.rows} view={view} data={data} itemType="finished" onEdit={onEdit} onDelete={onDelete} onInventory={onInventory} emptyMessage="No finished goods yet." unitLabel="Product" />
     </div>
   );
 }
@@ -11020,6 +11422,7 @@ function SalesOrderModal({ data, orderId, onClose, update }) {
     [data, orderId]);
   const [draft, setDraft] = useState({});
   const [error, setError] = useState("");
+  const [linking, setLinking] = useState(null);   // the line choosing a run
 
   if (!rec) return null;
   const money = (n) => fmtMoney(n || 0);
@@ -11073,6 +11476,18 @@ function SalesOrderModal({ data, orderId, onClose, update }) {
     if (outcome && !outcome.ok) setError(outcome.error);
   };
 
+  const linkedRun = (l) => l.line.scheduleId
+    ? (data.schedule || []).find(r => r.id === l.line.scheduleId) || null : null;
+  const linkable = (l) => linkableRunsForLine(data, l.line.finishedGoodId)
+    .filter(r => r.id !== l.line.scheduleId);
+
+  const unlink = (l) => {
+    setError("");
+    let outcome = null;
+    update(d2 => { outcome = tx.unlinkSalesOrderLine(d2, { salesOrderId: orderId, lineId: l.line.id }); });
+    if (outcome && !outcome.ok) setError(outcome.error);
+  };
+
   const releaseAll = () => {
     setError("");
     let failures = [];
@@ -11104,6 +11519,9 @@ function SalesOrderModal({ data, orderId, onClose, update }) {
                     background: "#F4F6F9", border: "1px solid #DCE1E8" }}>
         <div><b>{rec.customerName}</b></div>
         <div style={{ color: "#5B6470" }}>Rep: {rec.salesRep || "\u2014"}</div>
+        {/* Whose sale it is, and who typed it - the second is the question
+            asked when a line turns out to be wrong. */}
+        <div style={{ color: "#5B6470" }}>Entered by: {rec.enteredBy || "\u2014"}</div>
         <div style={{ color: "#5B6470" }}>Ordered {fmtDate(rec.orderDate)}</div>
         <div style={{ color: "#5B6470" }}>Requested {fmtDate(rec.requestedDate)}</div>
         <Badge tone={rec.status === "Released" ? "good" : rec.status === "Reviewed" ? "info" : "neutral"}>
@@ -11182,9 +11600,18 @@ function SalesOrderModal({ data, orderId, onClose, update }) {
               {l.released ? (
                 <>
                   <Badge tone="good">Released to production</Badge>
+                  {/* Which run is filling this line, by the number the floor
+                      uses - traceability from SO-xxxxx to RUN-xxxxx. */}
+                  {linkedRun(l) && (
+                    <span className="mono" style={{ fontSize: 12, fontWeight: 700 }}>
+                      {linkedRun(l).reference || "\u2014"}
+                    </span>
+                  )}
                   <span style={{ fontSize: 12, color: "#5B6470" }}>
                     {fmtNum(l.approvedQty)} {l.unit} due {fmtDate(l.approvedDate)}
                   </span>
+                  <Btn variant="ghost" onClick={() => unlink(l)}
+                       style={{ padding: "3px 9px", fontSize: 11.5 }}>Unlink</Btn>
                 </>
               ) : (
                 <>
@@ -11199,10 +11626,23 @@ function SalesOrderModal({ data, orderId, onClose, update }) {
                     onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); decide(l, "Adjust"); } }}
                     style={seg(l.decision === "Adjust", "#8C6B45")}>Adjust</div>
                   {(l.decision === "Accept" || l.decision === "Adjust") && (
-                    <Btn variant="secondary" onClick={() => release(l)}
-                         style={{ padding: "3px 10px", fontSize: 11.5 }}>
-                      Release to schedule
-                    </Btn>
+                    <>
+                      <Btn variant="secondary" onClick={() => release(l)}
+                           style={{ padding: "3px 10px", fontSize: 11.5 }}>
+                        Release to schedule
+                      </Btn>
+                      {/* Releasing raises a NEW run. When one is already
+                          planned - forecast production, a campaign, something
+                          scheduled by hand - linking to it is the right move,
+                          and without this the only way was to release a second
+                          run for the same goods and delete one afterwards. */}
+                      {linkable(l).length > 0 && (
+                        <Btn variant="secondary" onClick={() => setLinking(l)}
+                             style={{ padding: "3px 10px", fontSize: 11.5 }}>
+                          Link to existing run ({linkable(l).length})
+                        </Btn>
+                      )}
+                    </>
                   )}
                 </>
               )}
@@ -11257,24 +11697,360 @@ function SalesOrderModal({ data, orderId, onClose, update }) {
           <Btn variant="secondary" onClick={onClose}>Close</Btn>
         </div>
       </div>
+
+      {linking && (
+        <LinkRunModal data={data} orderId={orderId} detail={linking}
+          runs={linkable(linking)} update={update}
+          onClose={() => setLinking(null)} onError={setError} />
+      )}
     </Modal>
   );
 }
 
-function SalesOrdersTab({ data, onOpenOrder }) {
+/* Pick an existing run to fill a line.
+
+   The run has to make the same product - that is enforced in the transaction,
+   not merely filtered here, because a filtered list is a convenience and this
+   is a correctness rule.
+
+   Quantity is shown but never enforced. A run smaller than the order is a real
+   situation with a real answer (the rest comes from stock, or a second run),
+   and refusing the link would only push the planner into inventing a duplicate
+   run. Shown, not blocked - the same rule over-placement follows. */
+function LinkRunModal({ data, orderId, detail, runs, update, onClose, onError }) {
+  const need = detail.decision === "Adjust"
+    ? (Number(detail.line.approvedQty) || 0) : (Number(detail.qty) || 0);
+  const [chosen, setChosen] = useState(runs[0] ? runs[0].id : "");
+  const [err, setErr] = useState("");
+
+  const link = () => {
+    let outcome = null;
+    update(d => {
+      outcome = tx.linkSalesOrderLineToRun(d, {
+        salesOrderId: orderId, lineId: detail.line.id, scheduleId: chosen });
+    });
+    if (outcome && outcome.ok) { onError && onError(""); onClose(); }
+    else setErr((outcome && outcome.error) || "Could not link that run.");
+  };
+
+  return (
+    <Modal title={"Link " + detail.productName + " to an existing run"} onClose={onClose}>
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 12 }}>
+        This line needs <b>{fmtNum(need)} {detail.unit}</b>. Releasing would raise a new run; linking
+        points the line at production that is already planned, so the plant does not end up making the
+        same goods twice.
+      </div>
+      {runs.length === 0 && (
+        <div style={{ fontSize: 12.5, color: "#B87510" }}>
+          No open run makes this product. Release the line instead — it will raise one.
+        </div>
+      )}
+      {runs.map(r => {
+        const taken = ordersForRun(data, r.id);
+        const short = (Number(r.qty) || 0) < need;
+        return (
+          <label key={r.id} style={{ display: "flex", gap: 10, alignItems: "flex-start", cursor: "pointer",
+                                     padding: "8px 10px", marginBottom: 6, borderRadius: 8,
+                                     background: chosen === r.id ? "#F1F6F2" : "#fff",
+                                     border: "1px solid " + (chosen === r.id ? "#CFE0D3" : "#E7E9E4") }}>
+            <input type="radio" name="run" checked={chosen === r.id} onChange={() => setChosen(r.id)}
+              style={{ marginTop: 3 }} />
+            <span style={{ flex: 1 }}>
+              <span style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <span className="mono" style={{ fontWeight: 700, fontSize: 13 }}>{r.reference || "\u2014"}</span>
+                <Badge tone={r.status === "In progress" ? "info" : "neutral"}>{r.status}</Badge>
+                <span className="mono" style={{ fontSize: 12.5 }}>{fmtNum(r.qty)}</span>
+                <span style={{ fontSize: 12, color: "#8A9099" }}>due {fmtDate(r.dueDate)}</span>
+                {r.frozen && <Badge tone="info">Frozen</Badge>}
+              </span>
+              {short && (
+                <span style={{ display: "block", fontSize: 11.5, color: "#B87510", marginTop: 2 }}>
+                  Makes {fmtNum(r.qty)}, this line needs {fmtNum(need)} — the shortfall has to come from
+                  stock or another run.
+                </span>
+              )}
+              {taken.length > 0 && (
+                <span style={{ display: "block", fontSize: 11.5, color: "#8A9099", marginTop: 2 }}>
+                  Already filling {taken.map(t => t.reference).join(", ")}
+                </span>
+              )}
+            </span>
+          </label>
+        );
+      })}
+      {err && <div style={{ fontSize: 12, color: "#8A2E20", marginTop: 8, fontWeight: 600 }}>{err}</div>}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
+        <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+        <Btn onClick={link} style={{ opacity: chosen ? 1 : 0.5 }}>Link run</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+/* Search + sort for a list, in one place.
+
+   `columns` is the sortable set: { key, label, kind }. `fields` is what the
+   search box looks at, either property names or accessors for anything
+   derived. Returns the rows to render, so a caller never sorts by hand. */
+function useListView(rows, { columns, fields, initialSort }) {
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState(() => initialSort || (columns[0]
+    ? { key: columns[0].key, dir: "asc" } : { key: "", dir: "asc" }));
+  const view = useMemo(
+    () => sortRows(filterRows(rows, query, fields), sort, columns),
+    [rows, query, sort, fields, columns]);
+  return { rows: view, query, setQuery, sort, setSort, total: (rows || []).length };
+}
+
+/* A table heading that sorts.
+
+   Clicking a heading is what "sortable" means on a table, so the control is
+   the heading itself rather than a separate dropdown. The arrow only appears
+   on the active column - an arrow on every heading tells the reader nothing
+   about which one is in force. */
+function SortableTh({ view, col, children, style }) {
+  const active = view.sort.key === col.key;
+  const click = () => view.setSort(s => s.key === col.key
+    ? { key: col.key, dir: s.dir === "asc" ? "desc" : "asc" }
+    : { key: col.key, dir: col.kind === "num" ? "desc" : "asc" });
+  return (
+    <th style={{ cursor: "pointer", userSelect: "none", whiteSpace: "nowrap",
+                 color: active ? "#1F6F78" : undefined, ...(style || {}) }}
+      onClick={click} title={"Sort by " + (col.label || col.key)}
+      role="button" tabIndex={0}
+      onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); click(); } }}>
+      {children != null ? children : col.label}
+      <span style={{ marginLeft: 4, opacity: active ? 1 : 0.25 }}>
+        {active ? (view.sort.dir === "asc" ? "↑" : "↓") : "↕"}
+      </span>
+    </th>
+  );
+}
+
+function ListToolbar({ view, columns, placeholder, children }) {
+  const flip = () => view.setSort(s => ({ ...s, dir: s.dir === "asc" ? "desc" : "asc" }));
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
+      <SearchBox value={view.query} onChange={view.setQuery} placeholder={placeholder || "Search…"} />
+      <span style={{ fontSize: 12, color: "#7A8079" }}>Sort</span>
+      <select style={{ ...inputStyle, width: "auto", minWidth: 150 }} value={view.sort.key}
+        onChange={e => view.setSort(s => ({ ...s, key: e.target.value }))}>
+        {columns.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
+      </select>
+      <button type="button" onClick={flip} title={view.sort.dir === "asc" ? "Ascending" : "Descending"}
+        style={{ ...inputStyle, width: "auto", cursor: "pointer", padding: "0 10px", fontWeight: 600 }}>
+        {view.sort.dir === "asc" ? "↑" : "↓"}
+      </button>
+      {children}
+      <span style={{ fontSize: 11.5, color: "#8A9099", marginLeft: "auto" }}>
+        {view.rows.length === view.total
+          ? view.total + " item(s)"
+          : view.rows.length + " of " + view.total}
+      </span>
+    </div>
+  );
+}
+
+/* Raise a sales order.
+
+   There was no way to create one: the console could review and release the
+   orders that arrived with the seed data and nothing else.
+
+   Prices come from the customer's own price list at the quantity ordered, so
+   picking a customer first is not a formality - it is what makes the rest of
+   the form mean anything. The rep can override, and the override is what the
+   discount is measured against later. */
+function NewSalesOrderModal({ data, update, onClose }) {
+  const customers = (data.customers || []).slice()
+    .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  const [f, setF] = useState(() => ({
+    customerId: customers[0] ? customers[0].id : "",
+    addressId: "", salesRep: "", enteredBy: "",
+    orderDate: todayStr(), requestedDate: "", notes: "",
+    lines: []
+  }));
+  const [err, setErr] = useState("");
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+
+  const customer = customers.find(c => c.id === f.customerId) || null;
+  const addresses = (customer && customer.addresses) || [];
+  const goods = (data.finishedGoods || []).slice()
+    .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+  const priceFor = (finishedGoodId, qty) => {
+    const pl = customer && (customer.priceList || []).find(p => p.finishedGoodId === finishedGoodId);
+    return pl ? getEffectivePrice(pl, Number(qty) || 0) : null;
+  };
+
+  const addLine = () => {
+    if (!goods.length) return;
+    setF(p => ({ ...p, lines: [...p.lines, { id: uid(), finishedGoodId: goods[0].id, qty: 1,
+      listPrice: "", discountPct: 0, requestedDate: "", notes: "" }] }));
+  };
+  const setLine = (i, patch) => setF(p => ({ ...p, lines: p.lines.map((l, n) => n === i ? { ...l, ...patch } : l) }));
+  const removeLine = (i) => setF(p => ({ ...p, lines: p.lines.filter((_, n) => n !== i) }));
+
+  const rows = f.lines.map(l => {
+    const listed = priceFor(l.finishedGoodId, l.qty);
+    const price = l.listPrice !== "" && l.listPrice !== undefined ? Number(l.listPrice) : listed;
+    const qty = Number(l.qty) || 0;
+    const net = (price || 0) * (1 - (Number(l.discountPct) || 0) / 100);
+    const cost = computeItemUnitCost(data, "finished", l.finishedGoodId) || 0;
+    return { line: l, listed, price, qty, net, value: net * qty, cost, belowCost: cost > 0 && net < cost,
+             unpriced: listed == null && (l.listPrice === "" || l.listPrice === undefined) };
+  });
+  const total = rows.reduce((n, r) => n + r.value, 0);
+  const anyBelowCost = rows.some(r => r.belowCost);
+  const anyUnpriced = rows.some(r => r.unpriced);
+  const canSave = !!f.customerId && rows.some(r => r.qty > 0);
+
+  const submit = (asDraft) => {
+    if (!canSave) return;
+    let res = null;
+    update(d => {
+      res = tx.raiseSalesOrder(d, {
+        customerId: f.customerId, addressId: f.addressId, salesRep: f.salesRep,
+        enteredBy: f.enteredBy, orderDate: f.orderDate, requestedDate: f.requestedDate,
+        notes: f.notes, submit: !asDraft,
+        lines: f.lines.map(l => ({
+          finishedGoodId: l.finishedGoodId, qty: l.qty,
+          listPrice: l.listPrice === "" ? undefined : l.listPrice,
+          discountPct: l.discountPct, requestedDate: l.requestedDate, notes: l.notes
+        }))
+      });
+      return d;
+    });
+    if (res && res.ok) onClose(); else setErr((res && res.error) || "Could not raise the order.");
+  };
+
+  return (
+    <Modal title="New sales order" onClose={onClose} wide>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 12 }}>
+        <Field label="Customer">
+          <select style={inputStyle} value={f.customerId}
+            onChange={e => setF(p => ({ ...p, customerId: e.target.value, addressId: "" }))}>
+            {customers.length === 0 && <option value="">No customers yet</option>}
+            {customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        </Field>
+        <Field label="Ship to">
+          <select style={inputStyle} value={f.addressId} onChange={e => set("addressId", e.target.value)}>
+            <option value="">Default</option>
+            {addresses.map(a => <option key={a.id} value={a.id}>{a.label}</option>)}
+          </select>
+        </Field>
+        <Field label="Sales rep" hint="Whose sale it is">
+          <input style={inputStyle} value={f.salesRep} onChange={e => set("salesRep", e.target.value)} />
+        </Field>
+        <Field label="Entered by" hint="Who keyed it in — will be filled from the login once auth lands">
+          <input style={inputStyle} value={f.enteredBy} onChange={e => set("enteredBy", e.target.value)} />
+        </Field>
+        <Field label="Order date">
+          <input type="date" style={inputStyle} value={f.orderDate} onChange={e => set("orderDate", e.target.value)} />
+        </Field>
+        <Field label="Requested date">
+          <input type="date" style={inputStyle} value={f.requestedDate} onChange={e => set("requestedDate", e.target.value)} />
+        </Field>
+      </div>
+
+      <div style={{ borderTop: "1px solid #EEF0EA", paddingTop: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+          <div style={{ fontWeight: 700, fontSize: 13 }}>Products ordered</div>
+          <Btn variant="secondary" onClick={addLine} style={{ padding: "5px 9px", fontSize: 12 }}><Plus size={12} />Add line</Btn>
+        </div>
+        <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 8 }}>
+          Price comes from {customer ? customer.name + "’s" : "the customer’s"} price list at the quantity
+          ordered — including any volume tier. Override it if the rep agreed something else; the difference
+          is what shows up as a concession.
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "2fr 0.7fr 0.8fr 0.7fr 0.9fr 28px", gap: 6,
+                      fontSize: 11, fontWeight: 700, color: "#7A8079", textTransform: "uppercase",
+                      letterSpacing: 0.3, marginBottom: 4 }}>
+          <span>Product</span><span>Qty</span><span>Unit price</span><span>Disc %</span><span>Line value</span><span />
+        </div>
+        {rows.length === 0 && <div style={{ fontSize: 12, color: "#8A9099", padding: "6px 0" }}>No lines yet.</div>}
+        {rows.map((r, i) => (
+          <div key={r.line.id} style={{ marginBottom: 6 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "2fr 0.7fr 0.8fr 0.7fr 0.9fr 28px", gap: 6, alignItems: "center" }}>
+              <select style={inputStyle} value={r.line.finishedGoodId}
+                onChange={e => setLine(i, { finishedGoodId: e.target.value, listPrice: "" })}>
+                {goods.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+              </select>
+              <input type="number" step="0.01" style={inputStyle} value={r.line.qty}
+                onChange={e => setLine(i, { qty: parseFloat(e.target.value) || 0 })} />
+              <input type="number" step="0.01" style={{ ...inputStyle, borderColor: r.belowCost ? "#D97066" : "#D7DAD3" }}
+                value={r.line.listPrice === "" ? (r.listed == null ? "" : r.listed) : r.line.listPrice}
+                onChange={e => setLine(i, { listPrice: e.target.value })}
+                placeholder={r.listed == null ? "no list price" : String(r.listed)} />
+              <input type="number" step="0.1" style={inputStyle} value={r.line.discountPct}
+                onChange={e => setLine(i, { discountPct: parseFloat(e.target.value) || 0 })} />
+              <span className="mono" style={{ fontSize: 12.5, fontWeight: 600 }}>{fmtMoney(r.value)}</span>
+              <IconBtn onClick={() => removeLine(i)} title="Remove" danger><Trash2 size={12} /></IconBtn>
+            </div>
+            {r.belowCost && (
+              <div style={{ fontSize: 11.5, color: "#8A2E20", fontWeight: 600, marginTop: 2 }}>
+                Below cost — {fmtMoney(r.net)} against a unit cost of {fmtMoney(r.cost)}.
+              </div>
+            )}
+            {r.unpriced && (
+              <div style={{ fontSize: 11.5, color: "#B87510", marginTop: 2 }}>
+                No price list entry for this product — enter a price or it goes to review unpriced.
+              </div>
+            )}
+          </div>
+        ))}
+
+        <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, alignItems: "center",
+                      borderTop: "1px solid #EEF0EA", marginTop: 10, paddingTop: 8 }}>
+          <span style={{ fontSize: 12, color: "#7A8079" }}>Order value</span>
+          <span className="mono" style={{ fontSize: 15, fontWeight: 700 }}>{fmtMoney(total)}</span>
+        </div>
+      </div>
+
+      <Field label="Notes"><input style={inputStyle} value={f.notes} onChange={e => set("notes", e.target.value)} /></Field>
+
+      {(anyBelowCost || anyUnpriced) && (
+        <div style={{ background: "#FFF9EF", border: "1px solid #E8D5A8", borderRadius: 8,
+                      padding: "8px 10px", marginTop: 10, fontSize: 11.5, color: "#7A5205" }}>
+          This order can still be raised — the plant reviews it line by line, and a below-cost or unpriced
+          line is exactly the sort of thing that review is for.
+        </div>
+      )}
+      {err && <div style={{ fontSize: 12, color: "#8A2E20", marginTop: 8, fontWeight: 600 }}>{err}</div>}
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18 }}>
+        <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+        <Btn variant="secondary" onClick={() => submit(true)} style={{ opacity: canSave ? 1 : 0.5 }}>Save as draft</Btn>
+        <Btn onClick={() => submit(false)} style={{ opacity: canSave ? 1 : 0.5 }}>Submit for review</Btn>
+      </div>
+    </Modal>
+  );
+}
+
+const SO_SORT_COLUMNS = [
+  { key: "orderDate", label: "Order date", kind: "str" },
+  { key: "reference", label: "Reference", kind: "str" },
+  { key: "customerName", label: "Customer", kind: "str" },
+  { key: "requestedDate", label: "Requested date", kind: "str" },
+  { key: "salesRep", label: "Sales rep", kind: "str" },
+  { key: "enteredBy", label: "Entered by", kind: "str" },
+  { key: "status", label: "Status", kind: "str" },
+  { key: "netValue", label: "Order value", kind: "num" },
+  { key: "pending", label: "Lines awaiting review", kind: "num" }
+];
+const SO_SEARCH_FIELDS = ["reference", "customerName", "salesRep", "enteredBy", "status",
+  r => (r.lines || []).map(l => l.productName).join(" ")];
+
+function SalesOrdersTab({ data, onOpenOrder, onNewOrder }) {
   const [statusFilter, setStatusFilter] = useState("");
-  const [search, setSearch] = useState("");
 
   const records = useMemo(() => salesOrderRecords(data, { status: statusFilter }), [data, statusFilter]);
-  const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return records;
-    return records.filter(r =>
-      String(r.reference).toLowerCase().includes(q) ||
-      String(r.customerName).toLowerCase().includes(q) ||
-      String(r.salesRep).toLowerCase().includes(q) ||
-      r.lines.some(l => String(l.productName).toLowerCase().includes(q)));
-  }, [records, search]);
+  const view = useListView(records, {
+    columns: SO_SORT_COLUMNS,
+    fields: SO_SEARCH_FIELDS,
+    initialSort: { key: "orderDate", dir: "desc" }
+  });
+  const filtered = view.rows;
 
   const reps = useMemo(() => salesRepSummary(data), [data]);
   const awaiting = records.filter(r => r.pending > 0);
@@ -11289,7 +12065,9 @@ function SalesOrdersTab({ data, onOpenOrder }) {
     <div>
       <PageHeader tabKey="salesOrders"
         subtitle="What customers have asked for, what the rep conceded, and whether the plant will commit to it"
-        action={<SearchBox value={search} onChange={setSearch} placeholder="Order, customer, rep\u2026" />} />
+        action={<Btn onClick={onNewOrder}><Plus size={15} />New sales order</Btn>} />
+
+      <ListToolbar view={view} columns={SO_SORT_COLUMNS} placeholder="Order, customer, rep, product\u2026" />
 
       <div style={{ display: "flex", gap: 4, marginBottom: 14, flexWrap: "wrap" }}>
         {[["", "All"], ["Submitted", "Awaiting review"], ["Reviewed", "Reviewed"],
@@ -11498,6 +12276,11 @@ function CustomerCard({ customer, data, onEdit, onDelete }) {
   );
 }
 
+const tierHeadStyle = {
+  fontSize: 10.5, fontWeight: 700, color: "#7A8079",
+  textTransform: "uppercase", letterSpacing: 0.3
+};
+
 function CustomerModal({ data, id, onClose, update }) {
   const existing = id ? getCustomer(data, id) : null;
   const [f, setF] = useState(existing ? structuredClone(existing) : { name: "", code: "", notes: "", addresses: [], priceList: [] });
@@ -11589,13 +12372,30 @@ function CustomerModal({ data, id, onClose, update }) {
                 <Btn variant="ghost" onClick={() => addTier(pidx)} style={{ padding: "4px 8px", fontSize: 12 }}><Plus size={12} />Add tier</Btn>
               </div>
               {p.tiers.length === 0 && <div style={{ fontSize: 11.5, color: "#A6ABA2" }}>No volume discounts set.</div>}
+              {/* Three unlabelled number boxes and a badge is a guessing game.
+                  The third column is derived, not entered, which is the part
+                  the headers most need to say. */}
+              {p.tiers.length > 0 && (
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 28px", gap: 6, marginBottom: 4 }}>
+                  <span style={tierHeadStyle}>Units (min qty)</span>
+                  <span style={tierHeadStyle}>Price per unit</span>
+                  <span style={tierHeadStyle} title="Calculated from the tier price and this product's unit cost">
+                    Gross margin
+                  </span>
+                  <span />
+                </div>
+              )}
               {p.tiers.map((t, tidx) => {
                 const tierMargin = info ? info.points.find(pt => pt.qty === t.minQty) : null;
                 return (
                   <div key={t.id} style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 28px", gap: 6, marginBottom: 6, alignItems: "center" }}>
                     <input type="number" style={inputStyle} value={t.minQty} onChange={e => updateTier(pidx, tidx, { minQty: parseInt(e.target.value) || 0 })} placeholder="Min qty" />
                     <input type="number" step="0.01" style={inputStyle} value={t.price} onChange={e => updateTier(pidx, tidx, { price: parseFloat(e.target.value) || 0 })} placeholder="Tier price" />
-                    {tierMargin && <Badge tone={tierMargin.marginPct >= 20 ? "good" : tierMargin.marginPct >= 5 ? "warn" : "bad"}>{Math.round(tierMargin.marginPct)}%</Badge>}
+                    {/* A placeholder keeps the three columns lined up with
+                        their headers when the margin cannot be worked out. */}
+                    {tierMargin
+                      ? <Badge tone={tierMargin.marginPct >= 20 ? "good" : tierMargin.marginPct >= 5 ? "warn" : "bad"}>{Math.round(tierMargin.marginPct)}%</Badge>
+                      : <span style={{ fontSize: 11.5, color: "#A6ABA2" }}>\u2014</span>}
                     <IconBtn onClick={() => removeTier(pidx, tidx)} title="Remove" danger><Trash2 size={12} /></IconBtn>
                   </div>
                 );
@@ -11617,18 +12417,30 @@ function CustomerModal({ data, id, onClose, update }) {
 /* ---------------------------------------------------------------
    Equipment (admin, used by both views)
 ----------------------------------------------------------------*/
+const EQUIP_COLS = [
+  { key: "name", label: "Equipment", kind: "str" },
+  { key: "units", label: "Units available", kind: "num" },
+  { key: "notes", label: "Notes", kind: "str" }
+];
+
 function EquipmentTab({ data, search, setSearch, onAdd, onEdit, onDelete }) {
-  const rows = data.equipment.filter(e =>
-    !search || e.name.toLowerCase().includes(search.toLowerCase()) || e.code.toLowerCase().includes(search.toLowerCase())
-  );
+  const view = useListView(data.equipment || [], {
+    columns: EQUIP_COLS, fields: ["name", "code", "notes"],
+    initialSort: { key: "name", dir: "asc" }
+  });
+  const rows = view.rows;
   return (
     <div>
       <PageHeader tabKey="equipment" subtitle="Machines and work centers used across your processes"
-        action={<div style={{ display: "flex", gap: 10 }}><SearchBox value={search} onChange={setSearch} placeholder="Search equipment…" /><Btn onClick={onAdd}><Plus size={15} />Add equipment</Btn></div>} />
+        action={<Btn onClick={onAdd}><Plus size={15} />Add equipment</Btn>} />
+      <ListToolbar view={view} columns={EQUIP_COLS} placeholder="Name or code…" />
       <div style={{ background: "#fff", border: "1px solid #E2E4DD", borderRadius: 10, overflow: "hidden" }}>
         <table className="mrp-table">
           <thead>
-            <tr><th>Equipment</th><th>Units available</th><th>Notes</th><th></th></tr>
+            <tr>
+              {EQUIP_COLS.map(c => <SortableTh key={c.key} view={view} col={c} />)}
+              <th></th>
+            </tr>
           </thead>
           <tbody>
             {rows.map(e => (
@@ -11706,16 +12518,36 @@ function EquipmentModal({ data, id, onClose, update }) {
    optional link to the raw material that carries its real cost, so
    there's never a separately maintained cost to drift out of sync.
 ----------------------------------------------------------------*/
+const COMPONENT_COLS = [
+  { key: "name", label: "Component", kind: "str" },
+  { key: "unit", label: "Unit", kind: "str" },
+  { key: "linkedName", label: "Linked raw material", kind: "str" },
+  { key: "unitCost", label: "Unit cost", kind: "num" },
+  { key: "notes", label: "Notes", kind: "str" }
+];
+
 function ComponentsTab({ data, search, setSearch, onAdd, onEdit, onDelete }) {
-  const rows = data.components.filter(c => !search || c.name.toLowerCase().includes(search.toLowerCase()));
+  const source = useMemo(() => (data.components || []).map(c => {
+    const linked = c.rawMaterialId ? getRaw(data, c.rawMaterialId) : null;
+    return { ...c, linkedName: linked ? linked.name : "" };
+  }), [data]);
+  const view = useListView(source, {
+    columns: COMPONENT_COLS, fields: ["name", "unit", "linkedName", "notes"],
+    initialSort: { key: "name", dir: "asc" }
+  });
+  const rows = view.rows;
   return (
     <div>
       <PageHeader tabKey="components" subtitle="Fundamental constituents used to build a Composition on any raw material, intermediate product, or finished good"
-        action={<div style={{ display: "flex", gap: 10 }}><SearchBox value={search} onChange={setSearch} placeholder="Search components…" /><Btn onClick={onAdd}><Plus size={15} />Add component</Btn></div>} />
+        action={<Btn onClick={onAdd}><Plus size={15} />Add component</Btn>} />
+      <ListToolbar view={view} columns={COMPONENT_COLS} placeholder="Name, unit, material…" />
       <div style={{ background: "#fff", border: "1px solid #E2E4DD", borderRadius: 10, overflow: "hidden" }}>
         <table className="mrp-table">
           <thead>
-            <tr><th>Component</th><th>Unit</th><th>Linked raw material</th><th>Unit cost</th><th>Notes</th><th></th></tr>
+            <tr>
+              {COMPONENT_COLS.map(c => <SortableTh key={c.key} view={view} col={c} />)}
+              <th></th>
+            </tr>
           </thead>
           <tbody>
             {rows.map(c => {
@@ -12973,9 +13805,106 @@ function EquipmentLanes({ data, plan, month }) {
 }
 
 
-function ScheduleTab({ data, onAdd, onEdit, onDelete, readOnly, onEditHours, onFreeze, onAmend, onOpenBatch }) {
-  const sorted = [...data.schedule].sort((a, b) => a.dueDate.localeCompare(b.dueDate));
-  const [layout, setLayout] = useState("calendar");
+const RUN_STATUSES = ["Planned", "In progress", "Complete", "Cancelled"];
+
+const RUN_SORT_COLUMNS = [
+  { key: "dueDate", label: "Due date", kind: "str" },
+  { key: "reference", label: "Run number", kind: "str" },
+  { key: "productName", label: "Product", kind: "str" },
+  { key: "qty", label: "Quantity", kind: "num" },
+  { key: "status", label: "Status", kind: "str" },
+  { key: "customerName", label: "Customer", kind: "str" },
+  { key: "orderRefs", label: "Sales order", kind: "str" },
+  { key: "createdDate", label: "Raised", kind: "str" }
+];
+const RUN_SEARCH_FIELDS = ["reference", "productName", "status", "customerName", "orderRefs"];
+
+/* What the bars and flags on a run actually mean.
+
+   The timeline draws four different things in four colours and named none of
+   them, so the list read as decoration. Reviewers could not tell a lead-time
+   bar from a production bar, which is the single most useful distinction on
+   the row. */
+function ScheduleLegend() {
+  const [open, setOpen] = useState(false);
+  const swatch = (bg, extra) => ({
+    display: "inline-block", width: 14, height: 10, borderRadius: 3,
+    background: bg, marginRight: 6, verticalAlign: "middle", ...(extra || {})
+  });
+  const item = (node, label, hint) => (
+    <span key={label} style={{ display: "inline-flex", alignItems: "center", gap: 2, marginRight: 16,
+                               fontSize: 11.5, color: "#5B6470" }} title={hint || ""}>
+      {node}<span>{label}</span>
+    </span>
+  );
+  return (
+    <div style={{ background: "#fff", border: "1px solid #E7E9E4", borderRadius: 8, padding: "8px 12px" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center" }}>
+          {item(<span style={swatch("#C9CFC0")} />, "Raw material lead time",
+                "Between ordering the materials and being able to start")}
+          {item(<span style={swatch("#1F6F78")} />, "Finished goods production")}
+          {item(<span style={swatch("#5FBFB0")} />, "Intermediate production")}
+          {item(<span style={swatch("#B87510", { width: 3, height: 14 })} />, "Today")}
+        </div>
+        <button type="button" onClick={() => setOpen(o => !o)}
+          style={{ background: "none", border: "none", color: "#1F6F78", cursor: "pointer",
+                   fontSize: 11.5, textDecoration: "underline", padding: 0, whiteSpace: "nowrap" }}>
+          {open ? "Hide flags" : "What do the flags mean?"}
+        </button>
+      </div>
+      {open && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 14, marginTop: 8, paddingTop: 8,
+                      borderTop: "1px solid #F1F2EE", fontSize: 11.5, color: "#5B6470" }}>
+          <span><Badge tone="bad">Order overdue</Badge> materials needed to be ordered before today</span>
+          <span><Badge tone="warn">Due soon</Badge> due within seven days</span>
+          <span><Badge tone="info">Frozen</Badge> committed figures are locked; changes need a recorded amendment</span>
+          <span><Badge tone="warn">amendment(s)</Badge> the committed plan has been changed since freezing</span>
+          <span><Badge tone="good">Complete</Badge> / <Badge tone="info">In progress</Badge> / <Badge tone="neutral">Planned</Badge> run status</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ScheduleTab({ data, onAdd, onEdit, onDelete, readOnly, onEditHours, onFreeze, onAmend, onOpenBatch, tabKey }) {
+  // The nav decides which half is on screen. One component still serves both,
+  // because they share the plan, the calendar and every handler - splitting
+  // the file would duplicate all of that to separate two return branches.
+  const layout = tabKey === "scheduleList" ? "list" : "calendar";
+  const [statusFilter, setStatusFilter] = useState("");
+  const [assignFilter, setAssignFilter] = useState("");
+
+  // One flattened row per run, carrying everything the list sorts, filters or
+  // searches on. Derived once so sorting is comparing values rather than
+  // re-walking the sales orders for every comparison.
+  const split = useMemo(() => plannedProductionSplit(data), [data]);
+  const runRows = useMemo(() => (data.schedule || []).map(entry => {
+    const orders = (split.linked[entry.id] || []);
+    return {
+      entry,
+      reference: entry.reference || "",
+      productName: productName(data, entry),
+      qty: Number(entry.qty) || 0,
+      dueDate: entry.dueDate || "",
+      status: entry.status || "",
+      createdDate: entry.createdDate || "",
+      customerName: entry.customerId
+        ? ((getCustomer(data, entry.customerId) || {}).name || "") : "",
+      orderRefs: orders.map(o => o.reference).join(", "),
+      assigned: orders.length > 0
+    };
+  }), [data, split]);
+
+  const scoped = useMemo(() => runRows.filter(r =>
+    (!statusFilter || r.status === statusFilter) &&
+    (!assignFilter || (assignFilter === "assigned" ? r.assigned : !r.assigned))
+  ), [runRows, statusFilter, assignFilter]);
+
+  const listView = useListView(scoped, {
+    columns: RUN_SORT_COLUMNS, fields: RUN_SEARCH_FIELDS,
+    initialSort: { key: "dueDate", dir: "asc" }
+  });
   const [calMode, setCalMode] = useState("plan");
   const [scaleByBatch, setScaleByBatch] = useState(false);
   const [month, setMonth] = useState(() => todayStr().slice(0, 7));
@@ -12998,19 +13927,15 @@ function ScheduleTab({ data, onAdd, onEdit, onDelete, readOnly, onEditHours, onF
 
   return (
     <div>
-      <PageHeader tabKey="schedule" subtitle={readOnly ? "View-only — changes are made by planning/admin" : "Planned and in-progress runs that drive the material, equipment and revenue forecasts"}
+      <PageHeader tabKey={tabKey || "schedule"}
+        subtitle={readOnly
+          ? "View-only — changes are made by planning/admin"
+          : layout === "list"
+            ? "Every run by number, with what it is filling and how far along it is"
+            : "Planned and in-progress runs that drive the material, equipment and revenue forecasts"}
         action={!readOnly && <Btn onClick={onAdd}><Plus size={15} />Schedule a run</Btn>} />
 
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
-        <div style={{ display: "flex", gap: 4 }}>
-          <div role="button" tabIndex={0} onClick={() => setLayout("calendar")}
-            onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setLayout("calendar"); } }}
-            style={seg(layout === "calendar")}>Calendar</div>
-          <div role="button" tabIndex={0} onClick={() => setLayout("list")}
-            onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setLayout("list"); } }}
-            style={seg(layout === "list")}>List</div>
-        </div>
-
         {layout === "calendar" && (
           <>
             <div style={{ display: "flex", gap: 4 }}>
@@ -13119,7 +14044,29 @@ function ScheduleTab({ data, onAdd, onEdit, onDelete, readOnly, onEditHours, onF
 
       {layout === "list" && (
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-        {sorted.map(entry => {
+        <ListToolbar view={listView} columns={RUN_SORT_COLUMNS} placeholder="Run, product, order, customer\u2026">
+          <select style={{ ...inputStyle, width: "auto", minWidth: 130 }} value={statusFilter}
+            onChange={e => setStatusFilter(e.target.value)}>
+            <option value="">All statuses</option>
+            {RUN_STATUSES.map(st => <option key={st} value={st}>{st}</option>)}
+          </select>
+          <select style={{ ...inputStyle, width: "auto", minWidth: 150 }} value={assignFilter}
+            onChange={e => setAssignFilter(e.target.value)}>
+            <option value="">Assigned or not</option>
+            <option value="assigned">Against a sales order</option>
+            <option value="unassigned">Not against an order</option>
+          </select>
+        </ListToolbar>
+
+        <ScheduleLegend />
+
+        {listView.rows.length === 0 && (
+          <div style={{ fontSize: 12.5, color: "#8A9099", padding: 20 }}>
+            No runs match those filters.
+          </div>
+        )}
+        {listView.rows.map(row => {
+          const entry = row.entry;
           const { segments, earliestOrderBy } = computeTimeline(data, entry);
           const overdue = earliestOrderBy && daysUntil(earliestOrderBy) < 0 && entry.status !== "Complete" && entry.status !== "Cancelled";
           const dueSoon = daysUntil(entry.dueDate) <= 7 && daysUntil(entry.dueDate) >= 0;
@@ -13132,11 +14079,22 @@ function ScheduleTab({ data, onAdd, onEdit, onDelete, readOnly, onEditHours, onF
                 <div>
                   <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                     {entry.productType === "finished" ? <Boxes size={14} color="#1F6F78" /> : <Layers size={14} color="#1F6F78" />}
+                    {/* The number the floor quotes, first on the row. */}
+                    <span className="mono" style={{ fontWeight: 700, fontSize: 13, color: "#1F6F78" }}>
+                      {entry.reference || "\u2014"}
+                    </span>
                     <span style={{ fontWeight: 700, fontSize: 14 }}>{productName(data, entry)}</span>
                     <Badge tone={entry.status === "Complete" ? "good" : entry.status === "Cancelled" ? "neutral" : entry.status === "In progress" ? "info" : "neutral"}>{entry.status}</Badge>
                     {overdue && <Badge tone="bad">Order overdue</Badge>}
                     {!overdue && dueSoon && <Badge tone="warn">Due soon</Badge>}
                     {customer && <Badge tone="neutral">{customer.name}</Badge>}
+                    {/* SO-xxxxx -> RUN-xxxxx, both directions readable. A run
+                        with nothing against it is not a fault - forecast and
+                        campaign production are deliberate - but it is worth
+                        being able to see at a glance which is which. */}
+                    {row.assigned
+                      ? <Badge tone="good">{row.orderRefs}</Badge>
+                      : <Badge tone="neutral">No sales order</Badge>}
                     {entry.frozen && <Badge tone="info">Frozen {fmtDate(entry.frozenDate)}</Badge>}
                     {(entry.revisions || []).length > 0 &&
                       <Badge tone="warn">{entry.revisions.length} amendment(s)</Badge>}
@@ -13178,7 +14136,10 @@ function ScheduleTab({ data, onAdd, onEdit, onDelete, readOnly, onEditHours, onF
             </div>
           );
         })}
-        {sorted.length === 0 && <div style={{ color: "#8A9099", padding: 24 }}>No production runs scheduled yet.</div>}
+        {/* "Nothing scheduled" and "nothing matches your filters" are
+            different statements; the toolbar already covers the second. */}
+        {(data.schedule || []).length === 0 &&
+          <div style={{ color: "#8A9099", padding: 24 }}>No production runs scheduled yet.</div>}
       </div>
       )}
     </div>
@@ -13283,6 +14244,8 @@ function ScheduleModal({ data, id, onClose, update }) {
     }
     // Arrival order drives FIFO planning, so stamp it once and never move it.
     if (!record.createdDate) record.createdDate = todayStr();
+    // A run needs a number people can quote before it reaches the floor.
+    if (!record.reference) record.reference = nextRunReference(data);
     if (record.status === "Complete") {
       if (!record.completedDate) record.completedDate = todayStr();
       // Capture the standard cost once, on completion. Expected-versus-actual

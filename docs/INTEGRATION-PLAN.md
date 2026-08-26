@@ -38,6 +38,12 @@ through the phase notes below and easy to lose.
 | 4 | **The consumption gate is enforced in the UI, not in `tx.logProductionBatch`.** | The batch log will not let you select warehouse stock, and blocks Save if a selection goes stale — but the transaction itself still consumes whatever it is handed. Anything that writes a batch without going through the modal (an import, an API caller, a future mobile client) bypasses the rule entirely. Enforcing it in the transaction is the right end state; it is not done yet because **it would refuse every batch against existing data**, where no lot carries `inProcess`. That is not a bug in the rule, it is flag 2 arriving early: until go-live seeding sets custody correctly, hard enforcement and the seeded dataset cannot both be true. **Decide together with flag 2, not separately.** |
 | 5 | **Go-live seeding must decide the custody of every existing lot.** | With the gate in place, a lot with no `inProcess` flag is unconsumable. At go-live essentially everything on the floor is warehouse stock — correct, and it means production's first act is to raise material requests, which is the intended protocol. But **anything genuinely mid-process at cutover must be flagged In Process during seeding** or the line will be unable to log the batch it is standing in front of. Needs an explicit step in the onboarding path, not an afterthought. |
 
+### Awaiting a decision
+
+| # | Item | Needs |
+|---|---|---|
+| A | **"Semi-finished goods" as a fifth material category.** Not built — see `docs/SEMI-FINISHED-GOODS.md`. The capability already exists (bulk = an intermediate product; packing = a process), so the fifth `itemType` would buy a label at the cost of widening the polymorphic surface everywhere. A `stage` flag on intermediate products is the cheap version, under an hour. | Five questions in that doc — chiefly whether a semi-finished good can be **sold as-is**, and whether anything needs to **report on it separately**. Either would justify the type; a labelling preference would not. |
+
 ### Design notes to preserve (so they are not "fixed" by mistake)
 
 - **`Place` is not a receiving bypass, and should not be routed through putaway.**

@@ -127,7 +127,12 @@ console.log('\n--- shipment revenue ---');
   D.shipments.push({ id: 'sh2', finishedGoodId: fg.id, lotId: '', qty: 2,
     customerId: '', addressId: '', shipDate: '2026-06-12', reference: '', notes: '' });
 
-  const ev = shipmentEvents(D).filter(e => e.date === '2026-06-10' || e.date === '2026-06-12');
+  // Select the two shipments THIS test added, by id. Filtering by date used to
+  // work and then quietly stopped: the seed lays shipments down over a rolling
+  // window, so whether it happens to put one on 2026-06-12 depends on the day
+  // the suite is run. That made a real assertion fail for a reason that had
+  // nothing to do with the code under test.
+  const ev = shipmentEvents(D).filter(e => e.id === 'sh1' || e.id === 'sh2');
   ok('both added shipments extracted', ev.length === 2);
   const withCust = ev.find(e => e.customerId), without = ev.find(e => !e.customerId);
   ok('units captured', withCust.qty === 3 && without.qty === 2);
