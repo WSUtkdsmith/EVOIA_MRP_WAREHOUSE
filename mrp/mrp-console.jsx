@@ -3319,7 +3319,10 @@ function getCatalogItem(data, itemType, itemId) {
 // The process that produces a given catalog item as an output. If more than
 // one process is defined to produce the same item, the first one wins.
 function findProcessForOutput(data, itemType, itemId) {
-  return data.processes.find(p => (p.outputs || []).some(o => o.itemType === itemType && o.itemId === itemId)) || null;
+  // An empty dataset has no processes collection at all, which is a legitimate
+  // state rather than a caller error.
+  return ((data && data.processes) || [])
+    .find(p => (p.outputs || []).some(o => o.itemType === itemType && o.itemId === itemId)) || null;
 }
 
 function allCatalogOptions(data, includeRaw) {
@@ -6974,6 +6977,111 @@ function planRunLink(data, line, scheduleId, requestedQty) {
     remainder: round3(outstanding - canTake),
     full: canTake > 0 && round3(outstanding - canTake) <= 0.0001,
     none: canTake <= 0.0001
+  };
+}
+
+/* Production summary for whatever the run list is currently showing.
+
+   Grouped by product, because that is the level at which a quantity means
+   something: each product has its own unit, so a grand total of planned
+   production would add jars to kilogrammes. Money totals DO add up, so those
+   are the only figures reported across the whole selection.
+
+   "Expected COGS" is the same notion used in the sales roll-ups - the
+   standard cost frozen when the run was fulfilled where there is one, today's
+   standard otherwise - so the two reports cannot quietly disagree about what
+   a run was expected to cost.
+
+   Revenue is deliberately "SO linked only". Production with no order behind
+   it has no price: guessing one from a list price would invent revenue for
+   goods nobody has agreed to buy, which is the one number on this table
+   somebody might take to a board meeting. */
+function productionSummary(data, rows) {
+  const db = data && typeof data === "object" ? data : {};
+
+  // Every allocation pointing at each run, with the price agreed on its line.
+  const allocsByRun = {};
+  (db.salesOrders || []).forEach(o => {
+    if (!o || o.status === "Cancelled") return;
+    (o.lines || []).forEach(l => {
+      if (!l) return;
+      const detail = salesOrderLineDetail(db, o, l);
+      lineAllocations(l).forEach(a => {
+        (allocsByRun[a.scheduleId] = allocsByRun[a.scheduleId] || []).push({
+          orderId: o.id, reference: o.reference || "", lineId: l.id,
+          qty: Number(a.qty) || 0,
+          netPrice: Number(detail && detail.netPrice) || 0
+        });
+      });
+    });
+  });
+
+  const byProduct = {};
+  (Array.isArray(rows) ? rows : []).forEach(row => {
+    const entry = row && row.entry;
+    if (!entry) return;
+    const key = entry.productType + ":" + entry.productId;
+    const item = getCatalogItem(db, entry.productType, entry.productId);
+    const g = byProduct[key] || (byProduct[key] = {
+      key, itemType: entry.productType, itemId: entry.productId,
+      productName: row.productName || (item ? item.name : "(deleted product)"),
+      sku: item ? (item.sku || "") : "",
+      unit: item ? (item.unit || "") : "",
+      runs: 0, plannedQty: 0, expectedCogs: 0,
+      linkedOrderRefs: {}, linkedQty: 0, linkedRevenue: 0,
+      runsWithoutCost: 0
+    });
+
+    g.runs += 1;
+    g.plannedQty += Number(entry.qty) || 0;
+
+    // Expected cost, per the run's own frozen standard where it has one.
+    const exp = expectedUnitCost(db, entry);
+    if (exp && exp.unitCost > 0) g.expectedCogs += exp.unitCost * (Number(entry.qty) || 0);
+    else g.runsWithoutCost += 1;
+
+    (allocsByRun[entry.id] || []).forEach(a => {
+      g.linkedOrderRefs[a.orderId] = true;
+      g.linkedQty += a.qty;
+      g.linkedRevenue += a.qty * a.netPrice;
+    });
+  });
+
+  const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+  const products = Object.keys(byProduct).map(k => {
+    const g = byProduct[k];
+    return {
+      ...g,
+      plannedQty: r2(g.plannedQty),
+      expectedCogs: r2(g.expectedCogs),
+      linkedOrders: Object.keys(g.linkedOrderRefs).length,
+      linkedQty: r2(g.linkedQty),
+      linkedRevenue: r2(g.linkedRevenue),
+      // How much of what is planned has somebody behind it. Null rather than
+      // zero when nothing is planned, because 0% would read as "none of it is
+      // sold" where the truth is "there is nothing to sell".
+      linkedPct: g.plannedQty > 0 ? Math.round((g.linkedQty / g.plannedQty) * 100) : null
+    };
+  }).sort((a, b) => b.expectedCogs - a.expectedCogs || String(a.productName).localeCompare(String(b.productName)));
+
+  const orderIds = {};
+  products.forEach(p => Object.keys(p.linkedOrderRefs).forEach(id => { orderIds[id] = true; }));
+
+  return {
+    products,
+    totals: {
+      products: products.length,
+      runs: products.reduce((n, p) => n + p.runs, 0),
+      // Money adds up across products; quantity does not, so there is no
+      // plannedQty here on purpose.
+      expectedCogs: r2(products.reduce((n, p) => n + p.expectedCogs, 0)),
+      linkedRevenue: r2(products.reduce((n, p) => n + p.linkedRevenue, 0)),
+      linkedOrders: Object.keys(orderIds).length,
+      runsWithoutCost: products.reduce((n, p) => n + p.runsWithoutCost, 0),
+      // More than one unit of measure in the table means the quantity column
+      // must not be summed, and the reader has to be told.
+      mixedUnits: new Set(products.map(p => p.unit).filter(Boolean)).size > 1
+    }
   };
 }
 
@@ -15565,6 +15673,18 @@ function EquipmentLanes({ data, plan, month }) {
 
 const RUN_STATUSES = ["Planned", "In progress", "Complete", "Cancelled"];
 
+/* Horizons are computed when the list renders rather than stored, so "next 30
+   days" still means 30 days from today tomorrow. */
+const HORIZON_PRESETS = [
+  { key: "30d", label: "Due within 30 days", value: () => addDays(todayStr(), 30) },
+  { key: "60d", label: "Due within 60 days", value: () => addDays(todayStr(), 60) },
+  { key: "90d", label: "Due within 90 days", value: () => addDays(todayStr(), 90) },
+  { key: "eom", label: "Due this month", value: () => {
+      const d = new Date(todayStr() + "T00:00:00");
+      return fmtISODate(new Date(d.getFullYear(), d.getMonth() + 1, 0));
+    } }
+];
+
 const RUN_SORT_COLUMNS = [
   { key: "dueDate", label: "Due date", kind: "str" },
   // From the capacity plan rather than the run record: when the work actually
@@ -15589,6 +15709,121 @@ const RUN_SEARCH_FIELDS = ["reference", "productName", "status", "customerName",
    them, so the list read as decoration. Reviewers could not tell a lead-time
    bar from a production bar, which is the single most useful distinction on
    the row. */
+/* What the runs on screen add up to, per product.
+
+   Grouped by product because that is the level at which a quantity means
+   anything - each product has its own unit, so a grand total of planned
+   production would add jars to kilogrammes. Money adds up across products, so
+   the footer totals cost and revenue and pointedly does not total quantity.
+
+   Revenue counts LINKED production only. Production with nothing behind it has
+   no agreed price, and pricing it off a list would invent revenue for goods
+   nobody has committed to buy. */
+function ProductionSummaryModal({ summary, filtered, total, onClose }) {
+  const t = summary.totals;
+  const head = { fontSize: 10.5, fontWeight: 700, color: "#7A8079",
+                 textTransform: "uppercase", letterSpacing: 0.3 };
+  const COLS = "1.8fr 0.6fr 1fr 1fr 0.7fr 1fr 1fr";
+
+  return (
+    <Modal title="Production summary" onClose={onClose} wide>
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 12 }}>
+        The {filtered} run{filtered === 1 ? "" : "s"} currently shown
+        {filtered !== total && <> (of {total})</>}, grouped by product. Change the filters and these
+        figures follow.
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: COLS, gap: 8, ...head, padding: "0 10px 6px" }}>
+        <span>Product</span>
+        <span>Runs</span>
+        <span>Production planned</span>
+        <span title="Standard cost fixed when the run was fulfilled, where it has one">Expected COGS</span>
+        <span>Linked SOs</span>
+        <span>Linked production</span>
+        <span title="Priced from the linked order lines only">Est. revenue</span>
+      </div>
+
+      {summary.products.length === 0 && (
+        <div style={{ fontSize: 12.5, color: "#8A9099", padding: 20 }}>
+          No runs match the current filters, so there is nothing to summarise.
+        </div>
+      )}
+
+      {summary.products.map(p => (
+        <div key={p.key} style={{ display: "grid", gridTemplateColumns: COLS, gap: 8,
+                                  alignItems: "center", fontSize: 12.5, padding: "7px 10px",
+                                  marginBottom: 4, borderRadius: 8, background: "#fff",
+                                  border: "1px solid #E7E9E4" }}>
+          <span>
+            <b>{p.productName}</b>
+            <span style={{ display: "block", fontSize: 10.5, color: "#8A9099" }}>
+              {p.sku}{p.itemType === "intermediate" ? " · intermediate" : ""}
+            </span>
+          </span>
+          <span className="mono">{p.runs}</span>
+          <span className="mono">{fmtNum(p.plannedQty)} {p.unit}</span>
+          <span className="mono">
+            {fmtMoney(p.expectedCogs)}
+            {p.runsWithoutCost > 0 && (
+              <span style={{ display: "block", fontSize: 10, color: "#B87510" }}>
+                {p.runsWithoutCost} run(s) uncosted
+              </span>
+            )}
+          </span>
+          <span className="mono">{p.linkedOrders}</span>
+          <span className="mono">
+            {fmtNum(p.linkedQty)} {p.unit}
+            {p.linkedPct != null && (
+              <span style={{ display: "block", fontSize: 10, color: p.linkedPct === 0 ? "#8A9099" : "#2E7D5B" }}>
+                {p.linkedPct}% of planned
+              </span>
+            )}
+          </span>
+          <span className="mono" style={{ fontWeight: 600 }}>{fmtMoney(p.linkedRevenue)}</span>
+        </div>
+      ))}
+
+      {summary.products.length > 0 && (
+        <div style={{ display: "grid", gridTemplateColumns: COLS, gap: 8, alignItems: "center",
+                      fontSize: 12.5, padding: "9px 10px", marginTop: 6, borderRadius: 8,
+                      background: "#F1F6F2", border: "1px solid #CFE0D3", fontWeight: 700 }}>
+          <span>{t.products} product(s)</span>
+          <span className="mono">{t.runs}</span>
+          {/* No quantity total. Adding jars to kilogrammes would produce a
+              number with no unit, which is worse than no number. */}
+          <span style={{ fontSize: 10.5, fontWeight: 500, color: "#8A9099" }}>
+            {t.mixedUnits ? "mixed units — not totalled" : "\u2014"}
+          </span>
+          <span className="mono">{fmtMoney(t.expectedCogs)}</span>
+          <span className="mono">{t.linkedOrders}</span>
+          <span style={{ fontSize: 10.5, fontWeight: 500, color: "#8A9099" }}>
+            {t.mixedUnits ? "mixed units" : "\u2014"}
+          </span>
+          <span className="mono">{fmtMoney(t.linkedRevenue)}</span>
+        </div>
+      )}
+
+      {t.runsWithoutCost > 0 && (
+        <div style={{ background: "#FFF9EF", border: "1px solid #E8D5A8", borderRadius: 8,
+                      padding: "8px 12px", marginTop: 10, fontSize: 11.5, color: "#7A5205" }}>
+          {t.runsWithoutCost} run(s) have no standard cost for their product, so they add nothing to
+          Expected COGS. The figure is short by whatever those would have cost rather than complete.
+        </div>
+      )}
+
+      <div style={{ fontSize: 11, color: "#8A9099", marginTop: 10, lineHeight: 1.5 }}>
+        Estimated revenue prices the <b>linked</b> production only, at what each sales order line agreed.
+        Production with no order behind it has no agreed price, and pricing it off a list would invent
+        revenue for goods nobody has committed to buy.
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 18 }}>
+        <Btn variant="secondary" onClick={onClose}>Close</Btn>
+      </div>
+    </Modal>
+  );
+}
+
 function ScheduleLegend() {
   const [open, setOpen] = useState(false);
   const swatch = (bg, extra) => ({
@@ -15640,6 +15875,9 @@ function ScheduleTab({ data, onAdd, onEdit, onDelete, readOnly, onEditHours, onF
   const [assignFilter, setAssignFilter] = useState("");
   const [familyFilter, setFamilyFilter] = useState("");
   const [customerFilter, setCustomerFilter] = useState("");
+  const [typeFilter, setTypeFilter] = useState("");
+  const [horizon, setHorizon] = useState("");        // due on or before
+  const [summaryOpen, setSummaryOpen] = useState(false);
   const familyDims = useMemo(() => familyDimensions(data), [data]);
   const customerOptions = useMemo(() => (data.customers || []).slice()
     .sort((a, b) => String(a.name).localeCompare(String(b.name))), [data]);
@@ -15651,17 +15889,40 @@ function ScheduleTab({ data, onAdd, onEdit, onDelete, readOnly, onEditHours, onF
 
   const runRows = useMemo(() => runListRows(data, plan), [data, plan]);
 
+  /* Choosing Intermediate is what resolves the family conflict: family tags
+     live on finished goods, so the family filter is only offered while the
+     selection can contain them. Picking Intermediate clears it rather than
+     leaving a filter set that silently matches nothing. */
+  const familyUsable = typeFilter !== "intermediate";
+  useEffect(() => { if (!familyUsable && familyFilter) setFamilyFilter(""); },
+    [familyUsable, familyFilter]);
+
   const scoped = useMemo(() => runRows.filter(r =>
     (!statusFilter || r.status === statusFilter) &&
     (!assignFilter || (assignFilter === "assigned" ? r.assigned : !r.assigned)) &&
+    (!typeFilter || r.entry.productType === typeFilter) &&
     (!familyFilter || r.familyIds.indexOf(familyFilter) !== -1) &&
-    (!customerFilter || r.customerIds.indexOf(customerFilter) !== -1)
-  ), [runRows, statusFilter, assignFilter, familyFilter, customerFilter]);
+    (!customerFilter || r.customerIds.indexOf(customerFilter) !== -1) &&
+    // Due on or before the horizon. A run with no due date is not "within" any
+    // horizon, so it drops out rather than being assumed imminent.
+    (!horizon || (!!r.dueDate && r.dueDate <= horizon))
+  ), [runRows, statusFilter, assignFilter, typeFilter, familyFilter, customerFilter, horizon]);
 
   const listView = useListView(scoped, {
     columns: RUN_SORT_COLUMNS, fields: RUN_SEARCH_FIELDS,
     initialSort: { key: "dueDate", dir: "asc" }
   });
+
+  // Due inside the horizon but planned to finish after it. Two different
+  // things, and the gap is worth surfacing.
+  const horizonAtRisk = useMemo(() => !horizon ? 0
+    : scoped.filter(r => r.plannedEnd && r.plannedEnd > horizon).length, [scoped, horizon]);
+
+  /* The summary describes what is on screen, not the whole schedule. Filter
+     the list and the figures follow, which is the point of having it here
+     rather than as a separate report. */
+  const summary = useMemo(() => productionSummary(data, listView.rows),
+    [data, listView.rows]);
   const [calMode, setCalMode] = useState("plan");
   const [month, setMonth] = useState(() => todayStr().slice(0, 7));
 
@@ -15794,6 +16055,11 @@ function ScheduleTab({ data, onAdd, onEdit, onDelete, readOnly, onEditHours, onF
         </>
       )}
 
+      {summaryOpen && (
+        <ProductionSummaryModal summary={summary} filtered={listView.rows.length}
+          total={runRows.length} onClose={() => setSummaryOpen(false)} />
+      )}
+
       {layout === "list" && (
       <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
         <ListToolbar view={listView} columns={RUN_SORT_COLUMNS} placeholder="Run, product, order, customer\u2026">
@@ -15808,17 +16074,44 @@ function ScheduleTab({ data, onAdd, onEdit, onDelete, readOnly, onEditHours, onF
             <option value="assigned">Against a sales order</option>
             <option value="unassigned">Not against an order</option>
           </select>
+          <select style={{ ...inputStyle, width: "auto", minWidth: 165 }} value={typeFilter}
+            onChange={e => setTypeFilter(e.target.value)}>
+            <option value="">Intermediate and finished</option>
+            <option value="finished">Finished goods only</option>
+            <option value="intermediate">Intermediate products only</option>
+          </select>
           {/* Families are grouped by axis, so Blend and Pack do not read as one
-              flat list of unrelated options. */}
-          <select style={{ ...inputStyle, width: "auto", minWidth: 150 }} value={familyFilter}
+              flat list of unrelated options. Disabled for an intermediate-only
+              selection, which is what resolves the conflict: a filter that can
+              only ever match nothing should not be offered. */}
+          <select style={{ ...inputStyle, width: "auto", minWidth: 150,
+                           opacity: familyUsable ? 1 : 0.5 }}
+            value={familyFilter} disabled={!familyUsable}
+            title={familyUsable ? "" : "Families are tagged on finished goods"}
             onChange={e => setFamilyFilter(e.target.value)}>
-            <option value="">All product families</option>
+            <option value="">{familyUsable ? "All product families" : "Families — finished goods only"}</option>
             {familyDims.map(d => (
               <optgroup key={d.dimension} label={d.dimension}>
                 {d.families.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
               </optgroup>
             ))}
           </select>
+          {/* Horizon: everything due on or before a date. Presets for the
+              questions actually asked, and a date box for the rest. */}
+          <select style={{ ...inputStyle, width: "auto", minWidth: 140 }}
+            value={HORIZON_PRESETS.some(h => h.value() === horizon) ? horizon : (horizon ? "custom" : "")}
+            onChange={e => {
+              if (e.target.value === "custom") return;
+              setHorizon(e.target.value);
+            }}>
+            <option value="">Any due date</option>
+            {HORIZON_PRESETS.map(h => <option key={h.key} value={h.value()}>{h.label}</option>)}
+            {horizon && !HORIZON_PRESETS.some(h => h.value() === horizon) &&
+              <option value="custom">Due by {fmtDate(horizon)}</option>}
+          </select>
+          <input type="date" style={{ ...inputStyle, width: "auto" }} value={horizon}
+            title="Show runs due on or before this date"
+            onChange={e => setHorizon(e.target.value)} />
           <select style={{ ...inputStyle, width: "auto", minWidth: 150 }} value={customerFilter}
             onChange={e => setCustomerFilter(e.target.value)}>
             <option value="">All customers</option>
@@ -15826,16 +16119,32 @@ function ScheduleTab({ data, onAdd, onEdit, onDelete, readOnly, onEditHours, onF
           </select>
         </ListToolbar>
 
-        {/* Family tags live on finished goods, so a family filter can never
-            match a run making an intermediate. Saying so beats letting someone
-            conclude the runs have vanished. */}
-        {familyFilter && runRows.some(r => r.entry.productType !== "finished") && (
+        {/* Only worth saying when a family filter is actually narrowing away
+            intermediates — the type filter now handles the general case. */}
+        {familyFilter && !typeFilter && runRows.some(r => r.entry.productType !== "finished") && (
           <div style={{ fontSize: 11.5, color: "#7A5205", background: "#FFF9EF",
                         border: "1px solid #E8D5A8", borderRadius: 8, padding: "6px 10px" }}>
             Product families are tagged on finished goods, so runs making intermediate products are
             excluded while a family filter is on.
           </div>
         )}
+        {horizon && horizonAtRisk > 0 && (
+          /* Due within the horizon is a promise; planned to finish after it is
+             what the capacity plan expects to actually happen. The gap is the
+             point of having both. */
+          <div style={{ fontSize: 11.5, color: "#8A2E20", background: "#FCF4F3",
+                        border: "1px solid #E3B9B2", borderRadius: 8, padding: "6px 10px" }}>
+            {horizonAtRisk} of these are planned to finish <b>after</b> {fmtDate(horizon)} — due inside the
+            horizon, but not expected to make it.
+          </div>
+        )}
+
+        <div style={{ display: "flex", justifyContent: "flex-end" }}>
+          <Btn variant="secondary" onClick={() => setSummaryOpen(true)}
+            style={{ padding: "5px 11px", fontSize: 12 }}>
+            Production summary ({listView.rows.length} run{listView.rows.length === 1 ? "" : "s"})
+          </Btn>
+        </div>
 
         <ScheduleLegend />
 

@@ -1304,6 +1304,13 @@ console.log('\n--- the run list reads on its own ---');
      lh.includes('<optgroup label="Blend"') || lh.includes('label="Blend"'));
   ok('and by customer', lh.includes('All customers'));
 
+  // Added on review: the type filter is what resolves the family conflict.
+  ok('by product type', lh.includes('Intermediate and finished') &&
+     lh.includes('Finished goods only') && lh.includes('Intermediate products only'));
+  ok('and by a due-date horizon',
+     lh.includes('Any due date') && lh.includes('Due within 30 days'));
+  ok('the production summary is reachable', lh.includes('Production summary'));
+
   // Planned start and completion come from the capacity plan, not the run.
   ok('planned start and completion can be sorted on',
      lh.includes('Planned start') && lh.includes('Planned completion'));
@@ -1321,6 +1328,38 @@ console.log('\n--- the run list reads on its own ---');
 
   const legend = tryRender('sl3', React.createElement(A.ScheduleLegend, {}));
   ok('the legend renders standalone', !legend.err, legend.err);
+}
+
+console.log('\n--- the production summary window ---');
+{
+  const D10 = A.seedData();
+  const rows = A.runListRows(D10, null);
+  const summary = A.productionSummary(D10, rows);
+  const r = tryRender('psum', React.createElement(A.ProductionSummaryModal, {
+    summary, filtered: rows.length, total: rows.length, onClose: noop }));
+  ok('the summary window renders', !r.err, r.err);
+  const h = (r.html || '').replace(/<!-- -->/g, '');
+
+  ok('runs per product', h.includes('>Runs<'));
+  ok('total production planned', h.includes('Production planned'));
+  ok('expected COGS', h.includes('Expected COGS'));
+  ok('the number of linked sales orders', h.includes('Linked SOs'));
+  ok('the production linked to them', h.includes('Linked production'));
+  ok('and the revenue that implies', h.includes('Est. revenue'));
+
+  // Quantity is not summed across products; money is.
+  ok('mixed units are called out rather than totalled', h.includes('mixed units'));
+  ok('and it says revenue prices linked production only',
+     h.includes('prices the') && h.includes('linked'));
+  ok('naming why unsold production is not priced',
+     h.includes('nobody has committed to buy'));
+  ok('the window says what selection it describes', h.includes('currently shown'));
+
+  const none = tryRender('psum2', React.createElement(A.ProductionSummaryModal, {
+    summary: A.productionSummary(D10, []), filtered: 0, total: rows.length, onClose: noop }));
+  ok('an empty selection renders', !none.err, none.err);
+  ok('and says there is nothing to summarise',
+     (none.html || '').includes('nothing to summarise'));
 }
 
 console.log('\n--- assigned versus unassigned production, on the dashboard ---');

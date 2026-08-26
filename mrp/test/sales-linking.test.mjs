@@ -13,6 +13,7 @@ import { seedData, tx, repo, sortRows, filterRows, compareBy,
          runListRows, planScheduleFIFO, familiesOf,
          lineAllocations, lineRequiredQty, lineAllocatedQty, lineUnallocatedQty,
          lineIsReleased, lineRunIds, runCommittedQty, runCapacity, planRunLink,
+         productionSummary, expectedUnitCost,
          normalizeData } from '/tmp/core.mjs';
 
 let pass = 0, fail = 0;
@@ -529,6 +530,110 @@ console.log('\n--- the run list rows ---');
   tx.linkSalesOrderLineToRun(D, { salesOrderId: o2.id, lineId: o2.lines[0].id, scheduleId: r.id });
   ok('a customer on two orders is not listed twice',
      runListRows(D, null)[0].customerIds.length === 2);
+}
+
+console.log('\n--- the production summary ---');
+{
+  const D = seedData();
+  const rows = runListRows(D, null);
+  const sum = productionSummary(D, rows);
+
+  ok('every run is accounted for', sum.totals.runs === rows.length);
+  ok('grouped by product', sum.products.length > 0 && sum.products.length < rows.length);
+  ok('each product names itself', sum.products.every(p => !!p.productName));
+  ok('and carries its unit, since the quantity is in it',
+     sum.products.filter(p => p.plannedQty > 0).every(p => typeof p.unit === 'string'));
+
+  const one = sum.products[0];
+  const mine = rows.filter(r => r.entry.productId === one.itemId);
+  ok('the run count is that product\u2019s runs', one.runs === mine.length);
+  ok('and planned production is their quantities',
+     Math.abs(one.plannedQty - mine.reduce((n, r) => n + r.qty, 0)) < 0.02);
+
+  // Expected COGS reuses the notion the sales roll-ups use, so the two
+  // reports cannot disagree about what a run was expected to cost.
+  const expected = mine.reduce((n, r) => {
+    const e = expectedUnitCost(D, r.entry);
+    return n + (e && e.unitCost > 0 ? e.unitCost * r.qty : 0);
+  }, 0);
+  ok('expected COGS matches the shared expected-cost notion',
+     Math.abs(one.expectedCogs - expected) < 0.05);
+
+  ok('money totals across products', sum.totals.expectedCogs > 0);
+  // Each product has its own unit, so a grand total of quantity would add
+  // jars to kilogrammes.
+  ok('there is no grand total of planned quantity', sum.totals.plannedQty === undefined,
+     'that would add jars to kilogrammes');
+  ok('and the mixed units are flagged', sum.totals.mixedUnits === true);
+}
+
+// Linked figures, and the deliberate refusal to price unsold production.
+{
+  const { D, cust, fg } = plant();
+  const r1 = run(D, fg, { qty: 100 }), r2 = run(D, fg, { qty: 50 });
+  const rows = () => runListRows(D, null);
+
+  const bare = productionSummary(D, rows()).products[0];
+  ok('with nothing sold, no orders are linked', bare.linkedOrders === 0);
+  ok('no production is linked', bare.linkedQty === 0);
+  ok('and revenue is zero, not guessed from a list price', bare.linkedRevenue === 0,
+     'pricing unsold production would invent revenue for goods nobody has agreed to buy');
+  ok('but the production is still counted', bare.plannedQty === 150);
+  ok('and 0% of it is spoken for', bare.linkedPct === 0);
+
+  const o = tx.raiseSalesOrder(D, { customerId: cust.id, submit: true,
+    lines: [{ finishedGoodId: fg.id, qty: 60, listPrice: 10 }] }).order;
+  tx.reviewSalesOrderLine(D, { salesOrderId: o.id, lineId: o.lines[0].id, decision: 'Accept' });
+  tx.linkSalesOrderLineToRun(D, { salesOrderId: o.id, lineId: o.lines[0].id, scheduleId: r1.id });
+
+  const linked = productionSummary(D, rows()).products[0];
+  ok('a linked order is counted', linked.linkedOrders === 1);
+  ok('with the allocated quantity, not the run quantity', linked.linkedQty === 60,
+     'the run makes 100; only 60 of it is sold');
+  ok('revenue is that quantity at the agreed price', linked.linkedRevenue === 600);
+  ok('the share of planned production is reported', linked.linkedPct === 40);
+  ok('while planned production is unchanged', linked.plannedQty === 150);
+
+  // One order across two runs is still one order.
+  const o2 = tx.raiseSalesOrder(D, { customerId: cust.id, submit: true,
+    lines: [{ finishedGoodId: fg.id, qty: 90, listPrice: 10 }] }).order;
+  tx.reviewSalesOrderLine(D, { salesOrderId: o2.id, lineId: o2.lines[0].id, decision: 'Accept' });
+  tx.linkSalesOrderLineToRun(D, { salesOrderId: o2.id, lineId: o2.lines[0].id, scheduleId: r1.id });
+  tx.linkSalesOrderLineToRun(D, { salesOrderId: o2.id, lineId: o2.lines[0].id, scheduleId: r2.id });
+  const both = productionSummary(D, rows()).products[0];
+  ok('two orders are counted once each', both.linkedOrders === 2);
+  ok('and an order spanning two runs is not double-counted', both.linkedQty === 150);
+
+  // A withdrawn order is not revenue.
+  o2.status = 'Cancelled';
+  const afterCancel = productionSummary(D, rows()).products[0];
+  ok('a cancelled order stops counting as linked', afterCancel.linkedOrders === 1);
+  ok('and its revenue goes with it', afterCancel.linkedRevenue === 600);
+}
+
+// The summary describes what is passed in, which is what the list is showing.
+{
+  const D = seedData();
+  const rows = runListRows(D, null);
+  const finished = rows.filter(r => r.entry.productType === 'finished');
+  const sum = productionSummary(D, finished);
+  ok('a filtered selection summarises only that selection', sum.totals.runs === finished.length);
+  ok('and covers fewer products than the whole schedule',
+     sum.products.length <= productionSummary(D, rows).products.length);
+  ok('an empty selection summarises to nothing',
+     productionSummary(D, []).totals.runs === 0);
+  ok('with no products', productionSummary(D, []).products.length === 0);
+  ok('null rows tolerated', productionSummary(D, null).totals.runs === 0);
+  ok('null data tolerated', productionSummary(null, rows).totals.runs === rows.length);
+}
+
+// A single-product selection has one unit, so nothing is mixed.
+{
+  const { D, cust, fg } = plant();
+  run(D, fg, { qty: 10 });
+  const sum = productionSummary(D, runListRows(D, null));
+  ok('one product means one unit', sum.totals.mixedUnits === false);
+  ok('so the quantity column is safe to read', sum.products.length === 1);
 }
 
 console.log('\n--- sorting, shared by every list ---');
