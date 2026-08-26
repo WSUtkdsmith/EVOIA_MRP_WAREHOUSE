@@ -15,7 +15,10 @@ function plant() {
   raw.packagings = [{ id: 'pk', sku: 'S', packageType: 'sack', size: '60 kg', unitsPerPackage: 60, isDefault: true }];
   const po = tx.savePurchaseOrder(D, { supplier: 'Acme',
     lines: [{ rawMaterialId: raw.id, qty: 600, unitCost: 5, packagingId: 'pk', containerCount: 10 }] }).po;
-  tx.placePurchaseOrder(D, { purchaseOrderId: po.id });
+  // An order reaches the dock only by walking the approval path first.
+  tx.submitPurchaseRequest(D, { purchaseOrderId: po.id, role: 'operator', requestedBy: 'Line' });
+  tx.approvePurchaseOrder(D, { purchaseOrderId: po.id, role: 'admin', approvedBy: 'Buyer' });
+  tx.placePurchaseOrder(D, { purchaseOrderId: po.id, role: 'admin' });
   return { D, raw, po, line: po.lines[0] };
 }
 const booking = (over) => ({

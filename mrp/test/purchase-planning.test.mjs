@@ -6,11 +6,27 @@ import { seedData, repo, tx, suggestPurchaseOrders,
          unitsPerContainer, packagingLabel, qtyFromContainers, containersFromQty,
          poTotalCost, poContainerSummary, poPackaging, rawStockOnHand,
          nextPoReference, poOutstanding, poReceivedQty, openOrderQty,
-         poOrderedQty, poLineOutstanding, poDerivedStatus } from '/tmp/core.mjs';
+         poOrderedQty, poLineOutstanding, poDerivedStatus,
+         pipelineOrderQty, pipelineBreakdown } from '/tmp/core.mjs';
 
 let pass = 0, fail = 0;
 const ok = (n, c, x) => { if (c) { pass++; console.log('  PASS  ' + n); }
   else { fail++; console.log('  FAIL  ' + n + (x ? '\n          ' + x : '')); } };
+
+/* An order used to go from draft straight to the supplier. It now walks
+   Draft -> Requested -> Approved -> Ordered, with a different role entitled
+   to each step. Tests about receiving and container maths take it there
+   first rather than restating the workflow every time; the workflow itself
+   is asserted in purchasing.test.mjs. */
+const place = (db, poId, over) => {
+  const submitted = tx.submitPurchaseRequest(db, {
+    purchaseOrderId: poId, role: 'operator', requestedBy: 'Line' });
+  if (!submitted.ok) return submitted;
+  const approved = tx.approvePurchaseOrder(db, {
+    purchaseOrderId: poId, role: 'admin', approvedBy: 'Buyer' });
+  if (!approved.ok) return approved;
+  return tx.placePurchaseOrder(db, { purchaseOrderId: poId, role: 'admin', ...(over || {}) });
+};
 
 console.log('\n--- containers and units ---');
 ok('units per container defaults to 1 when absent', unitsPerContainer(null) === 1);
@@ -82,9 +98,26 @@ console.log('\n--- the forecast ---');
   ok('the ordered quantity is receivable in full',
      created.every(po => Math.abs(poOutstanding(po) - po.lines.reduce((s, l) => s + l.qty, 0)) < 0.001));
   ok('nothing is received yet', created.every(po => poReceivedQty(po) === 0));
-  ok('the order now counts as on order for the material', openOrderQty(D, raw.id) >= row.qty - 0.001);
-  ok('the forecast no longer asks for what is now on order',
+  /* A draft is NOT on order. Nobody outside this building has been told
+     about it, so counting it as cover would have the forecast stand down on
+     a shortage that nothing is coming to fill. It used to count, and that
+     was wrong; the approval walk made the gap wide enough to matter. */
+  ok('a raised draft does NOT count as on order', openOrderQty(D, raw.id) === 0,
+     String(openOrderQty(D, raw.id)));
+  ok('but it is visible in the pipeline rather than lost',
+     pipelineOrderQty(D, raw.id) >= row.qty - 0.001, String(pipelineOrderQty(D, raw.id)));
+  ok('and the split says exactly where it is stuck',
+     pipelineBreakdown(D, raw.id).Draft >= row.qty - 0.001);
+  /* The forecast asks a different question - "does this still need
+     raising?" - so something already raised stops it nagging for a
+     duplicate, even though it is not cover yet. */
+  ok('the forecast no longer asks for what has already been raised',
      !suggestPurchaseOrders(D, { today: '2026-07-31' }).some(r => r.rawMaterialId === raw.id));
+
+  // ...and once it is actually placed, it becomes real cover.
+  place(D, created[0].id);
+  ok('placing it moves the quantity from pipeline to on order',
+     openOrderQty(D, raw.id) > 0);
   ok('the order reads with its container count', /^\d+ × /.test(poContainerSummary(D, created[0])));
 }
 
@@ -116,10 +149,14 @@ console.log('\n--- one order, several lines ---');
   ok('the order is expected when its slowest line is', po.expectedDate === '2026-09-08');
   ok('the summary names both containers',
      /10 × 60 kg sack/.test(poContainerSummary(D, po)) && /3 × 1000 kg tote/.test(poContainerSummary(D, po)));
-  ok('both lines count toward what is on order', Math.abs(openOrderQty(D, raw.id) - 3600) < 0.001);
+  // Still a draft here, so the two lines show up as pipeline rather than cover.
+  ok('both lines count toward what has been raised',
+     Math.abs(pipelineOrderQty(D, raw.id) - 3600) < 0.001, String(pipelineOrderQty(D, raw.id)));
 
   // Receiving is per line, so one size arriving does not close the other.
-  tx.placePurchaseOrder(D, { purchaseOrderId: po.id });
+  place(D, po.id);
+  ok('and both count toward what is on order once it is placed',
+     Math.abs(openOrderQty(D, raw.id) - 3600) < 0.001, String(openOrderQty(D, raw.id)));
   const res = tx.receiveAgainstOrder(D, { purchaseOrderId: po.id, lineId: po.lines[1].id, qty: 3000, lotNumber: 'TOTE-1' });
   ok('a named line can be received', res.ok === true && res.line.id === po.lines[1].id);
   ok('the lot is priced from that line, not the other', res.lot.unitCost === 4.5);
@@ -144,7 +181,7 @@ console.log('\n--- a delivery need not name a line ---');
     { rawMaterialId: raw.id, supplier: 'Solo', qty: 100, unitCost: 2 }
   ]);
   const po = created[0];
-  tx.placePurchaseOrder(D, { purchaseOrderId: po.id });
+  place(D, po.id);
   const res = tx.receiveAgainstOrder(D, { purchaseOrderId: po.id, qty: 40, lotNumber: 'X' });
   ok('a single-line order receives without ceremony', res.ok === true);
   ok('and the receipt is still attributed to the line', po.receipts[0].lineId === po.lines[0].id);
@@ -206,7 +243,7 @@ console.log('\n--- authoring an order by hand ---');
   ok('a missing reference is minted', auto.ok === true && !!auto.po.reference);
 
   // once placed it is a commitment, not a draft
-  tx.placePurchaseOrder(D, { purchaseOrderId: two.po.id });
+  place(D, two.po.id);
   const afterPlace = tx.savePurchaseOrder(D, { purchaseOrderId: two.po.id, reference: 'HAND-1',
     supplier: 'Acme', lines: [{ rawMaterialId: raw.id, qty: 999, unitCost: 5 }] });
   ok('a placed order cannot be edited', afterPlace.ok === false);
@@ -229,7 +266,7 @@ console.log('\n--- cancelling ---');
   ok('it is no longer receivable', !tx.receivablePurchaseOrders(D).some(p => p.id === po.id));
 
   const done = tx.savePurchaseOrder(D, { supplier: 'B', lines: [{ rawMaterialId: raw.id, qty: 10, unitCost: 1 }] }).po;
-  tx.placePurchaseOrder(D, { purchaseOrderId: done.id });
+  place(D, done.id);
   tx.receiveAgainstOrder(D, { purchaseOrderId: done.id, qty: 10, lotNumber: 'ALL-IN' });
   ok('an order received in full cannot be cancelled',
      tx.cancelPurchaseOrder(D, { purchaseOrderId: done.id }).ok === false);
@@ -261,9 +298,10 @@ console.log('\n--- receiving against the order still works end to end ---');
 
   ok('a draft order is not receivable until it is placed',
      !tx.receivablePurchaseOrders(D).some(p => p.id === po.id));
-  ok('placing the order succeeds', tx.placePurchaseOrder(D, { purchaseOrderId: po.id }).ok === true);
+  ok('placing the order succeeds', place(D, po.id).ok === true);
   ok('a placed order is receivable', tx.receivablePurchaseOrders(D).some(p => p.id === po.id));
-  ok('placing it twice is refused', tx.placePurchaseOrder(D, { purchaseOrderId: po.id }).ok === false);
+  ok('placing it twice is refused',
+     tx.placePurchaseOrder(D, { purchaseOrderId: po.id, role: 'admin' }).ok === false);
 
   const first = tx.receiveAgainstOrder(D, { purchaseOrderId: po.id, date: '2026-08-01', qty: half, lotNumber: 'DOCK-1' });
   ok('a part delivery is accepted', first.ok === true);

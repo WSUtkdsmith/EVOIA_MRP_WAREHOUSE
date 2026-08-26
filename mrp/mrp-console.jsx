@@ -750,8 +750,24 @@ const SCHEMA = {
       id: "str", reference: "str!",
       supplier: "str", orderDate: "date!",
       expectedDate: "date!",
-      status: "enum:Draft|Ordered|Part received|Received|Cancelled!",
+      /* An order walks a path now rather than appearing already placed.
+
+         Draft      - being written; nobody has been asked for anything
+         Requested  - submitted for approval by whoever needs the material
+         Approved   - signed off, but the supplier still knows nothing
+         Ordered    - actually placed with the supplier, and only now
+                      receivable in the warehouse
+         Part received / Received - derived from the receipts
+
+         The three states before Ordered matter to the forecast as much as
+         to the buyer: material sitting in an approval queue is NOT on its
+         way, and openOrderQty must not pretend otherwise. */
+      status: "enum:Draft|Requested|Approved|Ordered|Part received|Received|Cancelled!",
       notes: "str",
+      // Who moved it and when. Names are typed for now - there are no user
+      // accounts yet, and inventing one would be worse than an empty field.
+      requestedBy: "str", requestedAt: "date",
+      approvedBy: "str", approvedAt: "date",
       /* What the supplier actually billed.
 
          The order is what we asked for at the price we agreed. The invoice
@@ -2359,20 +2375,133 @@ const tx = {
     return { ok: true, created };
   },
 
-  /* Place a drafted order with the supplier.
+  /* --- The approval walk -------------------------------------------
 
-     Draft is deliberately sticky - poDerivedStatus will not infer its way
-     out of it, because a draft is a decision rather than a state to be
-     guessed at. So there has to be an explicit step that says this order
-     was actually placed, and it is that step which makes the order
-     receivable. Without it a delivery could be booked against an order
-     nobody ever sent. */
-  placePurchaseOrder(db, { purchaseOrderId, orderDate, expectedDate }) {
+     Draft -> Requested -> Approved -> Ordered, each step explicit and
+     each one recorded. The states before Ordered are sticky in
+     poDerivedStatus, so nothing infers its way forward: an order becomes
+     receivable because someone placed it, never because it happens to
+     have no receipts yet.
+
+     Every step takes the acting role and refuses one that may not do it.
+     That is a workflow rule rather than a security control - there is no
+     login yet, and the view switch says so - but putting it in the
+     transaction means the rule is testable and cannot be sidestepped by
+     reaching a screen from an unexpected direction. Hiding a button is
+     not a rule.
+
+     Each transition writes a revision row, so the approval trail lands in
+     the same history the amendments already use rather than in a second
+     place nobody thinks to look. */
+  submitPurchaseRequest(db, { purchaseOrderId, role, requestedBy, date, notes }) {
     const po = repo.find(db, "purchaseOrders", purchaseOrderId);
     if (!po) return { ok: false, error: "That purchase order no longer exists." };
+    if (!canRequestPurchase(role)) {
+      return { ok: false, error: purchaseRights(role).label + " cannot raise a purchase request." };
+    }
+    if (po.status === "Cancelled") return { ok: false, error: "A cancelled order cannot be submitted." };
+    if (po.status !== "Draft") {
+      return { ok: false, error: "Only a draft can be submitted. This one is already " +
+               poDerivedStatus(po).toLowerCase() + "." };
+    }
+    if (!poLines(po).length) {
+      return { ok: false, error: "A request needs at least one material and quantity." };
+    }
+    const when = date || todayStr();
+    poRecordTransition(po, "Draft", "Requested", when,
+      notes || "Submitted for approval", requestedBy);
+    po.status = "Requested";
+    po.requestedBy = requestedBy || "";
+    po.requestedAt = when;
+    return { ok: true, po };
+  },
+
+  /* Approve a request. Separate from placing it: approval says the money
+     is agreed, placing says the supplier has been told. Collapsing the two
+     would lose the state every purchasing department actually lives in -
+     approved, and not yet ordered. */
+  approvePurchaseOrder(db, { purchaseOrderId, role, approvedBy, date, notes }) {
+    const po = repo.find(db, "purchaseOrders", purchaseOrderId);
+    if (!po) return { ok: false, error: "That purchase order no longer exists." };
+    if (!canApprovePurchase(role)) {
+      return { ok: false, error: purchaseRights(role).label +
+               " cannot approve a purchase order. Approval is for Admin and Finance." };
+    }
+    if (po.status === "Cancelled") return { ok: false, error: "A cancelled order cannot be approved." };
+    if (po.status !== "Requested") {
+      return { ok: false, error: po.status === "Draft"
+        ? "That order has not been submitted for approval yet."
+        : "Only a requested order can be approved. This one is already " +
+          poDerivedStatus(po).toLowerCase() + "." };
+    }
+    const when = date || todayStr();
+    poRecordTransition(po, "Requested", "Approved", when, notes || "Approved", approvedBy);
+    po.status = "Approved";
+    po.approvedBy = approvedBy || "";
+    po.approvedAt = when;
+    return { ok: true, po };
+  },
+
+  /* Send a request back to whoever raised it.
+
+     An approval step that can only say yes is not an approval step. The
+     reason is required for the same purpose it is on an amendment - the
+     requester has to know what to change, and "declined" on its own tells
+     them nothing. Goes back to Draft so it can be edited and resubmitted
+     rather than dying. */
+  returnPurchaseRequest(db, { purchaseOrderId, role, reason, returnedBy, date }) {
+    const po = repo.find(db, "purchaseOrders", purchaseOrderId);
+    if (!po) return { ok: false, error: "That purchase order no longer exists." };
+    if (!canApprovePurchase(role)) {
+      return { ok: false, error: purchaseRights(role).label + " cannot decide on a purchase request." };
+    }
+    if (po.status !== "Requested") {
+      return { ok: false, error: "Only a request awaiting approval can be returned." };
+    }
+    const why = String(reason || "").trim();
+    if (!why) return { ok: false, error: "A reason is required to return a request." };
+    const when = date || todayStr();
+    poRecordTransition(po, "Requested", "Draft", when, why, returnedBy);
+    po.status = "Draft";
+    // The request is undone, so the stamp that recorded it goes too - a
+    // requestedAt on a draft would claim a submission that no longer stands.
+    po.requestedBy = ""; po.requestedAt = "";
+    return { ok: true, po };
+  },
+
+  /* Place an approved order with the supplier.
+
+     This is the step that makes an order receivable, and the point at
+     which a delivery date is worth recording: until now the expected date
+     was a guess carried from the forecast, and from here it is what the
+     supplier has actually promised. Which is why it is asked for here
+     rather than inherited silently. */
+  placePurchaseOrder(db, { purchaseOrderId, role, orderDate, expectedDate, placedBy, notes }) {
+    const po = repo.find(db, "purchaseOrders", purchaseOrderId);
+    if (!po) return { ok: false, error: "That purchase order no longer exists." };
+    if (role !== undefined && !canPlacePurchase(role)) {
+      return { ok: false, error: purchaseRights(role).label +
+               " cannot place a purchase order. Ordering is for Admin and Finance." };
+    }
     if (po.status === "Cancelled") return { ok: false, error: "A cancelled order cannot be placed." };
-    if (po.status !== "Draft") return { ok: false, error: "Only a draft order can be placed." };
-    if (orderDate) po.orderDate = orderDate;
+    if (po.status !== "Approved") {
+      return { ok: false, error: po.status === "Draft"
+        ? "That order has not been submitted or approved yet."
+        : po.status === "Requested"
+        ? "That order is still awaiting approval."
+        : "Only an approved order can be placed. This one is already " +
+          poDerivedStatus(po).toLowerCase() + "." };
+    }
+    const when = orderDate || todayStr();
+    poRecordTransition(po, "Approved", "Ordered", when,
+      notes || "Placed with " + (po.supplier || "the supplier"), placedBy);
+    // The anticipated delivery date is a promise now rather than a guess, so
+    // a change to it is worth its own line in the history.
+    if (expectedDate && expectedDate !== po.expectedDate) {
+      poRecordTransition(po, po.expectedDate, expectedDate, when,
+        "Anticipated delivery agreed at order", placedBy, "expectedDate");
+    }
+    po.orderDate = when;
     if (expectedDate) po.expectedDate = expectedDate;
     po.status = "Ordered";
     return { ok: true, po };
@@ -2823,7 +2952,9 @@ const tx = {
     const existing = purchaseOrderId ? repo.find(db, "purchaseOrders", purchaseOrderId) : null;
     if (purchaseOrderId && !existing) return { ok: false, error: "That purchase order no longer exists." };
     if (existing && existing.status !== "Draft") {
-      return { ok: false, error: "Only a draft order can be edited. This one has already been placed." };
+      return { ok: false, error: existing.status === "Requested" || existing.status === "Approved"
+        ? "Only a draft can be edited. This one is awaiting approval - return it to draft first."
+        : "Only a draft order can be edited. This one has already been placed." };
     }
 
     const ref = String(reference || "").trim() || nextPoReference(db);
@@ -2885,8 +3016,13 @@ const tx = {
   amendPurchaseOrder(db, { purchaseOrderId, supplier, expectedDate, notes, lines, reason, author, date }) {
     const po = repo.find(db, "purchaseOrders", purchaseOrderId);
     if (!po) return { ok: false, error: "That purchase order no longer exists." };
-    if (po.status === "Draft") {
-      return { ok: false, error: "That order is still a draft - edit it directly rather than amending it." };
+    /* Amendment is for an order the supplier holds. Anything short of that
+       is still ours to edit outright - a request under review gets returned
+       to its author and changed, not amended behind their back. */
+    if (poIsPipeline(po)) {
+      return { ok: false, error: po.status === "Draft"
+        ? "That order is still a draft - edit it directly rather than amending it."
+        : "That order has not been placed yet. Return it to draft to change it." };
     }
     if (po.status === "Cancelled") return { ok: false, error: "A cancelled order cannot be amended." };
     if (poDerivedStatus(po) === "Received") {
@@ -3013,8 +3149,11 @@ const tx = {
                             invoiceNotes, chargeBasis, lineCosts, charges }) {
     const po = repo.find(db, "purchaseOrders", purchaseOrderId);
     if (!po) return { ok: false, error: "That purchase order no longer exists." };
-    if (po.status === "Draft") {
-      return { ok: false, error: "A draft has not been sent to anyone, so it cannot have been invoiced." };
+    // Nobody invoices an order they were never sent, and that covers the
+    // whole approval queue, not just drafts.
+    if (poIsPipeline(po)) {
+      return { ok: false, error: "That order has not been placed with a supplier yet, " +
+               "so it cannot have been invoiced." };
     }
     if (po.status === "Cancelled") {
       return { ok: false, error: "A cancelled order cannot take invoice costs." };
@@ -5243,6 +5382,12 @@ function normalizePurchaseOrders(list) {
         id: r.id || uid(), lineId: r.lineId || firstLineId, date: r.date || "",
         qty: Number(r.qty) || 0, lotId: r.lotId || "", notes: r.notes || ""
       })),
+      /* Orders that predate the approval walk are left where they are: a
+         historic "Ordered" was placed, and rewriting it as Draft to force
+         it back through a workflow that did not exist when it was raised
+         would be inventing an approval nobody gave. */
+      requestedBy: po.requestedBy || "", requestedAt: po.requestedAt || "",
+      approvedBy: po.approvedBy || "", approvedAt: po.approvedAt || "",
       invoiceVariance: !!po.invoiceVariance,
       invoiceRef: po.invoiceRef || "", invoiceDate: po.invoiceDate || "",
       invoiceNotes: po.invoiceNotes || "",
@@ -6473,6 +6618,112 @@ function batchRecords(data, options) {
    calendar is for.
 =============================================================== */
 
+/* ---------------------------------------------------------------
+   Who may move an order along
+
+   This is a SEPARATION OF DUTIES rule, not a security boundary. There
+   is no login yet - the view switch says as much on its face - so a
+   determined user can still click Admin and approve their own request.
+   What this does buy is that the workflow is real: the buttons, the
+   transactions and the tests all agree on who is supposed to do what,
+   so when authentication does arrive it has something correct to
+   attach to rather than a set of rules that were never written down.
+
+   The rules are held in one table so a new role is one line here, not
+   a hunt through the UI. `finance` exists and can do everything a
+   purchasing admin can - the person may be future, the rule is not.
+----------------------------------------------------------------*/
+const PURCHASE_ROLES = {
+  admin:    { label: "Admin",    request: true, approve: true, place: true },
+  finance:  { label: "Finance",  request: true, approve: true, place: true },
+  // An operator knows what the line needs and is exactly the person who
+  // should be raising the request. Approving their own is the thing this
+  // whole workflow exists to stop.
+  operator: { label: "Operator", request: true, approve: false, place: false }
+};
+
+function purchaseRights(role) {
+  return PURCHASE_ROLES[role] || { label: String(role || "unknown"),
+                                   request: false, approve: false, place: false };
+}
+const canRequestPurchase = (role) => purchaseRights(role).request;
+const canApprovePurchase = (role) => purchaseRights(role).approve;
+const canPlacePurchase = (role) => purchaseRights(role).place;
+
+/* The order of the walk, for anything that needs to reason about
+   "before" and "after" rather than name each state. */
+const PO_STATUS_FLOW = ["Draft", "Requested", "Approved", "Ordered", "Part received", "Received"];
+
+/* Placed with the supplier - the only states in which stock is genuinely
+   on its way. Everything earlier is an intention inside this building. */
+const PO_PLACED_STATUSES = ["Ordered", "Part received", "Received"];
+const poIsPlaced = (po) => PO_PLACED_STATUSES.indexOf(poDerivedStatus(po)) >= 0;
+// Raised but not yet placed: real demand, no supplier commitment behind it.
+const PO_PIPELINE_STATUSES = ["Draft", "Requested", "Approved"];
+const poIsPipeline = (po) => PO_PIPELINE_STATUSES.indexOf(poDerivedStatus(po)) >= 0;
+
+/* Write one step of the walk into the order's history.
+
+   Reuses the revisions table the amendments already write to, so the
+   whole life of an order - who asked for it, who approved it, who placed
+   it, and every change since - reads as one list in one place. A second
+   audit table would guarantee half the story went missing from each. */
+function poRecordTransition(po, from, to, at, reason, author, field) {
+  if (!Array.isArray(po.revisions)) po.revisions = [];
+  po.revisions.push({
+    id: uid(), at: at || todayStr(), field: field || "status", lineRef: "",
+    fromValue: String(from === undefined || from === null ? "" : from),
+    toValue: String(to === undefined || to === null ? "" : to),
+    reason: String(reason || "").trim() || "—",
+    author: String(author || "").trim()
+  });
+}
+
+/* The transitions this order can make right now, given who is asking.
+
+   One place decides, so the buttons on the record, the guards in the
+   transactions and the tests cannot drift apart. Returns the actions in
+   the order they would actually happen. */
+function poAvailableActions(po, role) {
+  const status = poDerivedStatus(po);
+  const rights = purchaseRights(role);
+  const out = [];
+  if (status === "Draft" && rights.request) {
+    out.push({ key: "submit", label: "Submit request", primary: true });
+  }
+  if (status === "Requested" && rights.approve) {
+    out.push({ key: "approve", label: "Approve", primary: true });
+    out.push({ key: "return", label: "Return to requester" });
+  }
+  if (status === "Approved" && rights.place) {
+    out.push({ key: "place", label: "Mark as ordered", primary: true });
+  }
+  if (status !== "Cancelled" && status !== "Received" && rights.approve) {
+    out.push({ key: "cancel", label: "Cancel order" });
+  }
+  return out;
+}
+
+/* What an order is waiting for, said in words rather than left for the
+   reader to work out from a status badge. Null once it is with the
+   supplier and the answer is just "the delivery". */
+function poWaitingOn(po, role) {
+  const status = poDerivedStatus(po);
+  const rights = purchaseRights(role);
+  if (status === "Draft") return "Not submitted yet — it is still a draft.";
+  if (status === "Requested") {
+    return rights.approve
+      ? "Waiting for your approval."
+      : "Waiting for Admin or Finance to approve it.";
+  }
+  if (status === "Approved") {
+    return rights.place
+      ? "Approved — waiting for you to place it with the supplier."
+      : "Approved — waiting for Admin or Finance to place it with the supplier.";
+  }
+  return null;
+}
+
 /* An order's lines. Orders written before lines existed are migrated on
    load, so anything reaching here has them. */
 function poLines(po) {
@@ -6663,7 +6914,13 @@ function poActualDate(po) {
    decision, not an inference - but it is reconciled against the receipts
    so it cannot drift out of step with them. */
 function poDerivedStatus(po) {
-  if (po.status === "Cancelled" || po.status === "Draft") return po.status;
+  /* Everything before Ordered is sticky. These are decisions somebody
+     made, not states to be guessed at from the receipts - and inferring
+     "Ordered" from an empty receipt list would silently promote an order
+     still sitting in the approval queue into one the warehouse may
+     receive against. */
+  if (po.status === "Cancelled" || po.status === "Draft" ||
+      po.status === "Requested" || po.status === "Approved") return po.status;
   const received = poReceivedQty(po);
   const ordered = poOrderedQty(po);
   if (received <= 0) return "Ordered";
@@ -6684,10 +6941,19 @@ function poDaysLate(po) {
 function openOrderQty(data, rawMaterialId) {
   let found = false, total = 0;
   (data.purchaseOrders || []).forEach(po => {
+    const placed = poIsPlaced(po);
     poLines(po).forEach(line => {
       if (line.rawMaterialId !== rawMaterialId) return;
+      // `found` counts any order at all, so a material that HAS orders never
+      // falls back to the stale hand-kept figure - even if every one of them
+      // is still awaiting approval.
       found = true;
-      total += poLineOutstanding(po, line);
+      /* Only a placed order contributes. A draft, a request and an approval
+         are all things nobody outside this building has been told about, so
+         counting them as cover would have the forecast quietly stand down on
+         a shortage that nothing is actually coming to fill. Use
+         pipelineOrderQty to see what is in the queue behind this. */
+      if (placed) total += poLineOutstanding(po, line);
     });
   });
   if (!found) {
@@ -6695,6 +6961,38 @@ function openOrderQty(data, rawMaterialId) {
     return raw ? Number(raw.onOrder) || 0 : 0;
   }
   return total;
+}
+
+/* Quantity raised but not yet placed with anyone - drafts, requests
+   awaiting approval, and approvals awaiting a buyer. Reported beside
+   on-order rather than folded into it: it is the difference between
+   "help is coming" and "somebody has asked for help". */
+function pipelineOrderQty(data, rawMaterialId) {
+  let total = 0;
+  (data.purchaseOrders || []).forEach(po => {
+    if (!poIsPipeline(po)) return;
+    poLines(po).forEach(line => {
+      if (line.rawMaterialId !== rawMaterialId) return;
+      total += Number(line.qty) || 0;
+    });
+  });
+  return total;
+}
+
+/* The same split, per status, for a material - what the reorder panel
+   needs to say WHERE the cover is stuck. */
+function pipelineBreakdown(data, rawMaterialId) {
+  const out = { Draft: 0, Requested: 0, Approved: 0, total: 0 };
+  (data.purchaseOrders || []).forEach(po => {
+    const st = poDerivedStatus(po);
+    if (out[st] === undefined) return;
+    poLines(po).forEach(line => {
+      if (line.rawMaterialId !== rawMaterialId) return;
+      const q = Number(line.qty) || 0;
+      out[st] += q; out.total += q;
+    });
+  });
+  return out;
 }
 
 /* ---------------------------------------------------------------
@@ -6802,11 +7100,22 @@ function suggestPurchaseOrders(data, options) {
     if (reorderPoint <= 0) return;
     const onHand = rawStockOnHand(raw);
     const onOrder = openOrderQty(data, raw.id);
+    /* Two different questions, deliberately given two different answers.
+
+       "Will I run out?" is openOrderQty: only a placed order is stock on
+       its way, so that is the honest exposure and it is what the reorder
+       panel nets against.
+
+       "Should I raise another order?" is this, and here anything already
+       raised counts - including drafts and requests still in the approval
+       queue. Ignoring them would have the forecast nag for a duplicate of
+       an order that already exists every time anybody opened it. */
+    const pipeline = pipelineOrderQty(data, raw.id);
     const available = onHand + onOrder;
-    if (available >= reorderPoint) return;
+    if (available + pipeline >= reorderPoint) return;
 
     const pkg = (raw.packagings || []).find(p => p.isDefault) || (raw.packagings || [])[0] || null;
-    const shortfall = reorderPoint - available;
+    const shortfall = reorderPoint - available - pipeline;
     const moq = Number(raw.moq) || 0;
     const target = Math.max(shortfall, moq);
     const containerCount = pkg ? containersFromQty(pkg, target) : 0;
@@ -6820,7 +7129,7 @@ function suggestPurchaseOrders(data, options) {
       sku: raw.sku,
       supplier: raw.supplier || "",
       unit: raw.unit || "",
-      onHand, onOrder, available, reorderPoint, shortfall, moq,
+      onHand, onOrder, pipeline, available, reorderPoint, shortfall, moq,
       packagingId: pkg ? pkg.id : "",
       packagingSku: pkg ? pkg.sku : "",
       packagingLabel: packagingLabel(pkg),
@@ -7898,7 +8207,15 @@ function purchaseOrderRecords(data, options) {
       materialVariance: landed.materialVariance,
       // The single number the buyer is judged on: everything the order cost
       // against everything it was supposed to.
-      landedVariance: landed.landedValue - landed.orderedValue
+      landedVariance: landed.landedValue - landed.orderedValue,
+      // Where it sits on the walk. `placed` is the one that matters to the
+      // forecast; `pipeline` is demand with no supplier behind it yet.
+      placed: PO_PLACED_STATUSES.indexOf(status) >= 0,
+      pipeline: PO_PIPELINE_STATUSES.indexOf(status) >= 0,
+      awaitingApproval: status === "Requested",
+      approvedNotPlaced: status === "Approved",
+      requestedBy: po.requestedBy || "", requestedAt: po.requestedAt || "",
+      approvedBy: po.approvedBy || "", approvedAt: po.approvedAt || ""
     };
   })
   // An order carries its materials on its lines, so "orders for this
@@ -10467,6 +10784,9 @@ const OPERATOR_NAV = [
   { key: "schedule", label: "Production schedule", icon: Calendar },
   { key: "scheduleList", label: "Run list", icon: ClipboardList },
   { key: "receiving", label: "Raw material receiving", icon: Package },
+  // Operators know what the line is short of, so they raise the request.
+  // They cannot approve it or place it - that is the point of the workflow.
+  { key: "purchaseOrders", label: "Purchase requests", icon: ShoppingCart },
   // Operators are the ones who ask for material and sign for it, so this is
   // not an admin-only view.
   { key: "materialFlow", label: "Material flow", icon: ArrowLeftRight },
@@ -10475,6 +10795,17 @@ const OPERATOR_NAV = [
   { key: "opfinished", label: "Finished goods", icon: Boxes },
   { key: "opwaste", label: "Waste streams", icon: Recycle },
   { key: "opshipments", label: "Finished goods shipment", icon: Truck }
+];
+
+/* Finance exists to approve spend and place orders, so its nav is the
+   purchasing spine and the two views that explain a request: what the
+   plan needs, and what it costs. Deliberately narrow - a finance user
+   with the whole admin console is just an admin. */
+const FINANCE_NAV = [
+  { key: "purchaseOrders", label: "Purchase orders", icon: ShoppingCart },
+  { key: "forecast", label: "MRP forecast", icon: TrendingUp },
+  { key: "materials", label: "Raw materials", icon: Package },
+  { key: "revenue", label: "Revenue", icon: DollarSign }
 ];
 
 const groupKeyForTab = (tabKey) => {
@@ -10490,7 +10821,8 @@ const navLabelForTab = (tabKey) => {
     const hit = grp.items.find(i => i.key === tabKey);
     if (hit) return hit.label;
   }
-  const op = OPERATOR_NAV.find(i => i.key === tabKey);
+  const op = OPERATOR_NAV.find(i => i.key === tabKey) ||
+             FINANCE_NAV.find(i => i.key === tabKey);
   return op ? op.label : "";
 };
 
@@ -10687,7 +11019,9 @@ export default function App() {
 
   const switchView = (v) => {
     setView(v);
-    setTab(v === "admin" ? "dashboard" : "schedule");
+    // Each role lands where its work is: the plant for an admin, the
+    // approval queue for finance, the schedule for an operator.
+    setTab(v === "admin" ? "dashboard" : v === "finance" ? "purchaseOrders" : "schedule");
     setModal(null);
   };
 
@@ -10765,7 +11099,7 @@ export default function App() {
         </div>
         <div style={{ padding: 12, borderBottom: "1px solid #333A40" }}>
           <div style={{ display: "flex", background: "#161B1F", borderRadius: 8, padding: 3 }}>
-            {["admin", "operator"].map(v => (
+            {["admin", "finance", "operator"].map(v => (
               <div key={v} onClick={() => switchView(v)} style={{
                 flex: 1, textAlign: "center", padding: "6px 0", borderRadius: 6, cursor: "pointer",
                 fontSize: 12, fontWeight: 600, textTransform: "capitalize",
@@ -10790,7 +11124,7 @@ export default function App() {
                   onSelect={setTab}
                 />
               ))
-            : OPERATOR_NAV.map(item => (
+            : (view === "finance" ? FINANCE_NAV : OPERATOR_NAV).map(item => (
                 <NavRow key={item.key} item={item} active={tab === item.key} onClick={setTab} />
               ))}
         </div>
@@ -10859,7 +11193,7 @@ export default function App() {
             onEdit={(id) => setModal({ type: "component", id })}
             onDelete={removeComponent} />
         )}
-        {tab === "materials" && view === "admin" && (
+        {tab === "materials" && view !== "operator" && (
           <RawMaterialsTab data={data} search={search} setSearch={setSearch}
             onAdd={() => setModal({ type: "raw", id: null })}
             onEdit={(id) => setModal({ type: "raw", id })}
@@ -10922,8 +11256,10 @@ export default function App() {
             onOpenOrder={(id) => setModal({ type: "salesOrder", id })}
             onNewOrder={() => setModal({ type: "newSalesOrder" })} />
         )}
-        {tab === "purchaseOrders" && view === "admin" && (
-          <PurchaseOrdersTab data={data}
+        {/* Every role reaches this one; what differs is what they may do
+            on it, which the role prop decides rather than the nav. */}
+        {tab === "purchaseOrders" && (
+          <PurchaseOrdersTab data={data} role={view}
             onOpenOrder={(id) => setModal({ type: "purchaseOrder", id })}
             onNewOrder={() => setModal({ type: "newPurchaseOrder" })} />
         )}
@@ -11081,11 +11417,25 @@ export default function App() {
         // placed opens as a record, from which an amendment is a deliberate
         // second step rather than something you fall into by typing.
         return rec.po.status === "Draft"
-          ? <PurchaseOrderEditor data={data} id={modal.id} onClose={() => setModal(null)} update={update} />
-          : <PurchaseOrderModal record={rec} onClose={() => setModal(null)}
+          ? <PurchaseOrderEditor data={data} id={modal.id} role={view}
+              onClose={() => setModal(null)} update={update} />
+          : <PurchaseOrderModal record={rec} role={view} onClose={() => setModal(null)}
               onAmend={() => setModal({ type: "amendPurchaseOrder", id: modal.id })}
               onCosts={() => setModal({ type: "purchaseCosts", id: modal.id })}
+              onAction={(step) => setModal(step === "place"
+                ? { type: "placePurchaseOrder", id: modal.id }
+                : { type: "poStep", id: modal.id, step })}
               onCancelOrder={() => { update(d => { tx.cancelPurchaseOrder(d, { purchaseOrderId: modal.id }); return d; }); setModal(null); }} />;
+      })()}
+      {modal && modal.type === "poStep" && (() => {
+        const rec = purchaseOrderRecords(data).find(r => r.po.id === modal.id);
+        return rec ? <PoStepModal record={rec} step={modal.step} role={view}
+          onClose={() => setModal({ type: "purchaseOrder", id: modal.id })} update={update} /> : null;
+      })()}
+      {modal && modal.type === "placePurchaseOrder" && (() => {
+        const rec = purchaseOrderRecords(data).find(r => r.po.id === modal.id);
+        return rec ? <PlacePurchaseOrderModal data={data} record={rec} role={view}
+          onClose={() => setModal({ type: "purchaseOrder", id: modal.id })} update={update} /> : null;
       })()}
       {modal && modal.type === "amendPurchaseOrder" && (() => {
         const rec = purchaseOrderRecords(data).find(r => r.po.id === modal.id);
@@ -14563,7 +14913,7 @@ const PO_SEARCH_FIELDS = ["reference", "supplier", "status", "materialName",
   r => r.po.invoiceRef || "",
   r => (r.lines || []).map(l => l.materialName + " " + l.materialSku).join(" ")];
 
-function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder }) {
+function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder, role }) {
   const [statusFilter, setStatusFilter] = useState("");
   const [supplierFilter, setSupplierFilter] = useState("");
   const [materialFilter, setMaterialFilter] = useState("");
@@ -14576,7 +14926,9 @@ function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder }) {
     .sort((a, b) => String(a.name).localeCompare(String(b.name))), [data.rawMaterials]);
 
   const records = useMemo(() => all.filter(r =>
-    (!statusFilter || (statusFilter === "open" ? r.open : r.status === statusFilter)) &&
+    (!statusFilter || (statusFilter === "open" ? r.open
+      : statusFilter === "pipeline" ? r.pipeline
+      : r.status === statusFilter)) &&
     (!supplierFilter || r.supplier === supplierFilter) &&
     (!materialFilter || r.lines.some(l => l.line.rawMaterialId === materialFilter))
   ), [all, statusFilter, supplierFilter, materialFilter]);
@@ -14591,6 +14943,9 @@ function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder }) {
   const open = records.filter(r => r.open);
   const overdue = records.filter(r => r.overdue);
   const drafts = records.filter(r => r.status === "Draft");
+  const awaiting = records.filter(r => r.awaitingApproval);
+  const approvedNotPlaced = records.filter(r => r.approvedNotPlaced);
+  const rights = purchaseRights(role);
   // Committed money is what is still owed on open orders, not the value of
   // every order ever raised - a received order has already been paid for and
   // a cancelled one never will be.
@@ -14608,14 +14963,49 @@ function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder }) {
   });
   const tone = (r) => r.status === "Received" ? "good"
     : r.status === "Cancelled" ? "neutral"
-    : r.status === "Draft" ? "neutral"
+    : r.status === "Requested" ? "warn"
+    : r.status === "Draft" || r.status === "Approved" ? "neutral"
     : r.overdue ? "bad" : "info";
 
   return (
     <div>
       <PageHeader tabKey="purchaseOrders"
-        subtitle="What has been ordered from whom, what is still outstanding, and what arrived late"
-        action={<Btn onClick={onNewOrder}><Plus size={15} />New purchase order</Btn>} />
+        subtitle={rights.approve
+          ? "What has been asked for, what is approved, what is on order, and what arrived late"
+          : "Raise a request for material. Admin or Finance approve it and place it with the supplier."}
+        action={canRequestPurchase(role)
+          ? <Btn onClick={onNewOrder}><Plus size={15} />
+              {rights.approve ? "New purchase order" : "New purchase request"}</Btn>
+          : null} />
+
+      {/* The queue is the thing an approver opens this tab to deal with, so
+          it gets said before the list rather than found inside it. */}
+      {rights.approve && awaiting.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap",
+                      padding: "10px 14px", marginBottom: 14, borderRadius: 8, fontSize: 13,
+                      background: "#FFF9EF", border: "1px solid #E8D5A8" }}>
+          <div><b>{awaiting.length}</b> request(s) waiting for approval</div>
+          <div style={{ color: "#8C6B45" }}>
+            {fmtMoney(awaiting.reduce((s, r) => s + r.value, 0))} of spend to agree
+          </div>
+          <div role="button" tabIndex={0} onClick={() => setStatusFilter("Requested")}
+            onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setStatusFilter("Requested"); } }}
+            style={{ ...seg(statusFilter === "Requested"), marginLeft: "auto" }}>Show them</div>
+        </div>
+      )}
+      {rights.place && approvedNotPlaced.length > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap",
+                      padding: "10px 14px", marginBottom: 14, borderRadius: 8, fontSize: 13,
+                      background: "#F4F6F9", border: "1px solid #DCE1E8" }}>
+          <div><b>{approvedNotPlaced.length}</b> approved order(s) not yet placed</div>
+          <div style={{ color: "#5B6470" }}>
+            Nothing is on its way until they are — an approval is not an order.
+          </div>
+          <div role="button" tabIndex={0} onClick={() => setStatusFilter("Approved")}
+            onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setStatusFilter("Approved"); } }}
+            style={{ ...seg(statusFilter === "Approved"), marginLeft: "auto" }}>Show them</div>
+        </div>
+      )}
 
       <ListToolbar view={view} columns={PO_SORT_COLUMNS} placeholder="Order, supplier, material…">
         <select style={{ ...inputStyle, width: "auto", minWidth: 150 }} value={supplierFilter}
@@ -14631,7 +15021,9 @@ function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder }) {
       </ListToolbar>
 
       <div style={{ display: "flex", gap: 4, marginBottom: 14, flexWrap: "wrap" }}>
-        {[["", "All"], ["open", "Open"], ["Draft", "Draft"], ["Ordered", "Ordered"],
+        {[["", "All"], ["pipeline", "Awaiting order"], ["Draft", "Draft"],
+          ["Requested", "Requested"], ["Approved", "Approved"],
+          ["open", "Open"], ["Ordered", "Ordered"],
           ["Part received", "Part received"], ["Received", "Received"],
           ["Cancelled", "Cancelled"]].map(([k, label]) => (
           <div key={k || "all"} role="button" tabIndex={0} onClick={() => setStatusFilter(k)}
@@ -14652,7 +15044,7 @@ function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder }) {
           ? <div style={{ color: "#A32D2D" }}><b>{overdue.length}</b> past the promised date</div>
           : <div style={{ color: "#2E7D5B" }}>Nothing is past its promised date.</div>}
         {drafts.length > 0 && (
-          <div style={{ color: "#8C6B45" }}><b>{drafts.length}</b> draft(s) never placed</div>
+          <div style={{ color: "#8C6B45" }}><b>{drafts.length}</b> draft(s) not submitted</div>
         )}
         <div style={{ color: "#5B6470" }}>
           {fmtMoney(committed)} still to be delivered
@@ -17202,13 +17594,14 @@ function ScheduleModal({ data, id, onClose, update }) {
    packaging can still be ordered, by quantity, and says so.
 
    Only drafts reach here; anything placed opens read-only instead. */
-function PurchaseOrderEditor({ data, id, onClose, update }) {
+function PurchaseOrderEditor({ data, id, onClose, update, role }) {
   const existing = id ? (data.purchaseOrders || []).find(p => p.id === id) : null;
   const [f, setF] = useState(() => existing ? structuredClone(existing) : {
     reference: nextPoReference(data), supplier: "", orderDate: todayStr(),
     expectedDate: todayStr(), notes: "", lines: []
   });
   const [error, setError] = useState("");
+  const [requestedBy, setRequestedBy] = useState("");
   const set = (k, v) => setF(prev => ({ ...prev, [k]: v }));
 
   const materials = data.rawMaterials || [];
@@ -17258,11 +17651,17 @@ function PurchaseOrderEditor({ data, id, onClose, update }) {
 
   const total = f.lines.reduce((s, l) => s + (Number(l.qty) || 0) * (Number(l.unitCost) || 0), 0);
 
-  const save = (thenPlace) => {
+  /* An order can no longer go straight from this form to the supplier.
+     The most a draft can do here is become a request; approving and
+     placing it are other people's steps, on the record view. */
+  const save = (thenSubmit) => {
     let res;
     update(d => {
       res = tx.savePurchaseOrder(d, { purchaseOrderId: existing ? existing.id : null, ...f });
-      if (res.ok && thenPlace) res = tx.placePurchaseOrder(d, { purchaseOrderId: res.po.id });
+      if (res.ok && thenSubmit) {
+        res = tx.submitPurchaseRequest(d, { purchaseOrderId: res.po.id, role,
+          requestedBy: requestedBy });
+      }
       return d;
     });
     if (res && !res.ok) { setError(res.error); return; }
@@ -17341,7 +17740,11 @@ function PurchaseOrderEditor({ data, id, onClose, update }) {
         );
       })}
 
-      <Field label="Notes"><input style={inputStyle} value={f.notes} onChange={e => set("notes", e.target.value)} placeholder="Terms, contact, anything the dock should know" /></Field>
+      <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 12 }}>
+        <Field label="Notes"><input style={inputStyle} value={f.notes} onChange={e => set("notes", e.target.value)} placeholder="Terms, contact, anything the dock should know" /></Field>
+        <Field label="Requested by"><input style={inputStyle} value={requestedBy}
+          onChange={e => setRequestedBy(e.target.value)} placeholder="Your name" /></Field>
+      </div>
 
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 16, flexWrap: "wrap", gap: 10 }}>
         <div style={{ fontSize: 14 }}>
@@ -17351,18 +17754,210 @@ function PurchaseOrderEditor({ data, id, onClose, update }) {
         <div style={{ display: "flex", gap: 8 }}>
           <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
           <Btn variant="secondary" onClick={() => save(false)}>Save draft</Btn>
-          <Btn onClick={() => save(true)}>Save and place</Btn>
+          {canRequestPurchase(role) && (
+            <Btn onClick={() => save(true)}>Save and submit request</Btn>
+          )}
         </div>
       </div>
       {error && <div style={{ color: "#A32D2D", fontSize: 12.5, marginTop: 8, textAlign: "right" }}>{error}</div>}
       <div style={{ fontSize: 11.5, color: "#8A9099", marginTop: 6, textAlign: "right" }}>
-        Placing an order is what makes it receivable in the warehouse.
+        A request goes to Admin or Finance to approve, and is placed with the supplier after that.
+        Only a placed order is receivable in the warehouse.
       </div>
     </Modal>
   );
 }
 
-function PurchaseOrderModal({ record, onClose, onCancelOrder, onAmend, onCosts }) {
+/* The approval walk drawn as a walk.
+
+   A status badge tells you where an order is; it does not tell you what
+   it had to pass through or what is left. Since the whole point of the
+   new states is that an order MOVES through them, showing the sequence
+   with the current position marked answers both at once. A cancelled
+   order gets a plain statement instead - it left the path. */
+function PoStatusTrail({ record }) {
+  const r = record;
+  if (r.status === "Cancelled") {
+    return (
+      <div style={{ fontSize: 12.5, color: "#8A9099", marginBottom: 14,
+                    padding: "8px 12px", borderRadius: 7, background: "#F4F6F9",
+                    border: "1px solid #DCE1E8" }}>
+        Cancelled — this order left the approval path and nothing further is expected against it.
+      </div>
+    );
+  }
+  const at = PO_STATUS_FLOW.indexOf(r.status);
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 2, flexWrap: "wrap", marginBottom: 14 }}>
+      {PO_STATUS_FLOW.map((step, i) => {
+        const done = at >= 0 && i < at;
+        const here = i === at;
+        return (
+          <React.Fragment key={step}>
+            {i > 0 && <span style={{ color: done || here ? "#1F6F78" : "#D7DAD3", fontSize: 12 }}>→</span>}
+            <span style={{
+              fontSize: 11.5, fontWeight: here ? 700 : 500, padding: "3px 9px", borderRadius: 20,
+              background: here ? "#1F6F78" : done ? "#E4EEEC" : "#F4F6F9",
+              color: here ? "#fff" : done ? "#1F6F78" : "#9AA09A",
+              border: "1px solid " + (here ? "#1F6F78" : done ? "#C9DEDA" : "#E7E9E3")
+            }}>{step}</span>
+          </React.Fragment>
+        );
+      })}
+    </div>
+  );
+}
+
+/* Placing an order is the moment the anticipated delivery date stops
+   being a forecast guess and becomes something the supplier said. So it
+   is asked for here rather than carried over silently.
+
+   The default is today plus the longest lead time on the order - the
+   materials already carry that figure, and a sensible pre-filled date
+   beats an empty box someone will accept unchanged. */
+function PlacePurchaseOrderModal({ data, record, onClose, update, role }) {
+  const r = record;
+  const suggested = useMemo(() => {
+    const lead = (r.po.lines || []).reduce((max, l) => {
+      const raw = getRaw(data, l.rawMaterialId);
+      return Math.max(max, raw ? (Number(raw.leadTimeDays) || 0) : 0);
+    }, 0);
+    return lead > 0 ? shiftISO(todayStr(), lead) : (r.po.expectedDate || todayStr());
+  }, [data, r.po]);
+
+  const [orderDate, setOrderDate] = useState(todayStr());
+  const [expectedDate, setExpectedDate] = useState(r.po.expectedDate || suggested);
+  const [placedBy, setPlacedBy] = useState("");
+  const [error, setError] = useState("");
+
+  const save = () => {
+    let res;
+    update(d => {
+      res = tx.placePurchaseOrder(d, { purchaseOrderId: r.po.id, role,
+        orderDate, expectedDate, placedBy });
+      return d;
+    });
+    if (res && !res.ok) { setError(res.error); return; }
+    onClose();
+  };
+
+  const leadDays = daysBetweenISO(orderDate, expectedDate);
+  return (
+    <Modal title={"Place order " + r.reference} onClose={onClose}>
+      <div style={{ fontSize: 12.5, color: "#5B6470", padding: "9px 12px", marginBottom: 14,
+                    borderRadius: 7, background: "#F1F6F2", border: "1px solid #CFE0D3" }}>
+        This tells the system the order has gone to {r.po.supplier || "the supplier"}. Only from
+        here can the warehouse receive against it, and only from here does the quantity count as
+        being on its way.
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+        <Field label="Order date">
+          <input type="date" style={inputStyle} value={orderDate}
+            onChange={e => setOrderDate(e.target.value)} />
+        </Field>
+        <Field label="Anticipated delivery">
+          <input type="date" style={inputStyle} value={expectedDate}
+            onChange={e => setExpectedDate(e.target.value)} />
+        </Field>
+      </div>
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 12 }}>
+        {expectedDate && orderDate && leadDays !== null && leadDays >= 0
+          ? leadDays + " day(s) out."
+          : "Anticipated delivery is before the order date."}
+        {suggested && expectedDate !== suggested &&
+          <span> Longest lead time on this order suggests {fmtDate(suggested)}.</span>}
+      </div>
+
+      <Field label="Placed by">
+        <input style={inputStyle} value={placedBy} onChange={e => setPlacedBy(e.target.value)}
+          placeholder="Who sent it" />
+      </Field>
+
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+        <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+        <Btn onClick={save}>Mark as ordered</Btn>
+      </div>
+      {error && <div style={{ color: "#A32D2D", fontSize: 12.5, marginTop: 8, textAlign: "right" }}>{error}</div>}
+    </Modal>
+  );
+}
+
+/* Submit, approve, or return — the three steps that only need a name and
+   maybe a reason. One form rather than three near-identical ones; what
+   differs is which transaction it calls and whether the reason is
+   compulsory, and both come from the step itself. */
+function PoStepModal({ record, step, onClose, update, role }) {
+  const r = record;
+  const spec = {
+    submit: { title: "Submit request", verb: "Submit for approval",
+              who: "Requested by", reasonLabel: "Note (optional)", reasonRequired: false,
+              blurb: "This hands the request to Admin or Finance to approve. Nothing goes to a " +
+                     "supplier until it has been approved and then placed." },
+    approve: { title: "Approve request", verb: "Approve",
+               who: "Approved by", reasonLabel: "Note (optional)", reasonRequired: false,
+               blurb: "Approving agrees the spend. It does not place the order — that is a " +
+                      "separate step, and the supplier still knows nothing until it happens." },
+    return: { title: "Return to requester", verb: "Return request",
+              who: "Returned by", reasonLabel: "Reason (required)", reasonRequired: true,
+              blurb: "This sends the request back to draft so it can be changed and resubmitted. " +
+                     "The reason is what tells the requester what to change." }
+  }[step];
+
+  const [who, setWho] = useState("");
+  const [reason, setReason] = useState("");
+  const [error, setError] = useState("");
+
+  const save = () => {
+    let res;
+    update(d => {
+      if (step === "submit") {
+        res = tx.submitPurchaseRequest(d, { purchaseOrderId: r.po.id, role,
+          requestedBy: who, notes: reason });
+      } else if (step === "approve") {
+        res = tx.approvePurchaseOrder(d, { purchaseOrderId: r.po.id, role,
+          approvedBy: who, notes: reason });
+      } else {
+        res = tx.returnPurchaseRequest(d, { purchaseOrderId: r.po.id, role,
+          returnedBy: who, reason });
+      }
+      return d;
+    });
+    if (res && !res.ok) { setError(res.error); return; }
+    onClose();
+  };
+
+  return (
+    <Modal title={spec.title + " — " + r.reference} onClose={onClose}>
+      <div style={{ fontSize: 12.5, color: "#5B6470", padding: "9px 12px", marginBottom: 14,
+                    borderRadius: 7, background: "#F4F6F9", border: "1px solid #DCE1E8" }}>
+        {spec.blurb}
+      </div>
+      <Field label={spec.who}>
+        <input style={inputStyle} value={who} onChange={e => setWho(e.target.value)}
+          placeholder="Name" />
+      </Field>
+      <Field label={spec.reasonLabel}>
+        <input style={inputStyle} value={reason} onChange={e => setReason(e.target.value)}
+          placeholder={spec.reasonRequired ? "What needs to change" : "Anything worth recording"} />
+      </Field>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+                    marginTop: 16, gap: 10 }}>
+        <div style={{ fontSize: 11.5, color: "#8A9099" }}>
+          {fmtMoney(r.value)} · {r.lines.length} line(s)
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+          <Btn onClick={save}
+            style={{ opacity: spec.reasonRequired && !reason.trim() ? 0.5 : 1 }}>{spec.verb}</Btn>
+        </div>
+      </div>
+      {error && <div style={{ color: "#A32D2D", fontSize: 12.5, marginTop: 8, textAlign: "right" }}>{error}</div>}
+    </Modal>
+  );
+}
+
+function PurchaseOrderModal({ record, onClose, onCancelOrder, onAmend, onCosts, onAction, role }) {
   const r = record;
   // Nothing invoiced and no charges means landed == ordered, and a column of
   // repeated numbers is worse than no column.
@@ -17370,7 +17965,11 @@ function PurchaseOrderModal({ record, onClose, onCancelOrder, onAmend, onCosts }
   const money = (n) => fmtMoney(n || 0);
   const tone = r.status === "Received" ? "good"
     : r.status === "Cancelled" ? "neutral"
+    : r.status === "Requested" ? "warn"
+    : r.status === "Draft" || r.status === "Approved" ? "neutral"
     : r.overdue ? "bad" : "info";
+  const actions = poAvailableActions(r.po, role);
+  const waiting = poWaitingOn(r.po, role);
 
   return (
     <Modal title={"Purchase order " + r.reference} onClose={onClose} wide>
@@ -17383,6 +17982,26 @@ function PurchaseOrderModal({ record, onClose, onCancelOrder, onAmend, onCosts }
         {r.overdue && <span style={{ color: "#A32D2D" }}>Past its expected date</span>}
         {r.late && <span style={{ color: "#8C6B45" }}>Delivered {r.daysLate} day(s) late</span>}
       </div>
+
+      {/* The walk, and where this order has got to on it. Shown as the
+          sequence rather than a lone badge, because "Approved" only means
+          something once you can see what comes next. */}
+      <PoStatusTrail record={r} />
+
+      {waiting && (
+        <div style={{ fontSize: 12.5, marginBottom: 14, padding: "8px 12px", borderRadius: 7,
+                      background: r.awaitingApproval ? "#FFF9EF" : "#F4F6F9",
+                      border: "1px solid " + (r.awaitingApproval ? "#E8D5A8" : "#DCE1E8"),
+                      color: "#5B6470" }}>
+          {waiting}
+          {r.requestedBy && <span style={{ color: "#8A9099" }}>
+            {" · requested by " + r.requestedBy}{r.requestedAt ? " on " + fmtDate(r.requestedAt) : ""}
+          </span>}
+          {r.approvedBy && <span style={{ color: "#8A9099" }}>
+            {" · approved by " + r.approvedBy}{r.approvedAt ? " on " + fmtDate(r.approvedAt) : ""}
+          </span>}
+        </div>
+      )}
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14, marginBottom: 16 }}>
         {[["Ordered", fmtDate(r.orderDate)],
@@ -17575,22 +18194,30 @@ function PurchaseOrderModal({ record, onClose, onCancelOrder, onAmend, onCosts }
         </div>
       )}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 16, gap: 10 }}>
-        <div style={{ fontSize: 11.5, color: "#8A9099" }}>
-          The supplier holds this order and stock may already have landed against it, so
-          changing one is a recorded amendment rather than an edit.
+        <div style={{ fontSize: 11.5, color: "#8A9099", maxWidth: 420 }}>
+          {r.placed
+            ? "The supplier holds this order and stock may already have landed against it, so " +
+              "changing one is a recorded amendment rather than an edit."
+            : "Nothing has been sent to a supplier yet. Every step of the approval is recorded " +
+              "against the order."}
         </div>
-        <div style={{ display: "flex", gap: 8 }}>
-          {/* Unlike amendment, this stays open on a fully received order -
-              the invoice almost always turns up after the goods do. */}
-          {onCosts && r.status !== "Cancelled" && (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+          {/* Costs and amendment only apply once an order is real; before
+              that the order itself is still editable. */}
+          {onCosts && r.placed && (
             <Btn variant="secondary" onClick={onCosts}><DollarSign size={14} />Costs and invoice</Btn>
           )}
-          {onAmend && r.status !== "Cancelled" && r.status !== "Received" && (
+          {onAmend && r.placed && r.status !== "Received" && (
             <Btn variant="secondary" onClick={onAmend}><Pencil size={14} />Amend order</Btn>
           )}
-          {onCancelOrder && r.status !== "Cancelled" && r.status !== "Received" && (
-            <Btn variant="secondary" onClick={onCancelOrder}>Cancel order</Btn>
-          )}
+          {/* One source for what may happen next, so the buttons cannot
+              disagree with the transactions that back them. */}
+          {actions.map(a => (
+            a.key === "cancel"
+              ? (onCancelOrder && <Btn key={a.key} variant="secondary" onClick={onCancelOrder}>{a.label}</Btn>)
+              : (onAction && <Btn key={a.key} variant={a.primary ? undefined : "secondary"}
+                   onClick={() => onAction(a.key)}>{a.label}</Btn>)
+          ))}
           <Btn variant="secondary" onClick={onClose}>Close</Btn>
         </div>
       </div>
@@ -18367,9 +18994,12 @@ function ReorderPanel({ data, update, onOpenOrder }) {
   };
 
   const drafts = (data.purchaseOrders || []).filter(po => po.status === "Draft");
-  const placeAll = () => update(d => {
+  /* Used to place every draft straight with the supplier. It now submits
+     them for approval instead - the whole point of the walk is that
+     nothing skips it, least of all a bulk action. */
+  const submitAll = () => update(d => {
     (d.purchaseOrders || []).filter(po => po.status === "Draft")
-      .forEach(po => tx.placePurchaseOrder(d, { purchaseOrderId: po.id }));
+      .forEach(po => tx.submitPurchaseRequest(d, { purchaseOrderId: po.id, role: "admin" }));
     return d;
   });
 
@@ -18378,8 +19008,8 @@ function ReorderPanel({ data, update, onOpenOrder }) {
       {raised.length > 0 && (
         <div style={{ padding: "9px 12px", marginBottom: 12, borderRadius: 7, fontSize: 13,
                       background: "#F1F6F2", border: "1px solid #CFE0D3" }}>
-          Raised as draft: <b>{raised.join(", ")}</b>. Review and place them below to make them
-          receivable in the warehouse.
+          Raised as draft: <b>{raised.join(", ")}</b>. Submit them for approval below; they become
+          receivable in the warehouse once approved and placed with the supplier.
         </div>
       )}
 
@@ -18387,11 +19017,11 @@ function ReorderPanel({ data, update, onOpenOrder }) {
         <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap",
                       padding: "10px 14px", marginBottom: 14, borderRadius: 8, fontSize: 13,
                       background: "#FFF9EF", border: "1px solid #E8D5A8" }}>
-          <div><b>{drafts.length}</b> draft order(s) not yet placed</div>
+          <div><b>{drafts.length}</b> draft order(s) not yet submitted</div>
           <div style={{ color: "#8C6B45" }}>
-            A draft cannot be received against until it is placed with the supplier.
+            A draft is not on order — it counts for nothing until it is approved and placed.
           </div>
-          <Btn onClick={placeAll}>Place all drafts</Btn>
+          <Btn onClick={submitAll}>Submit all for approval</Btn>
         </div>
       )}
 
@@ -18557,10 +19187,16 @@ function ForecastTab({ data, horizon, setHorizon, onOpenOrder, onNewOrder, updat
       // On-order comes from the orders themselves now, so it carries dates and
       // cannot drift from reality the way a hand-kept figure does.
       const onOrder = openOrderQty(data, raw.id);
+      /* Deliberately NOT netted off. A request sitting in an approval queue
+         is not cover - nothing is coming until somebody places it - so the
+         shortage stays a shortage and the pipeline is reported next to it.
+         Netting it off is how a plant discovers on the day that the order
+         it was relying on was never sent. */
+      const pipeline = pipelineBreakdown(data, raw.id);
       const net = rec.qty - stock - onOrder;
       const orders = purchaseOrderRecords(data, { rawMaterialId: raw.id }).filter(o => o.open);
       const nextArrival = orders.map(o => o.expectedDate).filter(Boolean).sort()[0] || "";
-      return { raw, stock, onOrder, gross: rec.qty, net,
+      return { raw, stock, onOrder, pipeline, gross: rec.qty, net,
                earliestOrderBy: rec.earliestOrderBy, uses: rec.uses,
                openOrders: orders, nextArrival,
                // An arrival promised after the material is needed is the
@@ -18715,7 +19351,8 @@ function ForecastTab({ data, horizon, setHorizon, onOpenOrder, onNewOrder, updat
         <table className="mrp-table">
           <thead>
             <tr>
-              <th>Raw material</th><th>Gross requirement</th><th>On hand</th><th>On order</th><th>Next arrival</th><th>Net to purchase</th><th>Order by</th><th>Status</th>
+              <th>Raw material</th><th>Gross requirement</th><th>On hand</th><th>On order</th>
+              <th>Awaiting order</th><th>Next arrival</th><th>Net to purchase</th><th>Order by</th><th>Status</th>
             </tr>
           </thead>
           <tbody>
@@ -18735,6 +19372,19 @@ function ForecastTab({ data, horizon, setHorizon, onOpenOrder, onNewOrder, updat
                     {r.openOrders.length > 0 && (
                       <div style={{ fontSize: 10.5, color: "#8A9099" }}>
                         {r.openOrders.length} order(s)
+                      </div>
+                    )}
+                  </td>
+                  {/* Raised but not placed. Reported, never netted off the
+                      shortage — an approval queue delivers nothing. */}
+                  <td className="mono" style={{ color: r.pipeline.total > 0 ? "#8C6B45" : "#9AA09A" }}>
+                    {r.pipeline.total > 0 ? fmtNum(r.pipeline.total) : "—"}
+                    {r.pipeline.total > 0 && (
+                      <div style={{ fontSize: 10.5, color: "#8A9099" }}>
+                        {[r.pipeline.Draft > 0 && "draft " + fmtNum(r.pipeline.Draft),
+                          r.pipeline.Requested > 0 && "requested " + fmtNum(r.pipeline.Requested),
+                          r.pipeline.Approved > 0 && "approved " + fmtNum(r.pipeline.Approved)]
+                          .filter(Boolean).join(" · ")}
                       </div>
                     )}
                   </td>

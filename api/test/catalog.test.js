@@ -160,6 +160,24 @@ eq(orders.map(o => o.reference), ['PO-4', 'PO-1'], 'only placed orders that stil
 ok(!orders.some(o => o.status === 'Draft'), 'a draft has been sent to nobody and is not receivable');
 ok(!orders.some(o => o.status === 'Cancelled'), 'a cancelled order does not accept stock');
 
+/* The MRP now walks an order Draft -> Requested -> Approved -> Ordered, and
+   the dock must never see one before the last step. This is an allow-list, so
+   a new pre-order state is excluded by construction rather than by someone
+   remembering to add it to a deny-list - which is the whole reason it is
+   written that way. Asserted at the boundary because this is the file the
+   warehouse actually reads. */
+['Requested', 'Approved'].forEach((status) => {
+  const pending = C.deriveReceivableOrders({
+    purchaseOrders: [{ id: 'p', reference: 'PO-PENDING', status,
+      expectedDate: '2026-09-01', receipts: [],
+      lines: [{ id: 'l', rawMaterialId: 'rm', qty: 100 }] }],
+  });
+  eq(pending, [], 'an order still ' + status.toLowerCase() + ' never reaches the dock');
+});
+ok(C.RECEIVABLE_STATUSES.indexOf('Requested') === -1 &&
+   C.RECEIVABLE_STATUSES.indexOf('Approved') === -1,
+   'approval states are not receivable — an approval is not an order');
+
 const po1 = orders.find(o => o.reference === 'PO-1');
 eq(po1.lines.length, 2, 'both container sizes come through as separate lines');
 eq(po1.lines[0].sku, 'GC-1-60KG', 'a line names the container it was bought in');

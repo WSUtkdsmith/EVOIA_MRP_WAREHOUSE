@@ -44,6 +44,7 @@ through the phase notes below and easy to lose.
 | # | Item | Needs |
 |---|---|---|
 | B | **The nightly valuation snapshot fires at 23:59 UTC.** `vercel.json` sets `59 23 * * *`, and Vercel crons only run on UTC. | The plant's timezone. "11:59 pm local" is a different instant, and for anywhere west of UTC a different *date* — which shifts a day's movement into the wrong bucket rather than losing it, but is still wrong. Tell me the timezone and I will set the cron offset. Also worth deciding: Vercel's Hobby plan runs crons **once a day at an approximate time**, so if the exact minute matters the project needs to be on Pro. |
+| D | **Self-approval is possible, and cannot be closed without login.** The purchasing workflow enforces *which role* may approve and place, but not *which person* — so an admin can approve a request they raised themselves, and anyone can switch to the Admin view. | Nothing to decide now; this is the first concrete rule waiting on the deferred security work. When authentication lands, the requester's identity needs storing on submit (rather than a typed name) and the approve step needs a "not the requester" check. Worth telling the incoming developer this rule is already written down and only needs an identity to attach to. |
 | C | **Should landed cost flow into inventory valuation and COGS?** Built and reported, but deliberately not wired into stock costing: a received lot keeps the price it was booked in at, so a late invoice or a freight bill cannot restate a margin already earned. That is the safe default, and it means reported inventory is understated by whatever freight and duty it took to get the material here. | Whether the plant wants **landed** or **invoice-price** inventory valuation. Wiring it in is not hard, but it changes every historic COGS figure in the system and needs a rule for lots received *before* the invoice arrives — re-cost them retroactively (moves history) or apply landed cost only from the invoice date forward (two costing bases coexist). Both are defensible; only one can be the plant's. |
 | A | **"Semi-finished goods" as a fifth material category.** Not built — see `docs/SEMI-FINISHED-GOODS.md`. The capability already exists (bulk = an intermediate product; packing = a process), so the fifth `itemType` would buy a label at the cost of widening the polymorphic surface everywhere. A `stage` flag on intermediate products is the cheap version, under an hour. | Five questions in that doc — chiefly whether a semi-finished good can be **sold as-is**, and whether anything needs to **report on it separately**. Either would justify the type; a labelling preference would not. |
 
@@ -162,6 +163,42 @@ through the phase notes below and easy to lose.
 - **A fully received order is closed to amendment.** Adding to one is a new
   order, not a revision of a finished one — a supplier who has already shipped
   in full is not holding anything to revise.
+- **A purchase order walks Draft → Requested → Approved → Ordered.** Every
+  state before Ordered is **sticky** in `poDerivedStatus`. That guard is the
+  load-bearing part: the function infers Ordered/Part received/Received from
+  the receipts, and a Requested order has none — so without it, an order still
+  in the approval queue would read as Ordered and the warehouse could receive
+  against something nobody ever sent.
+- **An approval is not an order, and neither is on order.** `openOrderQty`
+  counts **placed** orders only (`PO_PLACED_STATUSES`). Drafts used to count,
+  which was already wrong; with two more pre-placed states it would have been
+  three ways for the forecast to stand down on a shortage nothing was coming to
+  fill. The raised-but-unplaced quantity is reported beside it via
+  `pipelineOrderQty` / `pipelineBreakdown`, never netted off the shortage.
+- **`suggestPurchaseOrders` deliberately answers a DIFFERENT question.** "Will
+  I run out?" nets against placed orders only. "Should I raise another order?"
+  nets against placed **plus** pipeline, so the forecast does not nag for a
+  duplicate of an order that already exists. Two questions, two answers, both
+  honest — do not unify them.
+- **Role rules live in the transaction, not the button.** `PURCHASE_ROLES` is
+  the single table; `poAvailableActions` is the single answer to "what can this
+  person do next", used by the UI *and* the tests. Every transaction re-checks.
+  Hiding a button is not a rule — a screen reached from an unexpected direction
+  would otherwise bypass it. Unknown or missing role ⇒ **no rights** (fails
+  closed).
+- **This is separation of duties, not access control.** There is still no
+  login; the view switcher says so on its face. An operator can click Admin.
+  What the workflow buys is that the rules are written down and enforced in one
+  place, so authentication has something correct to attach to when it arrives.
+  Flag D covers the gap that remains.
+- **Historic orders are NOT dragged back through the workflow.**
+  `normalizePurchaseOrders` leaves an existing `Ordered` where it is. Rewriting
+  it as Draft to force it through a path that did not exist when it was raised
+  would invent an approval nobody gave.
+- **The warehouse boundary is an allow-list.** `api/_catalog.js`
+  `RECEIVABLE_STATUSES = ['Ordered', 'Part received']` — a new pre-order state
+  is excluded by construction rather than by remembering to add it to a
+  deny-list. Keep it that way.
 - **An invoiced cost NEVER overwrites an ordered one.** `line.unitCost` is the
   price agreed and does not move; `line.actualUnitCost` is what the supplier
   billed and sits beside it. Collapsing the two would destroy the variance the
@@ -602,6 +639,17 @@ Full spec: **`docs/PHASE5-MATERIAL-FLOW.md`**. Decisions taken:
 - The warehouse already models `rolePermissions` and `users` client-side; that is
   a starting point but is **not** a security boundary on its own (client-side
   checks are bypassable). Real enforcement belongs at the API layer.
+- **The MRP now has its first written-down authorisation rule**, in
+  `PURCHASE_ROLES` (`mrp/mrp-console.jsx`): an operator may raise a purchase
+  request; only Admin and Finance may approve one or mark it as ordered. It is
+  enforced in the transactions (`submitPurchaseRequest`, `approvePurchaseOrder`,
+  `returnPurchaseRequest`, `placePurchaseOrder`) rather than only in the UI, and
+  it fails closed on an unknown role. **It is still not a security boundary** —
+  the role comes from a view switcher anyone can toggle. What it gives the
+  incoming developer is a correct rule that needs an authenticated identity
+  attached to it, not a rule to design from scratch. Two specific things to do
+  when identity exists: store the requester from the session rather than a typed
+  name, and add a "the approver is not the requester" check (flag D).
 
 ## Open questions for the product owner
 

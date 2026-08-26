@@ -611,7 +611,7 @@ console.log('\n--- MRP forecast: calendar, history and order records ---');
 
   const rec = A.purchaseOrderRecords(DF)[0];
   const m = tryRender('pom', React.createElement(A.PurchaseOrderModal, {
-    record: rec, onClose: noop }));
+    record: rec, role: 'admin', onClose: noop }));
   ok('purchase order dialog renders', !m.err, m.err);
   const mh = (m.html || '').replace(/<!-- -->/g, '');
   ok('it shows order, expected and actual dates',
@@ -824,7 +824,7 @@ console.log('\n--- purchase orders have a home of their own ---');
 {
   const DP = A.seedData();
   const t = tryRender('po', React.createElement(A.PurchaseOrdersTab, {
-    data: DP, onOpenOrder: noop, onNewOrder: noop }));
+    data: DP, role: 'admin', onOpenOrder: noop, onNewOrder: noop }));
   ok('purchase order sheet renders', !t.err, t.err);
   const h = (t.html || '').replace(/<!-- -->/g, '');
   ok('there is a way to raise one from here', /New purchase order/.test(h));
@@ -847,7 +847,7 @@ console.log('\n--- purchase orders have a home of their own ---');
 
   const empty2 = Object.fromEntries(Object.keys(DP).map(k => [k, []]));
   const e = tryRender('po0', React.createElement(A.PurchaseOrdersTab, {
-    data: empty2, onOpenOrder: noop, onNewOrder: noop }));
+    data: empty2, role: 'admin', onOpenOrder: noop, onNewOrder: noop }));
   ok('an empty database renders it', !e.err, e.err);
   ok('and says nothing matches rather than drawing a blank table',
      /No purchase orders match/.test((e.html || '').replace(/<!-- -->/g, '')));
@@ -879,12 +879,12 @@ console.log('\n--- amending a placed order ---');
   // The record view is where the amendment is reached from, and where the
   // trail it leaves has to be readable afterwards.
   const rv = tryRender('pom2', React.createElement(A.PurchaseOrderModal, {
-    record: openRec, onClose: noop, onAmend: noop }));
+    record: openRec, role: 'admin', onClose: noop, onAmend: noop }));
   ok('the record offers the amendment', /Amend order/.test((rv.html || '').replace(/<!-- -->/g, '')));
   ok('a fully received order does not', (() => {
     const done = A.purchaseOrderRecords(DP).find(r => r.status === 'Received');
     const r = tryRender('pom3', React.createElement(A.PurchaseOrderModal, {
-      record: done, onClose: noop, onAmend: noop }));
+      record: done, role: 'admin', onClose: noop, onAmend: noop }));
     return !/Amend order/.test((r.html || '').replace(/<!-- -->/g, ''));
   })());
 
@@ -895,7 +895,7 @@ console.log('\n--- amending a placed order ---');
     author: 'Buyer', date: '2026-02-02', lines: (target.lines || []).map(l => ({ ...l })) });
   const withTrail = A.purchaseOrderRecords(amended).find(x => x.po.id === target.id);
   const tr = tryRender('pom4', React.createElement(A.PurchaseOrderModal, {
-    record: withTrail, onClose: noop, onAmend: noop }));
+    record: withTrail, role: 'admin', onClose: noop, onAmend: noop }));
   ok('the record shows the amendment history', !tr.err, tr.err);
   const th = (tr.html || '').replace(/<!-- -->/g, '');
   ok('with the reason, not just the fact', /Supplier moved the ship date/.test(th));
@@ -950,7 +950,7 @@ console.log('\n--- invoice costs and landed cost ---');
      /Evenly per unit/.test(m2h) && /In proportion to line value/.test(m2h));
 
   const rv = tryRender('pom5', React.createElement(A.PurchaseOrderModal, {
-    record: rec, onClose: noop, onCosts: noop }));
+    record: rec, role: 'admin', onClose: noop, onCosts: noop }));
   ok('the record renders with costs on it', !rv.err, rv.err);
   const rh = (rv.html || '').replace(/<!-- -->/g, '');
   ok('there is a way in to the costs form', /Costs and invoice/.test(rh));
@@ -966,7 +966,7 @@ console.log('\n--- invoice costs and landed cost ---');
   const plainRec = A.purchaseOrderRecords(A.seedData())
     .find(r => !r.hasInvoice && r.landed.chargeTotal === 0);
   const pv = tryRender('pom6', React.createElement(A.PurchaseOrderModal, {
-    record: plainRec, onClose: noop, onCosts: noop }));
+    record: plainRec, role: 'admin', onClose: noop, onCosts: noop }));
   const ph2 = (pv.html || '').replace(/<!-- -->/g, '');
   ok('an order with no costs recorded shows no landed panel', !/Landed cost/.test(ph2));
   ok('and no landed column', !/Landed \/ unit/.test(ph2));
@@ -976,13 +976,13 @@ console.log('\n--- invoice costs and landed cost ---');
   const cancelled = A.purchaseOrderRecords(DC).find(r => r.status === 'Cancelled');
   if (cancelled) {
     const cv = tryRender('pom7', React.createElement(A.PurchaseOrderModal, {
-      record: cancelled, onClose: noop, onCosts: noop }));
+      record: cancelled, role: 'admin', onClose: noop, onCosts: noop }));
     ok('a cancelled order is not offered the costs form',
        !/Costs and invoice/.test((cv.html || '').replace(/<!-- -->/g, '')));
   } else { ok('a cancelled order is not offered the costs form', true); }
 
   const tab = tryRender('po2', React.createElement(A.PurchaseOrdersTab, {
-    data: DC, onOpenOrder: noop, onNewOrder: noop }));
+    data: DC, role: 'admin', onOpenOrder: noop, onNewOrder: noop }));
   ok('the tab renders with a costed order in it', !tab.err, tab.err);
   const th2 = (tab.html || '').replace(/<!-- -->/g, '');
   ok('it carries a landed column', /Landed/.test(th2));
@@ -1027,6 +1027,120 @@ console.log('\n--- a mixed-unit order refuses the per-unit split ---');
 }
 
 
+console.log('\n--- the approval walk on screen ---');
+{
+  const DW = A.seedData();
+  const draft = (DW.purchaseOrders || []).find(p => p.status === 'Draft') ||
+    A.tx.savePurchaseOrder(DW, { supplier: 'Acme',
+      lines: [{ rawMaterialId: DW.rawMaterials[0].id, qty: 100, unitCost: 4 }] }).po;
+  A.tx.submitPurchaseRequest(DW, { purchaseOrderId: draft.id, role: 'operator',
+    requestedBy: 'Dana', date: '2026-01-05' });
+  const reqRec = A.purchaseOrderRecords(DW).find(r => r.po.id === draft.id);
+  ok('the order is a request', reqRec.status === 'Requested');
+
+  // An approver sees what to do about it.
+  const asAdmin = tryRender('powf1', React.createElement(A.PurchaseOrderModal, {
+    record: reqRec, role: 'admin', onClose: noop, onAction: noop, onCancelOrder: noop }));
+  ok('the record renders for an approver', !asAdmin.err, asAdmin.err);
+  const ah = (asAdmin.html || '').replace(/<!-- -->/g, '');
+  ok('the walk is drawn, not just the current badge',
+     ['Draft', 'Requested', 'Approved', 'Ordered'].every(s => ah.includes(s)));
+  ok('it says what the order is waiting for', /Waiting for your approval/.test(ah));
+  ok('it names who asked', /Dana/.test(ah));
+  ok('approve is offered', /Approve</.test(ah));
+  ok('and so is sending it back', /Return to requester/.test(ah));
+  ok('but not the order step — it is not approved yet', !/Mark as ordered/.test(ah));
+
+  // The operator who raised it sees the state, and no way to wave it through.
+  const asOp = tryRender('powf2', React.createElement(A.PurchaseOrderModal, {
+    record: reqRec, role: 'operator', onClose: noop, onAction: noop, onCancelOrder: noop }));
+  ok('the record renders for the requester', !asOp.err, asOp.err);
+  const oh = (asOp.html || '').replace(/<!-- -->/g, '');
+  ok('they are told who it is with', /Waiting for Admin or Finance/.test(oh));
+  ok('THE OPERATOR IS OFFERED NO APPROVE BUTTON', !/>Approve</.test(oh));
+  ok('nor a way to mark it ordered', !/Mark as ordered/.test(oh));
+  ok('nor to return their own request', !/Return to requester/.test(oh));
+
+  // Approved, not yet ordered.
+  A.tx.approvePurchaseOrder(DW, { purchaseOrderId: draft.id, role: 'finance',
+    approvedBy: 'Fin', date: '2026-01-06' });
+  const appRec = A.purchaseOrderRecords(DW).find(r => r.po.id === draft.id);
+  const asFin = tryRender('powf3', React.createElement(A.PurchaseOrderModal, {
+    record: appRec, role: 'finance', onClose: noop, onAction: noop, onCancelOrder: noop }));
+  const fh = (asFin.html || '').replace(/<!-- -->/g, '');
+  ok('an approved order offers the order step', /Mark as ordered/.test(fh));
+  ok('and says an approval is not an order yet',
+     /waiting for you to place it with the supplier/.test(fh));
+  ok('approve is no longer offered', !/>Approve</.test(fh));
+  ok('it names who approved it', /Fin/.test(fh));
+
+  // The place-order form, where the anticipated delivery date is set.
+  const pm = tryRender('powf4', React.createElement(A.PlacePurchaseOrderModal, {
+    data: DW, record: appRec, role: 'finance', onClose: noop, update: noop }));
+  ok('the place-order form renders', !pm.err, pm.err);
+  const ph = (pm.html || '').replace(/<!-- -->/g, '');
+  ok('IT ASKS FOR THE ANTICIPATED DELIVERY DATE', /Anticipated delivery/.test(ph));
+  ok('and the order date', /Order date/.test(ph));
+  ok('both are date fields', ((pm.html || '').match(/type="date"/g) || []).length >= 2);
+  ok('it records who placed it', /Placed by/.test(ph));
+  ok('and says this is what makes it receivable', /receive against it/.test(ph));
+
+  // The three no-frills steps share one form.
+  ['submit', 'approve', 'return'].forEach(step => {
+    const sm = tryRender('powf5' + step, React.createElement(A.PoStepModal, {
+      record: appRec, step, role: 'admin', onClose: noop, update: noop }));
+    ok('the ' + step + ' form renders', !sm.err, sm.err);
+  });
+  const ret = tryRender('powf6', React.createElement(A.PoStepModal, {
+    record: reqRec, step: 'return', role: 'admin', onClose: noop, update: noop }));
+  ok('returning demands a reason',
+     /Reason \(required\)/.test((ret.html || '').replace(/<!-- -->/g, '')));
+  const app = tryRender('powf7', React.createElement(A.PoStepModal, {
+    record: reqRec, step: 'approve', role: 'admin', onClose: noop, update: noop }));
+  ok('approving says it does not place the order',
+     /does not place the order/.test((app.html || '').replace(/<!-- -->/g, '')));
+}
+
+
+console.log('\n--- the tab reads differently for each role ---');
+{
+  const DR = A.seedData();
+  const draft = A.tx.savePurchaseOrder(DR, { supplier: 'Acme',
+    lines: [{ rawMaterialId: DR.rawMaterials[0].id, qty: 100, unitCost: 4 }] }).po;
+  A.tx.submitPurchaseRequest(DR, { purchaseOrderId: draft.id, role: 'operator', requestedBy: 'Dana' });
+
+  const adm = tryRender('por1', React.createElement(A.PurchaseOrdersTab, {
+    data: DR, role: 'admin', onOpenOrder: noop, onNewOrder: noop }));
+  ok('the tab renders for an admin', !adm.err, adm.err);
+  const ah = (adm.html || '').replace(/<!-- -->/g, '');
+  ok('the approval queue is called out first', /waiting for approval/.test(ah));
+  ok('the new statuses are filterable',
+     ah.includes('>Requested<') && ah.includes('>Approved<'));
+  ok('and there is a filter for everything not yet ordered', /Awaiting order/.test(ah));
+
+  const op = tryRender('por2', React.createElement(A.PurchaseOrdersTab, {
+    data: DR, role: 'operator', onOpenOrder: noop, onNewOrder: noop }));
+  ok('the tab renders for an operator', !op.err, op.err);
+  const oh = (op.html || '').replace(/<!-- -->/g, '');
+  ok('an operator can raise a request', /New purchase request/.test(oh));
+  ok('and is told what happens next', /Admin or Finance approve it/.test(oh));
+  ok('THE APPROVAL QUEUE IS NOT SHOWN TO THEM', !/waiting for approval/.test(oh));
+
+  const fin = tryRender('por3', React.createElement(A.PurchaseOrdersTab, {
+    data: DR, role: 'finance', onOpenOrder: noop, onNewOrder: noop }));
+  ok('the tab renders for finance', !fin.err, fin.err);
+  ok('finance sees the queue too',
+     /waiting for approval/.test((fin.html || '').replace(/<!-- -->/g, '')));
+
+  // Fail closed: an unknown role gets a read-only list, not a New button.
+  const none = tryRender('por4', React.createElement(A.PurchaseOrdersTab, {
+    data: DR, role: 'visitor', onOpenOrder: noop, onNewOrder: noop }));
+  ok('an unknown role still renders the list', !none.err, none.err);
+  ok('BUT IS OFFERED NO WAY TO RAISE ANYTHING — this fails closed',
+     !/New purchase/.test((none.html || '').replace(/<!-- -->/g, '')));
+}
+
+
 console.log('\n--- and the tab is actually reachable ---');
 {
   /* Rendering the component proves it works, not that anyone can get to it -
@@ -1062,6 +1176,35 @@ console.log('\n--- and the tab is actually reachable ---');
      which is precisely the bug the shared reckoning exists to prevent. */
   ok('and previews with the same function that stores it',
      /function PurchaseCostsModal[\s\S]{0,4000}return landedCost\(data, draft\)/.test(SRC));
+
+  /* The workflow is only real if every role can reach the tab and the
+     role actually travels to the component - a tab gated on view ===
+     "admin" would leave operators with no way to raise anything. */
+  ok('every role reaches the purchase orders tab, not just admin',
+     /\{tab === "purchaseOrders" && \(/.test(SRC));
+  ok('and the acting role is passed to it', /<PurchaseOrdersTab data=\{data\} role=\{view\}/.test(SRC));
+  ok('operators have it in their nav',
+     /const OPERATOR_NAV[\s\S]{0,1200}key: "purchaseOrders"/.test(SRC));
+  ok('finance has a nav of its own', /const FINANCE_NAV/.test(SRC));
+  ok('and finance is a role you can actually switch to',
+     /\["admin", "finance", "operator"\]/.test(SRC));
+  ok('finance lands on the approval queue',
+     /v === "finance" \? "purchaseOrders"/.test(SRC));
+  ok('the record view is given the role too',
+     /<PurchaseOrderModal record=\{rec\} role=\{view\}/.test(SRC));
+  ok('the step and place modals are dispatched',
+     SRC.includes('modal.type === "poStep"') &&
+     SRC.includes('modal.type === "placePurchaseOrder"'));
+  ok('and both go through their transactions',
+     /PoStepModal[\s\S]{0,3000}tx\.submitPurchaseRequest[\s\S]{0,600}tx\.approvePurchaseOrder[\s\S]{0,600}tx\.returnPurchaseRequest/.test(SRC) &&
+     /PlacePurchaseOrderModal[\s\S]{0,3000}tx\.placePurchaseOrder/.test(SRC));
+  /* The bulk action on the forecast used to place every draft outright.
+     A workflow a bulk button can skip is not a workflow. */
+  ok('the forecast bulk action submits rather than places',
+     SRC.includes('tx.submitPurchaseRequest(d, { purchaseOrderId: po.id, role: "admin" })') &&
+     !/placeAll/.test(SRC));
+  ok('and the editor can no longer place an order straight from the form',
+     !/Save and place/.test(SRC) && /Save and submit request/.test(SRC));
 }
 
 

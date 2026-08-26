@@ -6,7 +6,8 @@ import { bucketKeyOf, shipmentLines, lotCost, computeItemUnitCost,
          bucketEvents, exportCsvBundle, importCsvBundle, allTables, csvColumns,
          poOrderedQty, IMPORT_ORDER, normalizeData,
          landedCost, hasActualCost, poChargeTotal, poLineEffectiveUnitCost,
-         PO_CHARGE_KINDS } from '/tmp/core.mjs';
+         PO_CHARGE_KINDS, canRequestPurchase, canApprovePurchase, canPlacePurchase,
+         poAvailableActions, poIsPlaced, pipelineOrderQty, pipelineBreakdown } from '/tmp/core.mjs';
 
 let pass = 0, fail = 0;
 const ok = (n, c, x) => { if (c) { pass++; console.log('  PASS  ' + n); }
@@ -308,6 +309,217 @@ console.log('\n--- a placed order can grow, and the growth is on the record ---'
   ok('the order is still part received', poDerivedStatus(p) === 'Part received');
 }
 
+console.log('\n--- an order walks Draft to Ordered, one step at a time ---');
+{
+  const d = plant(); const o = po(d, { status: 'Draft' });
+  ok('it starts as a draft', poDerivedStatus(o) === 'Draft');
+  ok('a draft is not receivable', !tx.receivablePurchaseOrders(d).some(p => p.id === o.id));
+
+  const skip = tx.placePurchaseOrder(d, { purchaseOrderId:'PO1', role:'admin' });
+  ok('a draft CANNOT skip straight to ordered',
+     skip.ok === false && /not been submitted or approved/.test(skip.error), skip.error);
+
+  const early = tx.approvePurchaseOrder(d, { purchaseOrderId:'PO1', role:'admin' });
+  ok('nor can it be approved before it is submitted',
+     early.ok === false && /not been submitted/.test(early.error), early.error);
+
+  const s = tx.submitPurchaseRequest(d, { purchaseOrderId:'PO1', role:'operator',
+    requestedBy:'Dana', date:'2026-01-05' });
+  ok('submitting works', s.ok === true, s.error);
+  ok('the status moves to Requested', poDerivedStatus(o) === 'Requested');
+  ok('and records who asked and when', o.requestedBy === 'Dana' && o.requestedAt === '2026-01-05');
+  ok('a request is still not receivable', !tx.receivablePurchaseOrders(d).some(p => p.id === o.id));
+
+  const placeEarly = tx.placePurchaseOrder(d, { purchaseOrderId:'PO1', role:'admin' });
+  ok('an unapproved request cannot be placed',
+     placeEarly.ok === false && /still awaiting approval/.test(placeEarly.error), placeEarly.error);
+
+  const a = tx.approvePurchaseOrder(d, { purchaseOrderId:'PO1', role:'admin',
+    approvedBy:'Sam', date:'2026-01-06' });
+  ok('approving works', a.ok === true, a.error);
+  ok('the status moves to Approved', poDerivedStatus(o) === 'Approved');
+  ok('and records who approved it', o.approvedBy === 'Sam' && o.approvedAt === '2026-01-06');
+  ok('APPROVED IS NOT ORDERED — still not receivable',
+     !tx.receivablePurchaseOrders(d).some(p => p.id === o.id));
+
+  const p = tx.placePurchaseOrder(d, { purchaseOrderId:'PO1', role:'admin',
+    orderDate:'2026-01-07', expectedDate:'2026-02-20', placedBy:'Sam' });
+  ok('placing works', p.ok === true, p.error);
+  ok('the status moves to Ordered', poDerivedStatus(o) === 'Ordered');
+  ok('the order date is the day it was placed', o.orderDate === '2026-01-07');
+  ok('AND THE ANTICIPATED DELIVERY DATE IS RECORDED', o.expectedDate === '2026-02-20');
+  ok('only now is it receivable', tx.receivablePurchaseOrders(d).some(p2 => p2.id === o.id));
+
+  ok('the whole walk is on the record', (() => {
+    const steps = (o.revisions || []).filter(r => r.field === 'status')
+      .map(r => r.fromValue + '>' + r.toValue);
+    return steps.join(' ') === 'Draft>Requested Requested>Approved Approved>Ordered';
+  })(), JSON.stringify((o.revisions || []).map(r => r.field + ':' + r.fromValue + '>' + r.toValue)));
+  ok('with the names attached', (() => {
+    const byTo = {};
+    (o.revisions || []).forEach(r => { if (r.field === 'status') byTo[r.toValue] = r.author; });
+    return byTo.Requested === 'Dana' && byTo.Approved === 'Sam';
+  })());
+  ok('and the agreed delivery date is its own line',
+     (o.revisions || []).some(r => r.field === 'expectedDate' && r.toValue === '2026-02-20'));
+}
+
+console.log('\n--- who may do what ---');
+{
+  ok('an operator may raise a request', canRequestPurchase('operator') === true);
+  ok('AN OPERATOR MAY NOT APPROVE', canApprovePurchase('operator') === false);
+  ok('nor mark one as ordered', canPlacePurchase('operator') === false);
+  ok('an admin may do all three',
+     canRequestPurchase('admin') && canApprovePurchase('admin') && canPlacePurchase('admin'));
+  ok('and so may finance',
+     canRequestPurchase('finance') && canApprovePurchase('finance') && canPlacePurchase('finance'));
+  ok('an unknown role may do nothing — this fails closed',
+     !canRequestPurchase('visitor') && !canApprovePurchase('visitor') && !canPlacePurchase('visitor'));
+  ok('and so does a missing one',
+     !canRequestPurchase(undefined) && !canApprovePurchase(undefined) && !canPlacePurchase(undefined));
+
+  const d = plant(); const o = po(d, { status: 'Draft' });
+  tx.submitPurchaseRequest(d, { purchaseOrderId:'PO1', role:'operator', requestedBy:'Dana' });
+
+  const opApprove = tx.approvePurchaseOrder(d, { purchaseOrderId:'PO1', role:'operator' });
+  ok('THE RULE IS IN THE TRANSACTION, not just the button',
+     opApprove.ok === false && /cannot approve/.test(opApprove.error), opApprove.error);
+  ok('and nothing moved', poDerivedStatus(o) === 'Requested');
+
+  tx.approvePurchaseOrder(d, { purchaseOrderId:'PO1', role:'finance', approvedBy:'Fin' });
+  ok('finance can approve', poDerivedStatus(o) === 'Approved');
+
+  const opPlace = tx.placePurchaseOrder(d, { purchaseOrderId:'PO1', role:'operator' });
+  ok('an operator cannot place it either',
+     opPlace.ok === false && /cannot place/.test(opPlace.error), opPlace.error);
+  ok('and it is still only approved', poDerivedStatus(o) === 'Approved');
+
+  ok('finance can place it',
+     tx.placePurchaseOrder(d, { purchaseOrderId:'PO1', role:'finance' }).ok === true);
+}
+
+console.log('\n--- the actions offered match the rules ---');
+{
+  const d = plant(); const o = po(d, { status: 'Draft' });
+  const keys = (role) => poAvailableActions(o, role).map(a => a.key);
+  ok('a draft offers submit to an operator', keys('operator').indexOf('submit') >= 0);
+  ok('but an operator is offered no cancel — that is an approver decision',
+     keys('operator').indexOf('cancel') < 0);
+
+  tx.submitPurchaseRequest(d, { purchaseOrderId:'PO1', role:'operator' });
+  ok('a request offers approve and return to an admin',
+     keys('admin').indexOf('approve') >= 0 && keys('admin').indexOf('return') >= 0);
+  ok('AND NEITHER TO THE OPERATOR WHO RAISED IT',
+     keys('operator').indexOf('approve') < 0 && keys('operator').indexOf('return') < 0);
+  ok('the operator is offered nothing at all here', keys('operator').length === 0);
+
+  tx.approvePurchaseOrder(d, { purchaseOrderId:'PO1', role:'admin' });
+  ok('an approved order offers the order step to finance',
+     keys('finance').indexOf('place') >= 0);
+  ok('and not to the operator', keys('operator').indexOf('place') < 0);
+
+  tx.placePurchaseOrder(d, { purchaseOrderId:'PO1', role:'admin' });
+  ok('a placed order has no step left to take',
+     keys('admin').indexOf('place') < 0 && keys('admin').indexOf('approve') < 0);
+  ok('though it can still be cancelled', keys('admin').indexOf('cancel') >= 0);
+
+  ok('every action the modal can show is one the rules allow',
+     ['Draft','Requested','Approved','Ordered'].every(st => {
+       const probe = { ...o, status: st, receipts: [] };
+       return poAvailableActions(probe, 'operator').every(a => a.key === 'submit');
+     }));
+}
+
+console.log('\n--- a request can be sent back ---');
+{
+  const d = plant(); const o = po(d, { status: 'Draft' });
+  tx.submitPurchaseRequest(d, { purchaseOrderId:'PO1', role:'operator', requestedBy:'Dana' });
+
+  const noWhy = tx.returnPurchaseRequest(d, { purchaseOrderId:'PO1', role:'admin' });
+  ok('returning without a reason is refused',
+     noWhy.ok === false && /reason is required/.test(noWhy.error), noWhy.error);
+  ok('so it is still a request', poDerivedStatus(o) === 'Requested');
+
+  const back = tx.returnPurchaseRequest(d, { purchaseOrderId:'PO1', role:'admin',
+    reason:'Quantity looks like a typo', returnedBy:'Sam' });
+  ok('with a reason it goes back', back.ok === true, back.error);
+  ok('to draft, so it can be fixed and resubmitted', poDerivedStatus(o) === 'Draft');
+  ok('the stale request stamp is cleared', o.requestedBy === '' && o.requestedAt === '');
+  ok('and the reason is on the record',
+     (o.revisions || []).some(r => /typo/.test(r.reason)));
+  ok('a returned draft is editable again',
+     tx.savePurchaseOrder(d, { purchaseOrderId:'PO1', reference:'PO-1', supplier:'Acme',
+       lines: o.lines.map(l => ({ ...l, qty: 50 })) }).ok === true);
+  ok('and can walk the path again', (() => {
+    tx.submitPurchaseRequest(d, { purchaseOrderId:'PO1', role:'operator' });
+    tx.approvePurchaseOrder(d, { purchaseOrderId:'PO1', role:'admin' });
+    return tx.placePurchaseOrder(d, { purchaseOrderId:'PO1', role:'admin' }).ok === true;
+  })());
+}
+
+console.log('\n--- an unplaced order is not cover ---');
+{
+  const d = plant();
+  const o = po(d, { status: 'Draft', qty: 500 });
+  ok('a draft contributes nothing to on-order', openOrderQty(d, 'RM1') === 0);
+  ok('but is visible as pipeline', pipelineOrderQty(d, 'RM1') === 500);
+  ok('and the breakdown says which step it is on',
+     pipelineBreakdown(d, 'RM1').Draft === 500);
+
+  tx.submitPurchaseRequest(d, { purchaseOrderId:'PO1', role:'operator' });
+  ok('a request is still not cover', openOrderQty(d, 'RM1') === 0);
+  ok('and moves along the breakdown',
+     pipelineBreakdown(d, 'RM1').Requested === 500 && pipelineBreakdown(d, 'RM1').Draft === 0);
+
+  tx.approvePurchaseOrder(d, { purchaseOrderId:'PO1', role:'admin' });
+  ok('AN APPROVAL IS NOT AN ORDER — still not cover', openOrderQty(d, 'RM1') === 0);
+  ok('and reads as approved in the breakdown', pipelineBreakdown(d, 'RM1').Approved === 500);
+
+  tx.placePurchaseOrder(d, { purchaseOrderId:'PO1', role:'admin' });
+  ok('placing it makes it cover at last', openOrderQty(d, 'RM1') === 500);
+  ok('and it leaves the pipeline', pipelineOrderQty(d, 'RM1') === 0);
+  ok('the two never double count',
+     openOrderQty(d, 'RM1') + pipelineOrderQty(d, 'RM1') === 500);
+}
+
+console.log('\n--- the pre-order states are not inferred away ---');
+{
+  // The trap: poDerivedStatus reads receipts to decide, and a Requested
+  // order has none - so without an explicit guard it would read as Ordered
+  // and the warehouse could receive against something never sent.
+  ['Draft', 'Requested', 'Approved'].forEach(st => {
+    const d = plant(); const o = po(d, { status: st });
+    ok('a ' + st.toLowerCase() + ' order does NOT read as Ordered',
+       poDerivedStatus(o) === st, poDerivedStatus(o));
+    ok('and is not receivable', !tx.receivablePurchaseOrders(d).some(p => p.id === o.id));
+    ok('and cannot be invoiced',
+       tx.recordPurchaseCosts(d, { purchaseOrderId:'PO1', invoiceVariance: true }).ok === false);
+    ok('and cannot be amended',
+       tx.amendPurchaseOrder(d, { purchaseOrderId:'PO1', reason:'x',
+         lines: o.lines.map(l => ({ ...l })) }).ok === false);
+  });
+}
+
+console.log('\n--- orders raised before the workflow existed are left alone ---');
+{
+  const D = seedData();
+  const placed = (D.purchaseOrders || []).filter(p => poIsPlaced(p));
+  ok('the seed has placed orders', placed.length > 0);
+  ok('NONE ARE DRAGGED BACK INTO THE APPROVAL QUEUE — that would invent an ' +
+     'approval nobody gave',
+     placed.every(p => p.status !== 'Requested' && p.status !== 'Approved'));
+  ok('and they stay receivable', tx.receivablePurchaseOrders(D).length > 0);
+
+  const mig = normalizeData(seedData());
+  ok('migration adds the new fields without inventing values',
+     (mig.purchaseOrders || []).every(p =>
+       p.requestedBy === '' && p.approvedBy === '' &&
+       p.requestedAt === '' && p.approvedAt === ''));
+  ok('and leaves every status where it was',
+     JSON.stringify((mig.purchaseOrders || []).map(p => p.status).sort()) ===
+     JSON.stringify((D.purchaseOrders || []).map(p => p.status).sort()));
+}
+
 console.log('\n--- an invoiced price never overwrites the agreed one ---');
 {
   const d = plant(); const o = po(d, { qty: 1000, unitCost: 4.5 });
@@ -482,7 +694,7 @@ console.log('\n--- what the invoice form refuses ---');
   const d = plant(); po(d, { status:'Draft' });
   const draft = tx.recordPurchaseCosts(d, { purchaseOrderId:'PO1', invoiceVariance: true });
   ok('a draft cannot have been invoiced',
-     draft.ok === false && /not been sent/.test(draft.error), draft.error);
+     draft.ok === false && /not been placed/.test(draft.error), draft.error);
 
   const e = plant(); po(e, { status:'Cancelled' });
   const cancelled = tx.recordPurchaseCosts(e, { purchaseOrderId:'PO1', invoiceVariance: true });
