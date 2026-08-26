@@ -14,6 +14,7 @@
 
 import { seedData, tx, repo, familyById, familiesOf, familyDimensions,
          matchesFamilySelection, netContentOf, familySalesRollup,
+         expectedCostForShipment, shipmentEvents, shipmentLines,
          normalizeData } from '/tmp/core.mjs';
 
 let pass = 0, fail = 0;
@@ -180,6 +181,121 @@ console.log('\n--- what the roll-up refuses to hide ---');
   ok('and the grand total still covers everything',
      Math.abs(familySalesRollup(D4, {}).totals.revenue -
               familySalesRollup(D, {}).totals.revenue) < 0.02);
+}
+
+console.log('\n--- expected against actual cost ---');
+{
+  // Four figures, and the whole point is that the first two are different
+  // things: what the recipe said it would cost, and what the lots that
+  // actually shipped really cost.
+  const { D } = plant();
+  const roll = familySalesRollup(D, { dimension: 'Blend' });
+  const t = roll.totals;
+
+  ok('expected COGS is reported', typeof t.expectedCogs === 'number' && t.expectedCogs > 0);
+  ok('actual COGS is reported', typeof t.actualCogs === 'number' && t.actualCogs > 0);
+  ok('they are genuinely different numbers, not one under two names',
+     t.expectedCogs !== t.actualCogs);
+  ok('deviation is actual minus expected',
+     Math.abs(t.deviation - (t.actualCogs - t.expectedCogs)) < 0.02,
+     'dev=' + t.deviation + ' act-exp=' + (t.actualCogs - t.expectedCogs));
+  ok('actual margin is revenue less what it really cost',
+     Math.abs(t.actualMargin - (t.revenue - t.actualCogs)) < 0.02);
+  ok('and expected margin measures against the plan',
+     Math.abs(t.expectedMargin - (t.revenue - t.expectedCogs)) < 0.02);
+  ok('the two margins differ by exactly the deviation',
+     Math.abs((t.expectedMargin - t.actualMargin) - t.deviation) < 0.02);
+
+  ok('groups carry the same four figures',
+     roll.groups.every(g => typeof g.totals.expectedCogs === 'number' &&
+                            typeof g.totals.actualCogs === 'number' &&
+                            typeof g.totals.actualMargin === 'number'));
+  ok('and they add back to the whole',
+     Math.abs(roll.groups.reduce((n, g) => n + g.totals.actualCogs, 0) - t.actualCogs) < 0.05);
+  ok('products carry them too',
+     roll.detail.every(r => typeof r.expectedCogs === 'number' && typeof r.actualCogs === 'number'));
+
+  // The seed traces every shipment to a lot and a run, so everything is
+  // comparable.
+  ok('every seeded shipment has a real actual cost', t.shipmentsWithoutActualCost === 0);
+  ok('and an expected cost to measure against', t.shipmentsWithoutExpectedCost === 0);
+}
+
+console.log('\n--- expected cost is the one fixed at fulfilment ---');
+{
+  // Today's standard cost moves every time a supplier reprices, which would
+  // silently rewrite last quarter's variance. The frozen figure is what was
+  // actually planned at the time.
+  const { D } = plant();
+  const ev = shipmentEvents(D).find(e => e.shipment.scheduleId);
+  ok('the seed has a shipment traced to a run', !!ev);
+  const run = D.schedule.find(s => s.id === ev.shipment.scheduleId);
+  run.standardCostAtFulfillment = 99;
+  const cost = expectedCostForShipment(D, ev);
+  ok('the frozen cost is used when the run carries one', cost.unitCost === 99);
+  ok('and is flagged as frozen', cost.frozen === true);
+  ok('expected COGS is that cost times the quantity', Math.abs(cost.cogs - 99 * ev.qty) < 0.01);
+
+  run.standardCostAtFulfillment = '';
+  const unfrozen = expectedCostForShipment(D, ev);
+  ok('without one it falls back to the standard cost', unfrozen.unitCost > 0);
+  ok('and says it is not frozen', unfrozen.frozen === false);
+
+  // The shipment table and the roll-up must not report different variances
+  // for the same shipment.
+  const line = shipmentLines(D, {}).find(l => l.id === ev.id);
+  if (line) {
+    const again = expectedCostForShipment(D, ev);
+    ok('the table and the roll-up agree on expected cost',
+       Math.abs((line.expectedCogs || 0) - (again.cogs || 0)) < 0.01);
+    ok('and on the deviation',
+       Math.abs((line.costVariance || 0) - (again.deviation || 0)) < 0.01);
+  } else ok('that shipment fell outside the default range', true);
+}
+
+console.log('\n--- a shipment with no actual cost is not "on plan" ---');
+{
+  // Transitional, and due to be prevented at source: a shipment with no lot
+  // already falls back to standard cost for its actual, so expected and actual
+  // are the same number and the deviation would be a spurious zero. Reporting
+  // that as on-plan would bake a false clean bill of health into the history.
+  const { D } = plant();
+  D.shipments.forEach(sh => { sh.lotId = ''; });
+  const roll = familySalesRollup(D, { dimension: 'Blend' });
+
+  ok('such shipments are counted', roll.totals.shipmentsWithoutActualCost > 0);
+  ok('none of them count towards the deviation', roll.totals.comparableShipments === 0);
+  ok('so the deviation is unknown, not zero', roll.totals.deviation === null,
+     'a confident 0 would read as "on plan" when the truth is "we do not know"');
+  ok('revenue still counts — the sale happened', roll.totals.revenue > 0);
+  ok('and actual margin is still reported', typeof roll.totals.actualMargin === 'number');
+  ok('per product too', roll.detail.every(r => r.deviation === null));
+
+  // Mixed: some comparable, some not. The deviation must cover only the real
+  // ones, and say how many that is.
+  const { D: D2 } = plant();
+  const withLot = D2.shipments.filter(sh => sh.lotId);
+  if (withLot.length > 1) {
+    withLot[0].lotId = '';
+    const mixed = familySalesRollup(D2, { dimension: 'Blend' });
+    ok('a mixed period still reports a deviation', mixed.totals.deviation !== null);
+    ok('but only over the shipments that have real costs',
+       mixed.totals.comparableShipments === withLot.length - 1);
+    ok('and says how many were left out', mixed.totals.shipmentsWithoutActualCost === 1);
+  } else ok('not enough lot-traced shipments in the seed to mix', true);
+}
+
+console.log('\n--- a shipment with no run has no expected cost ---');
+{
+  const { D } = plant();
+  D.shipments.forEach(sh => { sh.scheduleId = ''; });
+  D.schedule.forEach(s => { s.fulfillmentLots = []; });
+  const roll = familySalesRollup(D, { dimension: 'Blend' });
+  ok('expected COGS is unknown rather than guessed at', roll.totals.expectedCogs === null);
+  ok('and so is expected margin', roll.totals.expectedMargin === null);
+  ok('those shipments are counted', roll.totals.shipmentsWithoutExpectedCost > 0);
+  ok('actual COGS is still real', roll.totals.actualCogs > 0);
+  ok('and so is actual margin', typeof roll.totals.actualMargin === 'number');
 }
 
 console.log('\n--- managing families ---');

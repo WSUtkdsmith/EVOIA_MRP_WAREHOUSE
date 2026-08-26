@@ -5340,20 +5340,13 @@ function shipmentLines(data, range) {
       const fg = getFinished(data, e.finishedGoodId);
       const customer = e.customerId ? getCustomer(data, e.customerId) : null;
       const lot = fg && e.lotId ? (fg.lots || []).find(l => l.id === e.lotId) : null;
-      /* Expected cost is the standard fixed on the day the run was fulfilled.
-         Showing it beside the actual is what makes the line readable - the
-         variance is the story, not either figure on its own. */
-      const run = e.shipment.scheduleId
-        ? (data.schedule || []).find(s => s.id === e.shipment.scheduleId)
-        : (data.schedule || []).find(s =>
-            (s.fulfillmentLots || []).some(fl => fl.lotId === e.lotId));
-      const exp = run ? expectedUnitCost(data, run) : null;
+      const exp = expectedCostForShipment(data, e);
       return {
         ...e,
-        expectedUnitCost: exp ? exp.unitCost : null,
-        expectedIsFrozen: exp ? exp.frozen : false,
-        expectedCogs: exp ? exp.unitCost * e.qty : null,
-        costVariance: exp ? (e.unitCost - exp.unitCost) * e.qty : null,
+        expectedUnitCost: exp.unitCost,
+        expectedIsFrozen: exp.frozen,
+        expectedCogs: exp.cogs,
+        costVariance: exp.deviation,
         productName: fg ? fg.name : "(deleted product)",
         unit: fg ? fg.unit : "",
         customerName: customer ? customer.name : "",
@@ -6288,15 +6281,25 @@ function familySalesRollup(data, options) {
   const byItem = {};
   events.forEach(e => {
     const row = byItem[e.finishedGoodId] || (byItem[e.finishedGoodId] = {
-      finishedGoodId: e.finishedGoodId, units: 0, revenue: 0, cogs: 0,
-      shipments: 0, unpriced: 0
+      finishedGoodId: e.finishedGoodId, units: 0, revenue: 0,
+      actualCogs: 0, expectedCogs: 0, deviation: 0,
+      shipments: 0, unpriced: 0, comparable: 0, notComparable: 0, noExpected: 0
     });
+    const cost = expectedCostForShipment(data, e);
     row.units += Number(e.qty) || 0;
     row.revenue += Number(e.revenue) || 0;
-    row.cogs += Number(e.cogs) || 0;
+    row.actualCogs += Number(e.cogs) || 0;
     row.shipments += 1;
     if (!e.priced) row.unpriced += 1;
+    if (cost.cogs == null) row.noExpected += 1; else row.expectedCogs += cost.cogs;
+    // Only shipments where the actual is genuinely actual contribute to the
+    // deviation. Counting the rest as zero variance would report a clean bill
+    // of health the data cannot support.
+    if (cost.comparable) { row.comparable += 1; row.deviation += cost.deviation; }
+    else row.notComparable += 1;
   });
+
+  const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
 
   const detail = Object.keys(byItem).map(id => {
     const item = getFinished(data, id);
@@ -6304,6 +6307,13 @@ function familySalesRollup(data, options) {
     const r = byItem[id];
     return {
       ...r,
+      actualCogs: round2(r.actualCogs),
+      expectedCogs: round2(r.expectedCogs),
+      // Positive is an overrun. Null when nothing on this product could be
+      // compared, so the column shows a dash rather than a confident zero.
+      deviation: r.comparable ? round2(r.deviation) : null,
+      actualMargin: round2(r.revenue - r.actualCogs),
+      expectedMargin: r.noExpected ? null : round2(r.revenue - r.expectedCogs),
       itemName: item ? item.name : "(deleted product)",
       sku: item ? item.sku : "",
       unit: item ? (item.unit || "") : "",
@@ -6324,13 +6334,28 @@ function familySalesRollup(data, options) {
       const u = r.netContentUnit || "(unstated unit)";
       netByUnit[u] = Math.round(((netByUnit[u] || 0) + r.netTotal) * 1000) / 1000;
     });
-    const revenue = Math.round(rows.reduce((n, r) => n + r.revenue, 0) * 100) / 100;
-    const cogs = Math.round(rows.reduce((n, r) => n + r.cogs, 0) * 100) / 100;
+    const sum = (k) => Math.round(rows.reduce((n, r) => n + (Number(r[k]) || 0), 0) * 100) / 100;
+    const revenue = sum("revenue");
+    const actualCogs = sum("actualCogs");
+    const comparable = rows.reduce((n, r) => n + (r.comparable || 0), 0);
+    const noExpected = rows.reduce((n, r) => n + (r.noExpected || 0), 0);
+    const expectedCogs = noExpected ? null : sum("expectedCogs");
     return {
       products: rows.length,
       shipments: rows.reduce((n, r) => n + r.shipments, 0),
-      revenue, cogs,
-      margin: Math.round((revenue - cogs) * 100) / 100,
+      revenue,
+      // The four figures the roll-up is read for.
+      expectedCogs, actualCogs,
+      deviation: comparable
+        ? Math.round(rows.reduce((n, r) => n + (r.deviation || 0), 0) * 100) / 100 : null,
+      actualMargin: Math.round((revenue - actualCogs) * 100) / 100,
+      expectedMargin: expectedCogs == null ? null : Math.round((revenue - expectedCogs) * 100) / 100,
+      // How much of the deviation figure is actually founded on real costs.
+      // Transitional: shipments raised without a lot reference have no actual
+      // cost of their own, and are due to be prevented at source.
+      comparableShipments: comparable,
+      shipmentsWithoutActualCost: rows.reduce((n, r) => n + (r.notComparable || 0), 0),
+      shipmentsWithoutExpectedCost: noExpected,
       netByUnit,
       // How many products in this group have no net content recorded. A total
       // with a gap in it has to say so, or it reads as complete.
@@ -7394,6 +7419,50 @@ function shippedFromLot(data, lotId) {
 /* Expected cost for a run: the standard cost as it stood when the run was
    fulfilled, not as it stands today. Falls back to today's standard only
    when the run predates the field, and says which it used. */
+/* Expected cost of one shipment, and how far the actual landed from it.
+
+   Expected is the standard cost fixed on the day the run was fulfilled, not
+   today's standard cost: today's moves every time a supplier reprices, which
+   silently rewrites last quarter's variance. Showing expected beside actual is
+   what makes a line readable - the deviation is the story, not either figure
+   on its own.
+
+   Shared by the shipment table and the family roll-up so the two cannot drift
+   into reporting different variances for the same shipment.
+
+   `comparable` is the honest part. A shipment with no lot reference already
+   falls back to standard cost for its "actual" (see shipmentEvents), so
+   expected and actual are then the same number and the deviation is a
+   spurious zero - which reads as "on plan" when the truth is "we do not know
+   what this cost". Those are excluded from deviation totals and counted
+   separately. Once shipments cannot be raised without real data this case
+   disappears, but reporting it as zero variance in the meantime would bake a
+   false clean bill of health into the history. */
+function expectedCostForShipment(data, event) {
+  const sh = event.shipment || event;
+  const run = sh.scheduleId
+    ? (data.schedule || []).find(s => s && s.id === sh.scheduleId)
+    : (data.schedule || []).find(s =>
+        (s.fulfillmentLots || []).some(fl => fl.lotId === event.lotId));
+  const exp = run ? expectedUnitCost(data, run) : null;
+  const qty = Number(event.qty) || 0;
+  const actualCogs = Number(event.cogs) || 0;
+  // Actual is only actual when it came from a real lot.
+  const comparable = !!exp && !event.costEstimated;
+  const cogs = exp ? exp.unitCost * qty : null;
+  return {
+    unitCost: exp ? exp.unitCost : null,
+    frozen: exp ? exp.frozen : false,
+    cogs,
+    // Positive is an overrun: it cost more than expected.
+    deviation: cogs == null ? null : actualCogs - cogs,
+    comparable,
+    // Margin against what it really cost - the one the business banks.
+    actualMargin: event.priced ? (Number(event.revenue) || 0) - actualCogs : null,
+    expectedMargin: (event.priced && cogs != null) ? (Number(event.revenue) || 0) - cogs : null
+  };
+}
+
 function expectedUnitCost(data, entry) {
   const frozen = Number(entry && entry.standardCostAtFulfillment);
   if (Number.isFinite(frozen) && frozen > 0) return { unitCost: frozen, frozen: true };
@@ -11048,6 +11117,15 @@ function FinishedGoodsTab({ data, search, setSearch, onAdd, onEdit, onDelete, on
    line exists, kilogrammes and litres are in the same table and must not be
    summed. So revenue leads, net content is reported per unit, and there is no
    grand total column for units at all. */
+const GROUP_COLS = "1.8fr 1fr 1fr 1fr 1.1fr 1fr 1fr";
+const PRODUCT_COLS = "1.8fr 0.8fr 1fr 1fr 1.1fr 1fr 1fr";
+
+/* A deviation of zero and an unmeasurable deviation are different answers, so
+   null reads as a dash rather than as "on plan". */
+const devText = (n) => n == null ? "\u2014" : (n > 0 ? "+" : "") + fmtMoney(n);
+const devColor = (n) => n == null ? "#8A9099" : n > 0 ? "#8A2E20" : n < 0 ? "#2E7D5B" : "#5B6470";
+const devTone = (n) => n == null ? undefined : n > 0 ? "bad" : n < 0 ? "good" : undefined;
+
 function FamilySalesTab({ data, onManage }) {
   const tr = useTimeRange(data, "13w");
   const dims = useMemo(() => familyDimensions(data), [data]);
@@ -11132,14 +11210,49 @@ function FamilySalesTab({ data, onManage }) {
         ))}
       </div>
 
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+                    gap: 12, marginBottom: 12 }}>
+        <MiniStat label="Revenue" value={fmtMoney(roll.totals.revenue)} />
+        <MiniStat label="Expected COGS"
+          value={roll.totals.expectedCogs == null ? "\u2014" : fmtMoney(roll.totals.expectedCogs)} />
+        <MiniStat label="Actual COGS" value={fmtMoney(roll.totals.actualCogs)} />
+        <MiniStat label="Deviation from plan" value={devText(roll.totals.deviation)}
+          tone={devTone(roll.totals.deviation)} />
+        <MiniStat label="Actual margin" value={fmtMoney(roll.totals.actualMargin)}
+          tone={roll.totals.actualMargin < 0 ? "bad" : "good"} />
+      </div>
+
       <div style={{ display: "flex", gap: 20, flexWrap: "wrap", alignItems: "center",
-                    padding: "10px 14px", marginBottom: 12, borderRadius: 8, fontSize: 13,
+                    padding: "8px 14px", marginBottom: 12, borderRadius: 8, fontSize: 12.5,
                     background: "#F1F6F2", border: "1px solid #CFE0D3" }}>
-        <div><b>{fmtMoney(roll.totals.revenue)}</b> revenue</div>
-        <div style={{ color: "#5B6470" }}>{fmtMoney(roll.totals.margin)} margin</div>
         <div style={{ color: "#5B6470" }}>{netText(roll.totals.netByUnit)} shipped</div>
         <div style={{ color: "#5B6470" }}>{roll.totals.products} product(s) · {roll.totals.shipments} shipment(s)</div>
+        <div style={{ color: "#5B6470" }}>
+          Expected COGS is the standard cost fixed when the run was fulfilled — not today's, which moves
+          every time a supplier reprices. Deviation is actual minus expected, so a positive figure is an overrun.
+        </div>
       </div>
+
+      {/* Transitional: a shipment raised without a lot reference has no cost of
+          its own, so its "actual" is really the standard cost and comparing the
+          two would report a variance of zero. Counting those as on-plan would
+          bake a false clean bill of health into the history, so they are left
+          out of the deviation and said out loud instead. */}
+      {roll.totals.shipmentsWithoutActualCost > 0 && (
+        <div style={{ background: "#F6E6C8", border: "1px solid #C99A3A", borderRadius: 8,
+                      padding: "8px 12px", marginBottom: 12, fontSize: 11.5, color: "#7A5205" }}>
+          {roll.totals.shipmentsWithoutActualCost} shipment(s) name no lot, so they have no actual cost of
+          their own and fall back to standard. They are excluded from the deviation rather than counted as
+          on plan — the figure covers {roll.totals.comparableShipments} shipment(s) with real costs.
+        </div>
+      )}
+      {roll.totals.shipmentsWithoutExpectedCost > 0 && (
+        <div style={{ background: "#FFF9EF", border: "1px solid #E8D5A8", borderRadius: 8,
+                      padding: "8px 12px", marginBottom: 12, fontSize: 11.5, color: "#7A5205" }}>
+          {roll.totals.shipmentsWithoutExpectedCost} shipment(s) trace to no production run, so no expected
+          cost was ever fixed for them. Expected COGS is shown as a dash rather than guessed at.
+        </div>
+      )}
 
       {roll.totals.productsWithoutNetContent > 0 && (
         <div style={{ background: "#F6E6C8", border: "1px solid #C99A3A", borderRadius: 8,
@@ -11156,10 +11269,16 @@ function FamilySalesTab({ data, onManage }) {
         </div>
       )}
 
-      <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr", gap: 8, fontSize: 11,
+      <div style={{ display: "grid", gridTemplateColumns: GROUP_COLS, gap: 8, fontSize: 11,
                     fontWeight: 700, color: "#7A8079", textTransform: "uppercase", letterSpacing: 0.3,
                     padding: "0 12px 6px" }}>
-        <span>{dimension}</span><span>Revenue</span><span>Margin</span><span>Shipped</span><span>Products</span>
+        <span>{dimension}</span>
+        <span>Revenue</span>
+        <span title="Standard cost fixed when the run was fulfilled">Expected COGS</span>
+        <span title="What the lots that actually shipped really cost">Actual COGS</span>
+        <span title="Actual minus expected — positive is an overrun">Deviation from plan</span>
+        <span title="Revenue less actual COGS">Actual margin</span>
+        <span>Shipped</span>
       </div>
 
       {roll.groups.length === 0 && (
@@ -11174,40 +11293,63 @@ function FamilySalesTab({ data, onManage }) {
           <div role="button" tabIndex={0}
             onClick={() => setExpanded(e => ({ ...e, [g.key]: !e[g.key] }))}
             onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setExpanded(x => ({ ...x, [g.key]: !x[g.key] })); } }}
-            style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr", gap: 8,
+            style={{ display: "grid", gridTemplateColumns: GROUP_COLS, gap: 8,
                      alignItems: "center", padding: "9px 12px", cursor: "pointer", fontSize: 12.5 }}>
             <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
               {expanded[g.key] ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
               <b>{g.label}</b>
               {!g.family && <Badge tone="warn">no {dimension} tag</Badge>}
+              <span style={{ fontSize: 11, color: "#8A9099" }}>{g.totals.products} product(s)</span>
             </span>
             <span className="mono" style={{ fontWeight: 700 }}>{fmtMoney(g.totals.revenue)}</span>
-            <span className="mono">{fmtMoney(g.totals.margin)}</span>
+            <span className="mono">
+              {g.totals.expectedCogs == null ? "\u2014" : fmtMoney(g.totals.expectedCogs)}
+            </span>
+            <span className="mono">{fmtMoney(g.totals.actualCogs)}</span>
+            <span className="mono" style={{ fontWeight: 700, color: devColor(g.totals.deviation) }}>
+              {devText(g.totals.deviation)}
+            </span>
+            <span className="mono" style={{ color: g.totals.actualMargin < 0 ? "#8A2E20" : "#2E7D5B" }}>
+              {fmtMoney(g.totals.actualMargin)}
+            </span>
             <span className="mono">{netText(g.totals.netByUnit)}</span>
-            <span className="mono">{g.totals.products}</span>
           </div>
           {expanded[g.key] && (
             <div style={{ borderTop: "1px solid #F1F2EE", padding: "6px 12px 10px" }}>
               {/* Per product, because this is the only level at which a unit
                   count is a real number. */}
-              <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr", gap: 8,
+              <div style={{ display: "grid", gridTemplateColumns: PRODUCT_COLS, gap: 8,
                             fontSize: 10.5, fontWeight: 700, color: "#7A8079",
                             textTransform: "uppercase", letterSpacing: 0.3, padding: "4px 0" }}>
-                <span>Product</span><span>Units</span><span>Net content</span><span>Shipped</span><span>Revenue</span>
+                <span>Product</span><span>Units</span><span>Revenue</span>
+                <span>Expected COGS</span><span>Actual COGS</span>
+                <span>Deviation</span><span>Actual margin</span>
               </div>
               {g.rows.slice().sort((a, b) => b.revenue - a.revenue).map(r => (
-                <div key={r.finishedGoodId} style={{ display: "grid", gridTemplateColumns: "2fr 1fr 1fr 1fr 1fr",
-                                                     gap: 8, fontSize: 12, padding: "3px 0",
+                <div key={r.finishedGoodId} style={{ display: "grid", gridTemplateColumns: PRODUCT_COLS,
+                                                     gap: 8, fontSize: 12, padding: "4px 0",
                                                      borderTop: "1px solid #F7F8F5" }}>
-                  <span>{r.itemName}</span>
+                  <span>
+                    {r.itemName}
+                    <span style={{ display: "block", fontSize: 10.5, color: "#8A9099" }}>
+                      {r.netContentQty == null
+                        ? "net content not set"
+                        : fmtNum(r.netContentQty) + " " + r.netContentUnit + " each · " +
+                          (r.netTotal == null ? "" : fmtNum(r.netTotal) + " " + r.netContentUnit + " shipped")}
+                    </span>
+                  </span>
                   <span className="mono">{fmtNum(r.units)} {r.unit}</span>
-                  <span className="mono" style={{ color: r.netContentQty == null ? "#B87510" : "#5B6470" }}>
-                    {r.netContentQty == null ? "not set" : fmtNum(r.netContentQty) + " " + r.netContentUnit}
-                  </span>
-                  <span className="mono">
-                    {r.netTotal == null ? "\u2014" : fmtNum(r.netTotal) + " " + r.netContentUnit}
-                  </span>
                   <span className="mono">{fmtMoney(r.revenue)}</span>
+                  <span className="mono">
+                    {r.noExpected ? "\u2014" : fmtMoney(r.expectedCogs)}
+                  </span>
+                  <span className="mono">{fmtMoney(r.actualCogs)}</span>
+                  <span className="mono" style={{ fontWeight: 700, color: devColor(r.deviation) }}>
+                    {devText(r.deviation)}
+                  </span>
+                  <span className="mono" style={{ color: r.actualMargin < 0 ? "#8A2E20" : "#2E7D5B" }}>
+                    {fmtMoney(r.actualMargin)}
+                  </span>
                 </div>
               ))}
             </div>

@@ -1375,8 +1375,15 @@ console.log('\n--- product families roll up along whichever axis is picked ---')
      h.includes('Premium Reserve') && h.includes('Foodservice') && h.includes('Dry powder'));
   ok('the faceted rule is stated rather than left to be discovered',
      h.includes('same axis widens, different axes narrow'));
-  ok('revenue leads, because it is the only measure that adds up everywhere',
-     h.includes('revenue'));
+  // The four figures the roll-up is read for, named in full rather than
+  // abbreviated to one ambiguous "COGS" column.
+  ok('expected COGS is named', h.includes('Expected COGS'));
+  ok('actual COGS is named', h.includes('Actual COGS'));
+  ok('the gap between them is named', h.includes('Deviation from plan'));
+  ok('and the margin is the one against actual cost', h.includes('Actual margin'));
+  ok('expected is the cost fixed at fulfilment, not today\u2019s moving standard',
+     h.includes('fixed when the run was fulfilled'));
+  ok('and the sign convention is stated', h.includes('positive figure is an overrun'));
 
   // The arithmetic the report refuses to do, said out loud.
   ok('it says why units are never summed across formats',
