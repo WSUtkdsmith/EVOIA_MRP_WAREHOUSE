@@ -1416,6 +1416,57 @@ console.log('\n--- product families roll up along whichever axis is picked ---')
   ok('and carries the family tags', fh.includes('Product families'));
 }
 
+console.log('\n--- the dashboard revisions ---');
+{
+  const D9 = A.seedData();
+  const dash = tryRender('dash10', React.createElement(A.Dashboard, {
+    data: D9, setTab: noop, update: noop }));
+  ok('the dashboard renders', !dash.err, dash.err);
+  const h = (dash.html || '').replace(/<!-- -->/g, '');
+
+  // A run can finish on time and the goods still reach the customer late.
+  ok('due-date adherence can be switched between runs and shipments',
+     h.includes('Completions against due date') && h.includes('>Runs<') && h.includes('>Shipments<'));
+
+  // The old chart added kilogrammes to metres to litres.
+  ok('raw material flow can be narrowed to one material',
+     h.includes('All raw materials (mixed units)'));
+  ok('and says why the combined view is close to useless',
+     h.includes('several units of measure in one bar'));
+  ok('every raw material is offered', h.includes('Green coffee') || h.includes('Sachet'));
+
+  // Valuation.
+  ok('raw material on hand is valued', h.includes('Raw material on hand'));
+  ok('intermediates too', h.includes('Intermediate products'));
+  ok('and finished goods', h.includes('Finished goods'));
+  ok('with a total', h.includes('Total stock on hand'));
+  ok('waste is called out as excluded', h.includes('waste streams excluded'));
+  ok('a snapshot can be taken by hand', h.includes('Take snapshot now'));
+  ok('and the history says it is read, not recomputed',
+     h.includes('not recomputed'));
+}
+
+console.log('\n--- the valuation panel on its own ---');
+{
+  const D9 = A.seedData();
+  const range = { from: '2026-01-01', to: '2026-12-31', granularity: 'month' };
+  const empty = tryRender('val1', React.createElement(A.InventoryValuationPanel, {
+    data: D9, update: noop, range }));
+  ok('it renders with no snapshots yet', !empty.err, empty.err);
+  const eh = (empty.html || '').replace(/<!-- -->/g, '');
+  ok('and says so rather than drawing an empty chart', eh.includes('No snapshots recorded yet'));
+  ok('pointing at both ways one gets taken', eh.includes('nightly job') && eh.includes('button above'));
+
+  A.tx.captureInventorySnapshot(D9, { date: '2026-06-30', source: 'cron' });
+  A.tx.captureInventorySnapshot(D9, { date: '2026-07-31', source: 'cron' });
+  const withHistory = tryRender('val2', React.createElement(A.InventoryValuationPanel, {
+    data: D9, update: noop, range }));
+  ok('and with snapshots', !withHistory.err, withHistory.err);
+  const wh = (withHistory.html || '').replace(/<!-- -->/g, '');
+  ok('naming when the last one was taken', wh.includes('Last snapshot'));
+  ok('and how many are in range', wh.includes('2 snapshot(s) in this range'));
+}
+
 console.log('\n============================');
 console.log('  ' + pass + ' passed, ' + fail + ' failed');
 console.log('============================\n');

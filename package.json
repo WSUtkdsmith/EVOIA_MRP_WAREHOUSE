@@ -4,8 +4,8 @@
   "private": true,
   "description": "Integrated MRP + Warehouse platform, multi-tenant by Business Unit. Vercel web app with a shared Postgres backend and two front-end modules.",
   "scripts": {
-    "test": "SKIP_TSC=1 bash mrp/tools/run-tests.sh && npm run test:render && node api/test/tenancy.test.js && node api/test/catalog.test.js && node api/test/receipts.test.js && node api/test/material-flow.test.js && node warehouse/test/placement.test.js && node warehouse/test/startup.test.js && node warehouse/test/layout.test.js",
-    "test:full": "bash mrp/tools/run-tests.sh && npm run test:render && node api/test/tenancy.test.js && node api/test/catalog.test.js && node api/test/receipts.test.js && node api/test/material-flow.test.js && node warehouse/test/placement.test.js && node warehouse/test/startup.test.js && node warehouse/test/layout.test.js",
+    "test": "SKIP_TSC=1 bash mrp/tools/run-tests.sh && npm run test:render && node api/test/tenancy.test.js && node api/test/catalog.test.js && node api/test/receipts.test.js && node api/test/material-flow.test.js && node api/test/valuation.test.js && node warehouse/test/placement.test.js && node warehouse/test/startup.test.js && node warehouse/test/layout.test.js",
+    "test:full": "bash mrp/tools/run-tests.sh && npm run test:render && node api/test/tenancy.test.js && node api/test/catalog.test.js && node api/test/receipts.test.js && node api/test/material-flow.test.js && node api/test/valuation.test.js && node warehouse/test/placement.test.js && node warehouse/test/startup.test.js && node warehouse/test/layout.test.js",
     "test:render": "bash mrp/tools/mkapp.sh && node mrp/test/render.test.js",
     "build:mrp": "esbuild mrp/entry.jsx --bundle --format=iife --outfile=mrp/app.bundle.js --define:process.env.NODE_ENV=\\\"production\\\" --minify"
   },

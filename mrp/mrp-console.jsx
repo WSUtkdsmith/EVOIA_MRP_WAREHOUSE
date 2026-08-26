@@ -910,6 +910,38 @@ const SCHEMA = {
      (the original start and finish) plus the reason, which is enough to show
      what was changed and why - and it keeps this out of IMPORT_ORDER's way,
      which has caught us twice already. */
+  /* A dated record of what the stock was worth.
+
+     A valuation computed from today's data can only ever answer "what is it
+     worth now" - lots get consumed, costs get recomputed, and last month's
+     figure is unrecoverable the moment the data moves. So the number is
+     written down, once a day, and the written-down figure is what the history
+     is drawn from. Nothing derives it after the fact.
+
+     One row per business day, keyed on the date: capturing twice on the same
+     day replaces rather than appends, so a retry or an overlapping cron run
+     cannot double-count. */
+  inventorySnapshots: {
+    table: "inventory_snapshots",
+    label: "Inventory snapshot",
+    pk: "id",
+    naturalKey: "date",
+    columns: {
+      id: "str", date: "date!", capturedAt: "str!",
+      // Where it came from: the nightly job, or somebody pressing the button.
+      source: "str",
+      rawValue: "num", intermediateValue: "num", finishedValue: "num",
+      wasteValue: "num", totalValue: "num",
+      rawLots: "num", intermediateLots: "num", finishedLots: "num",
+      // How much of the figure rested on standard cost rather than a traced
+      // lot cost. A valuation is acted on, so its softness travels with it.
+      estimatedLots: "num",
+      notes: "str"
+    },
+    embeds: {},
+    children: {}
+  },
+
   /* A reporting grouping. Deliberately thin: a family is a name and the axis
      it belongs to, and nothing else.
 
@@ -1491,7 +1523,7 @@ const IMPORT_ORDER = [
   "maintenance", "production_targets", "purchase_orders", "purchase_order_lines", "warehouse_receipts",
   // Families before family_tags, and family_tags after finished_goods: a tag
   // points at both. This list is hand-maintained and has bitten us twice.
-  "product_families", "family_tags",
+  "product_families", "family_tags", "inventory_snapshots",
   "material_requests", "material_request_lines",
   "material_returns", "material_return_lines",
   // After processes: a run points at one.
@@ -2769,6 +2801,37 @@ const tx = {
   /* Record a review decision on a sales order line. Accepting or adjusting
      does not itself raise a run - that is releaseSalesOrderLine - so a
      decision can be revisited before anything hits the schedule. */
+  /* Write down what the stock is worth today.
+
+     Idempotent on the date: capturing twice on the same day replaces the row
+     rather than adding one, so a cron retry, an overlapping run or somebody
+     pressing the button after the job has already fired cannot double up.
+
+     The values are computed here and stored. Recomputing them later from the
+     data would give a different answer - lots move, costs are recalculated -
+     which is the whole reason this exists. */
+  captureInventorySnapshot(db, { date, source, notes }) {
+    const day = String(date || todayStr()).slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return { ok: false, error: "A snapshot needs a date." };
+    const v = inventoryValuation(db);
+    const existing = (db.inventorySnapshots || []).find(r => r && r.date === day);
+    const row = {
+      date: day, capturedAt: nowStamp(), source: source || "manual",
+      rawValue: v.byKey.raw.value,
+      intermediateValue: v.byKey.intermediate.value,
+      finishedValue: v.byKey.finished.value,
+      wasteValue: v.byKey.waste.value,
+      totalValue: v.total,
+      rawLots: v.byKey.raw.lots,
+      intermediateLots: v.byKey.intermediate.lots,
+      finishedLots: v.byKey.finished.lots,
+      estimatedLots: v.estimatedLots,
+      notes: notes || ""
+    };
+    const saved = repo.upsert(db, "inventorySnapshots", existing ? existing.id : null, row);
+    return { ok: true, snapshot: saved, replaced: !!existing };
+  },
+
   /* --------------------------------------------------------------
      Product families - reporting groupings, many per product.
   ----------------------------------------------------------------*/
@@ -4605,7 +4668,8 @@ function seedData() {
     equipment, maintenance, customers, components, wasteStreams, shipments,
     operatingCalendars, productionTargets, purchaseOrders, salesOrders,
     fulfilmentCancellations, warehouseReceipts: [],
-    materialRequests: [], materialReturns: [], batchRuns: [], productFamilies
+    materialRequests: [], materialReturns: [], batchRuns: [], productFamilies,
+    inventorySnapshots: []
   });
 }
 
@@ -4927,6 +4991,7 @@ function normalizeData(raw) {
       materialReturns: Array.isArray(raw.materialReturns) ? raw.materialReturns : [],
       batchRuns: Array.isArray(raw.batchRuns) ? raw.batchRuns : [],
       productFamilies: Array.isArray(raw.productFamilies) ? raw.productFamilies : [],
+      inventorySnapshots: Array.isArray(raw.inventorySnapshots) ? raw.inventorySnapshots : [],
       salesOrders: normalizeSalesOrders(raw.salesOrders),
       fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [],
       operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars),
@@ -4999,7 +5064,7 @@ function normalizeData(raw) {
   const shipments = normalizeShipments(raw.shipments);
 
   const migrated = migrateCompositionToComponents(rawMaterials, intermediateProducts, finishedGoods, raw.components);
-  return backfillRowIds({ rawMaterials: migrated.rawMaterials, intermediateProducts: migrated.intermediateProducts, finishedGoods: migrated.finishedGoods, components: migrated.components, wasteStreams, processes, schedule, equipment, maintenance, customers, shipments, productionTargets, purchaseOrders: normalizePurchaseOrders(raw.purchaseOrders), warehouseReceipts: Array.isArray(raw.warehouseReceipts) ? raw.warehouseReceipts : [], materialRequests: Array.isArray(raw.materialRequests) ? raw.materialRequests : [], materialReturns: Array.isArray(raw.materialReturns) ? raw.materialReturns : [], batchRuns: Array.isArray(raw.batchRuns) ? raw.batchRuns : [], productFamilies: Array.isArray(raw.productFamilies) ? raw.productFamilies : [], salesOrders: normalizeSalesOrders(raw.salesOrders), fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [], operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars), seedVersion: raw.seedVersion || "" });
+  return backfillRowIds({ rawMaterials: migrated.rawMaterials, intermediateProducts: migrated.intermediateProducts, finishedGoods: migrated.finishedGoods, components: migrated.components, wasteStreams, processes, schedule, equipment, maintenance, customers, shipments, productionTargets, purchaseOrders: normalizePurchaseOrders(raw.purchaseOrders), warehouseReceipts: Array.isArray(raw.warehouseReceipts) ? raw.warehouseReceipts : [], materialRequests: Array.isArray(raw.materialRequests) ? raw.materialRequests : [], materialReturns: Array.isArray(raw.materialReturns) ? raw.materialReturns : [], batchRuns: Array.isArray(raw.batchRuns) ? raw.batchRuns : [], productFamilies: Array.isArray(raw.productFamilies) ? raw.productFamilies : [], inventorySnapshots: Array.isArray(raw.inventorySnapshots) ? raw.inventorySnapshots : [], salesOrders: normalizeSalesOrders(raw.salesOrders), fulfilmentCancellations: Array.isArray(raw.fulfilmentCancellations) ? raw.fulfilmentCancellations : [], operatingCalendars: ensureOperatingCalendars(raw.operatingCalendars), seedVersion: raw.seedVersion || "" });
 }
 
 /* ---------------------------------------------------------------
@@ -5256,7 +5321,12 @@ function consumptionEvents(data) {
       (lot.sources || []).forEach(s => {
         const sep = String(s.groupKey || "").indexOf(":");
         const itemType = sep < 0 ? "raw" : String(s.groupKey).slice(0, sep);
-        if (lot.date) out.push({ date: lot.date, series: itemType, value: Number(s.qty) || 0 });
+        // itemId travels with the event so consumption can be broken out per
+        // material. Without it the only available view is every raw material
+        // added together, which mixes kilogrammes of coffee with metres of
+        // sachet film and litres of nitrogen.
+        const itemId = sep < 0 ? "" : String(s.groupKey).slice(sep + 1);
+        if (lot.date) out.push({ date: lot.date, series: itemType, value: Number(s.qty) || 0, itemId });
       });
     }));
   });
@@ -5444,6 +5514,139 @@ function orderCompletionEvents(data) {
   return (data.schedule || [])
     .filter(s => s.status === "Complete" && s.completedDate)
     .map(s => ({ date: s.completedDate, series: "orders", value: 1, qty: Number(s.qty) || 0, entry: s }));
+}
+
+/* Did the goods reach the customer by the date we promised?
+
+   A different question from whether the RUN hit its date, and the one the
+   customer actually experiences: a run can finish on time and still ship late.
+
+   The promised date is looked for in the order it carries weight:
+
+     1. the date the plant COMMITTED to on the sales order line (approvedDate)
+     2. the date the customer ASKED for (requestedDate on the line, then on
+        the order)
+     3. the run's frozen baseline due date
+     4. the run's current due date - last, because an unfrozen due date may
+        have been moved to match what happened, which would make adherence
+        look perfect for the wrong reason
+
+   A shipment with none of those is `measurable: false` and is counted but
+   never scored. Guessing a date and calling the result on-time would be worse
+   than admitting the shipment cannot be judged. */
+function shipmentAdherenceEvents(data) {
+  const runById = {};
+  (data.schedule || []).forEach(r => { if (r && r.id) runById[r.id] = r; });
+
+  // Which sales order line each run is filling, so a shipment can reach the
+  // commitment through the run it came from.
+  const lineByRun = {};
+  (data.salesOrders || []).forEach(o => {
+    if (!o || o.status === "Cancelled") return;
+    (o.lines || []).forEach(l => {
+      if (l && l.scheduleId && !lineByRun[l.scheduleId]) lineByRun[l.scheduleId] = { order: o, line: l };
+    });
+  });
+
+  return (data.shipments || []).filter(sh => sh && sh.shipDate).map(sh => {
+    const run = sh.scheduleId ? runById[sh.scheduleId] : null;
+    const match = sh.scheduleId ? lineByRun[sh.scheduleId] : null;
+
+    let promised = "", basis = "";
+    if (match && match.line.approvedDate) { promised = match.line.approvedDate; basis = "committed"; }
+    else if (match && match.line.requestedDate) { promised = match.line.requestedDate; basis = "requested"; }
+    else if (match && match.order.requestedDate) { promised = match.order.requestedDate; basis = "requested"; }
+    else if (run && run.frozen && run.baselineDueDate) { promised = run.baselineDueDate; basis = "runBaseline"; }
+    else if (run && run.dueDate) { promised = run.dueDate; basis = "runDueDate"; }
+
+    const measurable = !!promised;
+    const late = measurable && sh.shipDate > promised;
+    return {
+      shipment: sh, id: sh.id, date: sh.shipDate,
+      promisedDate: promised, promisedBasis: basis, measurable, late,
+      daysLate: measurable ? daysBetweenISO(promised, sh.shipDate) : null,
+      series: !measurable ? "unmeasured" : late ? "late" : "onTime",
+      value: 1,
+      qty: Number(sh.qty) || 0,
+      customerId: sh.customerId || "", finishedGoodId: sh.finishedGoodId || "",
+      reference: sh.reference || ""
+    };
+  });
+}
+
+/* What the stock on hand is worth, right now, by category.
+
+   Valued at each lot's own cost where that is known, falling back to the
+   item's standard cost. `estimatedLots` counts how much of the figure rests
+   on the fallback, because a valuation is a number people act on and one
+   built largely on standard cost is a different animal from one built on
+   traced lot costs.
+
+   Waste streams are valued separately and NOT folded into the total: a heap
+   of spent grounds is not working capital in the sense the other three are,
+   and adding it in would flatter the number. */
+function inventoryValuation(data, options) {
+  const opts = options || {};
+  const cache = {};
+  const CATEGORIES = [
+    { key: "raw", entity: "rawMaterials", label: "Raw material on hand" },
+    { key: "intermediate", entity: "intermediateProducts", label: "Intermediate products" },
+    { key: "finished", entity: "finishedGoods", label: "Finished goods" },
+    { key: "waste", entity: "wasteStreams", label: "Waste streams" }
+  ];
+
+  const categories = CATEGORIES.map(cat => {
+    const items = ((data && data[cat.entity]) || []).map(item => {
+      let value = 0, qty = 0, lots = 0, estimatedLots = 0;
+      (item.lots || []).forEach(lot => {
+        const q = Number(lot.qty) || 0;
+        if (q <= 0) return;                       // an empty lot is not stock
+        let unitCost, estimated;
+        if (cat.key === "raw" || cat.key === "waste") {
+          // These are bought or accrued rather than built, so the lot's own
+          // cost is the cost - there is no genealogy to roll up.
+          const own = Number(lot.unitCost);
+          unitCost = Number.isFinite(own) && own > 0 ? own : (Number(item.unitCost) || 0);
+          estimated = !(Number.isFinite(own) && own > 0);
+        } else {
+          const c = lotCost(data, cat.key, item.id, lot.id, cache);
+          unitCost = c.unitCost;
+          estimated = !!c.estimated;
+        }
+        value += unitCost * q;
+        qty += q;
+        lots += 1;
+        if (estimated) estimatedLots += 1;
+      });
+      return {
+        itemId: item.id, name: item.name || "", sku: item.sku || "",
+        unit: item.unit || "",
+        qty: Math.round(qty * 1000) / 1000,
+        value: Math.round(value * 100) / 100,
+        lots, estimatedLots
+      };
+    }).filter(r => opts.includeEmpty || r.lots > 0);
+
+    return {
+      ...cat,
+      items: items.sort((a, b) => b.value - a.value),
+      value: Math.round(items.reduce((n, r) => n + r.value, 0) * 100) / 100,
+      lots: items.reduce((n, r) => n + r.lots, 0),
+      estimatedLots: items.reduce((n, r) => n + r.estimatedLots, 0)
+    };
+  });
+
+  const byKey = {};
+  categories.forEach(c => { byKey[c.key] = c; });
+  // Waste is deliberately outside the total.
+  const stockKeys = ["raw", "intermediate", "finished"];
+  const total = Math.round(stockKeys.reduce((n, k) => n + byKey[k].value, 0) * 100) / 100;
+
+  return {
+    categories, byKey, total,
+    totalLots: stockKeys.reduce((n, k) => n + byKey[k].lots, 0),
+    estimatedLots: stockKeys.reduce((n, k) => n + byKey[k].estimatedLots, 0)
+  };
 }
 
 /* ---------------------------------------------------------------
@@ -9714,7 +9917,7 @@ export default function App() {
                  style={{ padding: "4px 10px", fontSize: 12 }}>Dismiss</Btn>
           </div>
         )}
-        {tab === "dashboard" && view === "admin" && <Dashboard data={data} setTab={setTab}
+        {tab === "dashboard" && view === "admin" && <Dashboard data={data} setTab={setTab} update={update}
             onEditTargets={() => setModal({ type: "productionTargets", id: null })} />}
         {tab === "components" && view === "admin" && (
           <ComponentsTab data={data} search={search} setSearch={setSearch}
@@ -10116,7 +10319,110 @@ function ConsumeLotModal({ data, itemType, itemId, lot, onClose, update, onLocal
 /* ---------------------------------------------------------------
    Dashboard
 ----------------------------------------------------------------*/
-function Dashboard({ data, setTab, onEditTargets }) {
+/* What the stock is worth, now and over time.
+
+   The current figure is computed; the history is not. A valuation recomputed
+   from today's data can only ever answer "what is it worth now" - lots get
+   consumed and costs get recalculated, so last month's figure is unrecoverable
+   the moment the data moves. The history is therefore read from snapshots that
+   were written down at the time, and nothing here derives it after the fact.
+   That is also why a gap in the record is shown rather than interpolated. */
+function InventoryValuationPanel({ data, update, range }) {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const val = useMemo(() => inventoryValuation(data), [data]);
+
+  const snaps = useMemo(() => ((data.inventorySnapshots) || []).slice()
+    .sort((a, b) => String(a.date).localeCompare(String(b.date))), [data]);
+  const inRange = snaps.filter(s => s.date >= range.from && s.date <= range.to);
+  const latest = snaps[snaps.length - 1] || null;
+  const today = todayStr();
+  const capturedToday = snaps.some(s => s.date === today);
+
+  const series = [
+    { key: "raw", label: "Raw material", color: "#5FA8A0" },
+    { key: "intermediate", label: "Intermediate", color: "#8FBF6F" },
+    { key: "finished", label: "Finished goods", color: "#1F6F78" }
+  ];
+  const rows = useMemo(() => bucketEvents(inRange.flatMap(s => [
+    { date: s.date, series: "raw", value: Number(s.rawValue) || 0 },
+    { date: s.date, series: "intermediate", value: Number(s.intermediateValue) || 0 },
+    { date: s.date, series: "finished", value: Number(s.finishedValue) || 0 }
+  ]), range, ["raw", "intermediate", "finished"]), [inRange, range]);
+
+  const capture = () => {
+    setBusy(true);
+    let res = null;
+    update(d => { res = tx.captureInventorySnapshot(d, { date: today, source: "manual" }); });
+    setBusy(false);
+    setMsg(res && res.ok
+      ? (res.replaced ? "Today's snapshot was replaced." : "Snapshot taken for " + fmtDate(today) + ".")
+      : ((res && res.error) || "Could not take a snapshot."));
+  };
+
+  const card = (label, value, sub) => (
+    <div key={label} style={{ background: "#fff", border: "1px solid #E2E4DD", borderRadius: 10, padding: 14 }}>
+      <div style={{ fontSize: 11.5, color: "#7A8079", fontWeight: 600, marginBottom: 6,
+                    textTransform: "uppercase", letterSpacing: 0.3 }}>{label}</div>
+      <div className="mono" style={{ fontSize: 20, fontWeight: 700, color: "#20262B" }}>{value}</div>
+      {sub && <div style={{ fontSize: 11, color: "#8A9099", marginTop: 3 }}>{sub}</div>}
+    </div>
+  );
+
+  return (
+    <div style={{ marginBottom: 20 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline",
+                    flexWrap: "wrap", gap: 10, marginBottom: 10 }}>
+        <div style={{ fontWeight: 700, fontSize: 14 }}>Inventory valuation</div>
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <span style={{ fontSize: 11.5, color: "#8A9099" }}>
+            {latest ? "Last snapshot " + fmtDate(latest.date) + " (" + (latest.source || "manual") + ")"
+                    : "No snapshots recorded yet"}
+          </span>
+          <Btn variant="secondary" onClick={capture} disabled={busy}
+            style={{ padding: "4px 10px", fontSize: 12 }}>
+            {capturedToday ? "Re-take today\u2019s snapshot" : "Take snapshot now"}
+          </Btn>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+                    gap: 12, marginBottom: 10 }}>
+        {card("Raw material on hand", fmtMoney(val.byKey.raw.value), val.byKey.raw.lots + " lot(s)")}
+        {card("Intermediate products", fmtMoney(val.byKey.intermediate.value), val.byKey.intermediate.lots + " lot(s)")}
+        {card("Finished goods", fmtMoney(val.byKey.finished.value), val.byKey.finished.lots + " lot(s)")}
+        {card("Total stock on hand", fmtMoney(val.total), "waste streams excluded")}
+      </div>
+
+      {val.estimatedLots > 0 && (
+        /* A valuation gets acted on, so how much of it rests on standard cost
+           rather than a traced lot cost travels with the number. */
+        <div style={{ background: "#FFF9EF", border: "1px solid #E8D5A8", borderRadius: 8,
+                      padding: "8px 12px", marginBottom: 10, fontSize: 11.5, color: "#7A5205" }}>
+          {val.estimatedLots} of {val.totalLots} lot(s) are valued at standard cost rather than a traced
+          lot cost — the figure is an estimate to that extent.
+        </div>
+      )}
+
+      {msg && <div style={{ fontSize: 11.5, color: "#2E7D5B", marginBottom: 8 }}>{msg}</div>}
+
+      <ChartCard
+        title="Stock value over time"
+        subtitle="From nightly snapshots, not recomputed — last month’s valuation cannot be rebuilt from today’s data, so it is only ever what was written down at the time"
+        rows={rows} series={series} formatValue={fmtMoney}
+        emptyMessage="No snapshots in this period yet — the nightly job writes one a day, and the button above takes one now"
+        footer={
+          <div style={{ fontSize: 11.5, color: "#8A9099", marginTop: 8 }}>
+            {inRange.length} snapshot(s) in this range.
+            {" "}Waste streams are valued separately and left out of the total — a heap of spent grounds is
+            not working capital in the way the other three are.
+          </div>
+        } />
+    </div>
+  );
+}
+
+function Dashboard({ data, setTab, onEditTargets, update }) {
   const tr = useTimeRange(data, "13w");
   /* Defaults to the whole plant: that is what "how did we do" means, and it
      is the scope a site-wide target is set against. Narrower scopes are one
@@ -10269,6 +10575,30 @@ function Dashboard({ data, setTab, onEditTargets }) {
   const completionUnmeasurable = completions.filter(e =>
     !e.measurable && e.date >= tr.range.from && e.date <= tr.range.to).length;
 
+  /* The same question asked of shipments rather than runs.
+
+     Worth having both: a run can finish on time and the goods still reach the
+     customer late, and it is the second one the customer experiences. Sharing
+     one card behind a toggle rather than adding another keeps the two side by
+     side, which is where the interesting gap shows up. */
+  const [dueMode, setDueMode] = useState("runs");
+  const adherence = useMemo(() => shipmentAdherenceEvents(data), [data]);
+  const shipAdherenceRows = useMemo(() => bucketEvents(
+    adherence.filter(e => e.measurable)
+      .map(e => ({ date: e.date, series: e.late ? "late" : "onTime", value: 1 })),
+    tr.range, ["onTime", "late"]), [adherence, tr.range]);
+  const shipOnTime = shipAdherenceRows.reduce((s, r) => s + r.onTime, 0);
+  const shipTotal = shipOnTime + shipAdherenceRows.reduce((s, r) => s + r.late, 0);
+  const shipUnmeasurable = adherence.filter(e =>
+    !e.measurable && e.date >= tr.range.from && e.date <= tr.range.to).length;
+  const shipWorstLate = adherence
+    .filter(e => e.measurable && e.late && e.date >= tr.range.from && e.date <= tr.range.to)
+    .reduce((n, e) => Math.max(n, e.daysLate || 0), 0);
+  const dueRows = dueMode === "runs" ? completionRows : shipAdherenceRows;
+  const dueOnTime = dueMode === "runs" ? completionOnTime : shipOnTime;
+  const dueTotal = dueMode === "runs" ? completionTotal : shipTotal;
+  const dueUnmeasurable = dueMode === "runs" ? completionUnmeasurable : shipUnmeasurable;
+
   const batchesInRange = batchRows.reduce((s, r) => s + r.batches, 0);
   const materialInRange = useMemo(() => batches
     .filter(b => b.date >= tr.range.from && b.date <= tr.range.to)
@@ -10281,14 +10611,32 @@ function Dashboard({ data, setTab, onEditTargets }) {
   const amended = inRange.filter(r => r.amended > 0).length;
   const anyScheduled = Object.values(scheduledByBucket).some(v => v > 0);
 
-  const flowSeries = [
-    { key: "raw", label: "Raw material received", color: "#5FA8A0" },
-    { key: "consumed", label: "Raw material consumed", color: "#C08A3E" }
-  ];
-  const flowRows = useMemo(() => bucketEvents(
-    receiptEvents(data).concat(
-      consumptionEvents(data).filter(e => e.series === "raw").map(e => ({ ...e, series: "consumed" }))
-    ), tr.range, ["raw", "consumed"]), [data, tr.range]);
+  /* Raw material flow, one material at a time.
+
+     Every raw material at once was the default and is close to useless: the
+     bar adds kilogrammes of green coffee to metres of sachet film to litres of
+     nitrogen, so the height has no unit and means nothing. Narrowing to one
+     material gives a figure with a unit on it, which is the version anyone
+     can act on. */
+  const [rawScopeId, setRawScopeId] = useState("");
+  const rawOptions = useMemo(() => (data.rawMaterials || []).slice()
+    .sort((a, b) => String(a.name).localeCompare(String(b.name))), [data]);
+  const rawScope = rawOptions.find(r => r.id === rawScopeId) || null;
+
+  const flowSeries = useMemo(() => [
+    { key: "raw", label: rawScope ? "Received (" + (rawScope.unit || "units") + ")" : "Raw material received", color: "#5FA8A0" },
+    { key: "consumed", label: rawScope ? "Consumed (" + (rawScope.unit || "units") + ")" : "Raw material consumed", color: "#C08A3E" }
+  ], [rawScope]);
+
+  const flowRows = useMemo(() => {
+    const received = receiptEvents(data)
+      .filter(e => !rawScopeId || e.itemId === rawScopeId);
+    const consumed = consumptionEvents(data)
+      .filter(e => e.series === "raw")
+      .filter(e => !rawScopeId || e.itemId === rawScopeId)
+      .map(e => ({ ...e, series: "consumed" }));
+    return bucketEvents(received.concat(consumed), tr.range, ["raw", "consumed"]);
+  }, [data, tr.range, rawScopeId]);
 
   const lowStock = data.rawMaterials.filter(r => lotQty(r.lots) <= r.reorderPoint);
   const certIssues = data.rawMaterials.filter(r => r.certStatus === "Expired" || r.certStatus === "Pending review");
@@ -10411,6 +10759,8 @@ function Dashboard({ data, setTab, onEditTargets }) {
           </>
         )}
       </div>
+
+      <InventoryValuationPanel data={data} update={update} range={tr.range} />
 
       {earliestOverdue && (
         <div style={{ background: "#F3DBD6", border: "1px solid #E3B9B2", borderRadius: 10, padding: "12px 16px", marginBottom: 14, display: "flex", alignItems: "center", gap: 10, color: "#8A2E20", fontSize: 13.5 }}>
@@ -10570,25 +10920,67 @@ function Dashboard({ data, setTab, onEditTargets }) {
         } />
 
       <ChartCard
-        title="Completions against due date"
-        subtitle="Runs completed in each period, split by whether they made their committed date. Only frozen runs are counted \u2014 an unfrozen due date may have been moved to match."
-        rows={completionRows} series={completionSeries}
-        emptyMessage="No runs were completed in this period"
+        title={dueMode === "runs" ? "Completions against due date" : "Shipments against due date"}
+        subtitle={dueMode === "runs"
+          ? "Runs completed in each period, split by whether they made their committed date. Only frozen runs are counted \u2014 an unfrozen due date may have been moved to match."
+          : "Shipments despatched in each period against the date promised to the customer \u2014 the committed date on the sales order line where there is one, the run's frozen baseline otherwise."}
+        rows={dueRows} series={completionSeries}
+        emptyMessage={dueMode === "runs"
+          ? "No runs were completed in this period"
+          : "Nothing was shipped in this period"}
+        action={
+          <div style={{ display: "flex", gap: 4 }}>
+            {[["runs", "Runs"], ["shipments", "Shipments"]].map(([k, label]) => (
+              <div key={k} role="button" tabIndex={0} onClick={() => setDueMode(k)}
+                onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setDueMode(k); } }}
+                style={{
+                  padding: "4px 10px", fontSize: 11.5, fontWeight: 600, cursor: "pointer", borderRadius: 6,
+                  background: dueMode === k ? "#1F6F78" : "#fff",
+                  color: dueMode === k ? "#fff" : "#5B6470",
+                  border: "1px solid " + (dueMode === k ? "#1F6F78" : "#D7DAD3")
+                }}>{label}</div>
+            ))}
+          </div>
+        }
         footer={
           <div style={{ fontSize: 12, color: "#7A8079", marginTop: 8 }}>
-            {completionTotal > 0
-              ? Math.round((completionOnTime / completionTotal) * 100) + "% of " +
-                completionTotal + " completed run(s) hit their date."
-              : "No completed runs in this range."}
-            {completionUnmeasurable > 0 &&
-              " " + completionUnmeasurable + " completion(s) excluded as the run was never frozen."}
+            {dueTotal > 0
+              ? Math.round((dueOnTime / dueTotal) * 100) + "% of " + dueTotal + " " +
+                (dueMode === "runs" ? "completed run(s) hit their date." : "shipment(s) went out on time.")
+              : dueMode === "runs" ? "No completed runs in this range." : "Nothing shipped in this range."}
+            {dueMode === "shipments" && shipWorstLate > 0 &&
+              " Worst was " + shipWorstLate + " day(s) late."}
+            {dueUnmeasurable > 0 && (dueMode === "runs"
+              ? " " + dueUnmeasurable + " completion(s) excluded as the run was never frozen."
+              : " " + dueUnmeasurable + " shipment(s) excluded \u2014 no promised date could be traced, so they are counted but never scored.")}
           </div>
         } />
+
       <ChartCard
         title="Raw material flow"
-        subtitle="Received against consumed — consumption is dated from the batch that drew it"
+        subtitle={rawScope
+          ? "Received against consumed for " + rawScope.name + ", in " + (rawScope.unit || "units")
+          : "Received against consumed, every raw material added together \u2014 pick one to make the numbers mean something"}
         rows={flowRows} series={flowSeries}
-        emptyMessage="No raw material movement in this period" />
+        emptyMessage="No raw material movement in this period"
+        action={
+          <select style={{ ...inputStyle, width: "auto", maxWidth: 260 }} value={rawScopeId}
+            onChange={e => setRawScopeId(e.target.value)}>
+            <option value="">All raw materials (mixed units)</option>
+            {rawOptions.map(r => (
+              <option key={r.id} value={r.id}>{r.name}{r.unit ? " (" + r.unit + ")" : ""}</option>
+            ))}
+          </select>
+        }
+        footer={!rawScope ? (
+          /* The reason this chart was not useful: it adds kilogrammes of green
+             coffee to metres of sachet film to litres of nitrogen. The total
+             has no unit and therefore no meaning. */
+          <div style={{ fontSize: 11.5, color: "#7A5205", marginTop: 8 }}>
+            Every raw material at once means several units of measure in one bar \u2014 kilogrammes, metres
+            and litres added together. Useful as a shape; pick a material for a figure you can act on.
+          </div>
+        ) : null} />
     </div>
   );
 }

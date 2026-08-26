@@ -43,6 +43,7 @@ through the phase notes below and easy to lose.
 
 | # | Item | Needs |
 |---|---|---|
+| B | **The nightly valuation snapshot fires at 23:59 UTC.** `vercel.json` sets `59 23 * * *`, and Vercel crons only run on UTC. | The plant's timezone. "11:59 pm local" is a different instant, and for anywhere west of UTC a different *date* — which shifts a day's movement into the wrong bucket rather than losing it, but is still wrong. Tell me the timezone and I will set the cron offset. Also worth deciding: Vercel's Hobby plan runs crons **once a day at an approximate time**, so if the exact minute matters the project needs to be on Pro. |
 | A | **"Semi-finished goods" as a fifth material category.** Not built — see `docs/SEMI-FINISHED-GOODS.md`. The capability already exists (bulk = an intermediate product; packing = a process), so the fifth `itemType` would buy a label at the cost of widening the polymorphic surface everywhere. A `stage` flag on intermediate products is the cheap version, under an hour. | Five questions in that doc — chiefly whether a semi-finished good can be **sold as-is**, and whether anything needs to **report on it separately**. Either would justify the type; a labelling preference would not. |
 
 ### Design notes to preserve (so they are not "fixed" by mistake)

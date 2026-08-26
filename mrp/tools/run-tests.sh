@@ -30,7 +30,7 @@ echo "=== logic suites ==="
 TOTAL=0; FAILED=0
 for t in schema data-layer csv-codec timeseries scheduler calendar \
          plan-freeze cost purchasing reconciliation sales-orders held-stock packaging \
-         purchase-planning receipt-apply material-flow batch-runs sales-linking product-families; do
+         purchase-planning receipt-apply material-flow batch-runs sales-linking product-families dashboard; do
   R=$(node "$MRP_ROOT/test/$t.test.mjs" 2>&1 | grep -E "^ *[0-9]+ passed, [0-9]+ failed")
   printf "  %-22s%s\n" "$t" "$R"
   P=$(echo "$R" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+')
