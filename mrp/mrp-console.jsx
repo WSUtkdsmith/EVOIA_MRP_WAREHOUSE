@@ -6760,6 +6760,78 @@ function plannedProductionSplit(data) {
   };
 }
 
+/* One flattened row per production run, for the run list.
+
+   Everything the list sorts, filters or searches on is resolved once here
+   rather than re-walked per comparison - and, more to the point, the
+   resolution is not obvious enough to leave inline in a component:
+
+   - Planned start and completion come from the CAPACITY PLAN, not the run.
+     A run records the date it is DUE; when the work actually lands depends on
+     what is queued in front of it on the same machines. The plan covers open
+     runs only, so a completed or cancelled run has no planned dates. That is
+     right rather than a gap: back-filling a forward-looking plan for
+     something already finished would invent a schedule that never existed.
+
+   - A run can serve several sales orders, and those need not share a
+     customer. So the customer is ANY of them plus whoever the run itself
+     names; matching on one and missing the others would quietly hide runs
+     that genuinely belong to that customer.
+
+   - Family tags live on finished goods, so a run making an intermediate has
+     none and can never match a family filter. The caller has to say so rather
+     than let someone conclude the runs vanished. */
+function runListRows(data, plan) {
+  const db = data && typeof data === "object" ? data : {};
+  const split = plannedProductionSplit(db);
+
+  const plannedById = {};
+  ((plan && plan.rows) || []).forEach(r => {
+    if (r && r.entry && r.entry.id) {
+      plannedById[r.entry.id] = {
+        start: r.start || "", end: r.end || "",
+        unplaceable: !!r.unplaceable, late: !!r.late, lateDays: r.lateDays || 0
+      };
+    }
+  });
+
+  return (db.schedule || []).filter(Boolean).map(entry => {
+    const orders = split.linked[entry.id] || [];
+    const item = entry.productType === "finished" ? getFinished(db, entry.productId) : null;
+    const fams = item ? familiesOf(db, item) : [];
+    const planned = plannedById[entry.id] || null;
+
+    const customerIds = [];
+    if (entry.customerId) customerIds.push(entry.customerId);
+    orders.forEach(o => {
+      const so = (db.salesOrders || []).find(x => x && x.id === o.orderId);
+      if (so && so.customerId && customerIds.indexOf(so.customerId) === -1) customerIds.push(so.customerId);
+    });
+
+    return {
+      entry,
+      reference: entry.reference || "",
+      productName: productName(db, entry),
+      qty: Number(entry.qty) || 0,
+      dueDate: entry.dueDate || "",
+      status: entry.status || "",
+      createdDate: entry.createdDate || "",
+      plannedStart: planned ? planned.start : "",
+      plannedEnd: planned ? planned.end : "",
+      plannedLate: planned ? planned.late : false,
+      plannedLateDays: planned ? planned.lateDays : 0,
+      unplaceable: planned ? planned.unplaceable : false,
+      customerIds,
+      customerName: customerIds.map(id => (getCustomer(db, id) || {}).name || "")
+        .filter(Boolean).join(", "),
+      familyIds: fams.map(f => f.id),
+      familyNames: fams.map(f => f.name).join(", "),
+      orderRefs: orders.map(o => o.reference).join(", "),
+      assigned: orders.length > 0
+    };
+  });
+}
+
 /* Which sales order lines a run is filling, if any. */
 function ordersForRun(data, runId) {
   const out = [];
@@ -15164,15 +15236,21 @@ const RUN_STATUSES = ["Planned", "In progress", "Complete", "Cancelled"];
 
 const RUN_SORT_COLUMNS = [
   { key: "dueDate", label: "Due date", kind: "str" },
+  // From the capacity plan rather than the run record: when the work actually
+  // lands depends on what is queued in front of it, not on when it is due.
+  { key: "plannedStart", label: "Planned start", kind: "str" },
+  { key: "plannedEnd", label: "Planned completion", kind: "str" },
   { key: "reference", label: "Run number", kind: "str" },
   { key: "productName", label: "Product", kind: "str" },
+  { key: "familyNames", label: "Product family", kind: "str" },
   { key: "qty", label: "Quantity", kind: "num" },
   { key: "status", label: "Status", kind: "str" },
   { key: "customerName", label: "Customer", kind: "str" },
   { key: "orderRefs", label: "Sales order", kind: "str" },
   { key: "createdDate", label: "Raised", kind: "str" }
 ];
-const RUN_SEARCH_FIELDS = ["reference", "productName", "status", "customerName", "orderRefs"];
+const RUN_SEARCH_FIELDS = ["reference", "productName", "status", "customerName",
+                           "orderRefs", "familyNames"];
 
 /* What the bars and flags on a run actually mean.
 
@@ -15229,44 +15307,32 @@ function ScheduleTab({ data, onAdd, onEdit, onDelete, readOnly, onEditHours, onF
   const layout = tabKey === "scheduleList" ? "list" : "calendar";
   const [statusFilter, setStatusFilter] = useState("");
   const [assignFilter, setAssignFilter] = useState("");
+  const [familyFilter, setFamilyFilter] = useState("");
+  const [customerFilter, setCustomerFilter] = useState("");
+  const familyDims = useMemo(() => familyDimensions(data), [data]);
+  const customerOptions = useMemo(() => (data.customers || []).slice()
+    .sort((a, b) => String(a.name).localeCompare(String(b.name))), [data]);
 
-  // One flattened row per run, carrying everything the list sorts, filters or
-  // searches on. Derived once so sorting is comparing values rather than
-  // re-walking the sales orders for every comparison.
-  const split = useMemo(() => plannedProductionSplit(data), [data]);
-  const runRows = useMemo(() => (data.schedule || []).map(entry => {
-    const orders = (split.linked[entry.id] || []);
-    return {
-      entry,
-      reference: entry.reference || "",
-      productName: productName(data, entry),
-      qty: Number(entry.qty) || 0,
-      dueDate: entry.dueDate || "",
-      status: entry.status || "",
-      createdDate: entry.createdDate || "",
-      customerName: entry.customerId
-        ? ((getCustomer(data, entry.customerId) || {}).name || "") : "",
-      orderRefs: orders.map(o => o.reference).join(", "),
-      assigned: orders.length > 0
-    };
-  }), [data, split]);
+  const [scaleByBatch, setScaleByBatch] = useState(false);
+  const plan = useMemo(
+    () => planScheduleFIFO(data, { scaleByBatch }),
+    [data, scaleByBatch]);
+
+  const runRows = useMemo(() => runListRows(data, plan), [data, plan]);
 
   const scoped = useMemo(() => runRows.filter(r =>
     (!statusFilter || r.status === statusFilter) &&
-    (!assignFilter || (assignFilter === "assigned" ? r.assigned : !r.assigned))
-  ), [runRows, statusFilter, assignFilter]);
+    (!assignFilter || (assignFilter === "assigned" ? r.assigned : !r.assigned)) &&
+    (!familyFilter || r.familyIds.indexOf(familyFilter) !== -1) &&
+    (!customerFilter || r.customerIds.indexOf(customerFilter) !== -1)
+  ), [runRows, statusFilter, assignFilter, familyFilter, customerFilter]);
 
   const listView = useListView(scoped, {
     columns: RUN_SORT_COLUMNS, fields: RUN_SEARCH_FIELDS,
     initialSort: { key: "dueDate", dir: "asc" }
   });
   const [calMode, setCalMode] = useState("plan");
-  const [scaleByBatch, setScaleByBatch] = useState(false);
   const [month, setMonth] = useState(() => todayStr().slice(0, 7));
-
-  const plan = useMemo(
-    () => planScheduleFIFO(data, { scaleByBatch }),
-    [data, scaleByBatch]);
 
   const monthBatchCount = useMemo(() => {
     if (calMode !== "actual") return 0;
@@ -15411,7 +15477,34 @@ function ScheduleTab({ data, onAdd, onEdit, onDelete, readOnly, onEditHours, onF
             <option value="assigned">Against a sales order</option>
             <option value="unassigned">Not against an order</option>
           </select>
+          {/* Families are grouped by axis, so Blend and Pack do not read as one
+              flat list of unrelated options. */}
+          <select style={{ ...inputStyle, width: "auto", minWidth: 150 }} value={familyFilter}
+            onChange={e => setFamilyFilter(e.target.value)}>
+            <option value="">All product families</option>
+            {familyDims.map(d => (
+              <optgroup key={d.dimension} label={d.dimension}>
+                {d.families.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
+              </optgroup>
+            ))}
+          </select>
+          <select style={{ ...inputStyle, width: "auto", minWidth: 150 }} value={customerFilter}
+            onChange={e => setCustomerFilter(e.target.value)}>
+            <option value="">All customers</option>
+            {customerOptions.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
         </ListToolbar>
+
+        {/* Family tags live on finished goods, so a family filter can never
+            match a run making an intermediate. Saying so beats letting someone
+            conclude the runs have vanished. */}
+        {familyFilter && runRows.some(r => r.entry.productType !== "finished") && (
+          <div style={{ fontSize: 11.5, color: "#7A5205", background: "#FFF9EF",
+                        border: "1px solid #E8D5A8", borderRadius: 8, padding: "6px 10px" }}>
+            Product families are tagged on finished goods, so runs making intermediate products are
+            excluded while a family filter is on.
+          </div>
+        )}
 
         <ScheduleLegend />
 
@@ -15454,7 +15547,33 @@ function ScheduleTab({ data, onAdd, onEdit, onDelete, readOnly, onEditHours, onF
                     {(entry.revisions || []).length > 0 &&
                       <Badge tone="warn">{entry.revisions.length} amendment(s)</Badge>}
                   </div>
+                  {/* Planned start and completion sit on their own line: they
+                      come from the capacity plan, not from the run, and mixing
+                      them in with the due date would blur that. */}
                   <div style={{ fontSize: 12, color: "#7A8079", marginTop: 4 }}>
+                    <span style={{ color: "#8A9099" }}>Planned </span>
+                    {row.plannedStart
+                      ? <>
+                          <span className="mono" style={{ fontWeight: 600 }}>{fmtDate(row.plannedStart)}</span>
+                          <span style={{ color: "#8A9099" }}> → </span>
+                          <span className="mono" style={{ fontWeight: 600,
+                                  color: row.plannedLate ? "#8A2E20" : "#20262B" }}>
+                            {fmtDate(row.plannedEnd)}
+                          </span>
+                          {row.plannedLate && <span style={{ color: "#8A2E20" }}> · {row.plannedLateDays}d past due</span>}
+                        </>
+                      : row.unplaceable
+                        ? <span style={{ color: "#8A2E20" }}>cannot be placed within the horizon</span>
+                        : <span style={{ color: "#A6ABA2" }}>
+                            — {entry.status === "Complete" || entry.status === "Cancelled"
+                                ? "closed runs are not in the forward plan"
+                                : "not in the current capacity plan"}
+                          </span>}
+                    {row.familyNames && (
+                      <span style={{ color: "#8A9099" }}> · {row.familyNames}</span>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 12, color: "#7A8079", marginTop: 2 }}>
                     Quantity <span className="mono">{fmtNum(entry.qty)}</span> · due <span className="mono">{fmtDate(entry.dueDate)}</span>
                     {earliestOrderBy && <span> · order raw materials by <span className="mono" style={{ fontWeight: 700, color: overdue ? "#8A2E20" : "#20262B" }}>{fmtDate(earliestOrderBy)}</span></span>}
                     {unitPrice != null && <span> · est. revenue <span className="mono" style={{ fontWeight: 700 }}>{fmtMoney(unitPrice * entry.qty)}</span></span>}

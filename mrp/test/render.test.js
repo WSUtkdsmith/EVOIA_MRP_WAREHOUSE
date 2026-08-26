@@ -1290,6 +1290,21 @@ console.log('\n--- the run list reads on its own ---');
   ok('and can be filtered by that', lh.includes('Not against an order'));
   ok('and by status', lh.includes('All statuses'));
 
+  // Added on review: a planner narrows by what is being made and who for.
+  ok('by product family, grouped by axis',
+     lh.includes('All product families') && lh.includes('Premium Reserve'));
+  ok('the family axes are the optgroups, not a flat list',
+     lh.includes('<optgroup label="Blend"') || lh.includes('label="Blend"'));
+  ok('and by customer', lh.includes('All customers'));
+
+  // Planned start and completion come from the capacity plan, not the run.
+  ok('planned start and completion can be sorted on',
+     lh.includes('Planned start') && lh.includes('Planned completion'));
+  ok('and are shown on the row', lh.includes('>Planned <') || lh.includes('Planned '));
+  ok('a closed run says why it has no planned dates rather than showing blanks',
+     lh.includes('closed runs are not in the forward plan') ||
+     lh.includes('not in the current capacity plan'));
+
   const cal = tryRender('sl2', React.createElement(A.ScheduleTab, {
     data: D7, tabKey: 'schedule', onAdd: noop, onEdit: noop, onDelete: noop }));
   const ch = (cal.html || '').replace(/<!-- -->/g, '');

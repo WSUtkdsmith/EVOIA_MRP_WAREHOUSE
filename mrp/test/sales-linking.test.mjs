@@ -10,6 +10,7 @@
 import { seedData, tx, repo, sortRows, filterRows, compareBy,
          plannedProductionSplit, ordersForRun, linkableRunsForLine,
          nextRunReference, nextSalesOrderReference, backfillRunReferences,
+         runListRows, planScheduleFIFO, familiesOf,
          normalizeData } from '/tmp/core.mjs';
 
 let pass = 0, fail = 0;
@@ -241,6 +242,76 @@ console.log('\n--- what can be linked ---');
   ok('soonest due first — that is nearly always the one being looked for',
      linkableRunsForLine(D, fg.id)[0].id === soon.id);
   ok('an unknown product offers nothing', linkableRunsForLine(D, 'nope').length === 0);
+}
+
+console.log('\n--- the run list rows ---');
+{
+  const D = seedData();
+  const plan = planScheduleFIFO(D);
+  const rows = runListRows(D, plan);
+  ok('one row per run', rows.length === (D.schedule || []).length);
+  ok('each carries its run number', rows.every(r => typeof r.reference === 'string'));
+  ok('and the product it makes', rows.every(r => !!r.productName));
+
+  // Planned dates come from the capacity plan, not the run record: a run
+  // stores when it is DUE, and when the work lands depends on the queue.
+  const planned = rows.filter(r => r.plannedStart);
+  ok('open runs pick up a planned start', planned.length > 0);
+  ok('and a planned completion', planned.every(r => !!r.plannedEnd));
+  ok('which is not before the start', planned.every(r => r.plannedEnd >= r.plannedStart));
+  ok('and is genuinely different from the due date on at least some runs',
+     planned.some(r => r.plannedEnd !== r.dueDate),
+     'otherwise the plan would just be echoing the due date');
+
+  // Back-filling a forward-looking plan for something already finished would
+  // invent a schedule that never existed.
+  const closed = rows.filter(r => r.status === 'Complete' || r.status === 'Cancelled');
+  ok('closed runs have no planned dates', closed.every(r => !r.plannedStart && !r.plannedEnd));
+
+  ok('finished-goods runs carry their product families',
+     rows.some(r => r.familyIds.length > 0));
+  ok('and the names are resolved for searching',
+     rows.filter(r => r.familyIds.length).every(r => !!r.familyNames));
+  // Family tags live on finished goods only.
+  ok('an intermediate run has no families',
+     rows.filter(r => r.entry.productType === 'intermediate').every(r => r.familyIds.length === 0));
+
+  ok('no plan at all still produces rows', runListRows(D, null).length === rows.length);
+  ok('with no planned dates', runListRows(D, null).every(r => !r.plannedStart));
+  ok('null data does not throw', runListRows(null, plan).length === 0);
+}
+
+// A run can serve several sales orders, and those need not share a customer.
+{
+  const { D, cust, fg } = plant();
+  const other = D.customers[1];
+  const r = run(D, fg);
+  ok('a run with no customer and no orders lists none',
+     runListRows(D, null)[0].customerIds.length === 0);
+
+  r.customerId = cust.id;
+  ok('the run’s own customer counts', runListRows(D, null)[0].customerIds.indexOf(cust.id) !== -1);
+
+  const o = tx.raiseSalesOrder(D, { customerId: other.id, submit: true,
+    lines: [{ finishedGoodId: fg.id, qty: 10 }] }).order;
+  tx.reviewSalesOrderLine(D, { salesOrderId: o.id, lineId: o.lines[0].id, decision: 'Accept' });
+  tx.linkSalesOrderLineToRun(D, { salesOrderId: o.id, lineId: o.lines[0].id, scheduleId: r.id });
+
+  const row = runListRows(D, null)[0];
+  ok('a customer reached only through a linked order counts too',
+     row.customerIds.indexOf(other.id) !== -1,
+     'filtering on the run’s own customer alone would hide this run from them');
+  ok('both customers are listed', row.customerIds.length === 2);
+  ok('and named, so the row is searchable',
+     row.customerName.includes(cust.name) && row.customerName.includes(other.name));
+
+  // The same customer twice is still one customer.
+  const o2 = tx.raiseSalesOrder(D, { customerId: other.id, submit: true,
+    lines: [{ finishedGoodId: fg.id, qty: 5 }] }).order;
+  tx.reviewSalesOrderLine(D, { salesOrderId: o2.id, lineId: o2.lines[0].id, decision: 'Accept' });
+  tx.linkSalesOrderLineToRun(D, { salesOrderId: o2.id, lineId: o2.lines[0].id, scheduleId: r.id });
+  ok('a customer on two orders is not listed twice',
+     runListRows(D, null)[0].customerIds.length === 2);
 }
 
 console.log('\n--- sorting, shared by every list ---');
