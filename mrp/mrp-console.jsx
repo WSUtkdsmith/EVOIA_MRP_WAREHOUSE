@@ -751,7 +751,26 @@ const SCHEMA = {
       supplier: "str", orderDate: "date!",
       expectedDate: "date!",
       status: "enum:Draft|Ordered|Part received|Received|Cancelled!",
-      notes: "str"
+      notes: "str",
+      /* What the supplier actually billed.
+
+         The order is what we asked for at the price we agreed. The invoice
+         is what arrived on paper, and the two disagree often enough that
+         pretending otherwise is how a margin quietly goes wrong. So the
+         invoice sits ALONGSIDE the order rather than on top of it: nothing
+         here overwrites an ordered price, and every figure below can be
+         removed again leaving the order exactly as it was placed.
+
+         `invoiceVariance` is the operator saying the billed prices differ.
+         It gates the per-line actual costs and nothing else - charges are
+         real whether or not the material prices matched. */
+      invoiceVariance: "bool",
+      invoiceRef: "str", invoiceDate: "date", invoiceNotes: "str",
+      /* How non-material charges are spread to get a landed unit cost.
+         "perUnit" divides them evenly across the units on the order, which
+         is only arithmetic when those units are the same thing; "byValue"
+         apportions on line value, which always is. See landedCost. */
+      chargeBasis: "enum:perUnit|byValue"
     },
     embeds: {},
     children: {
@@ -768,7 +787,15 @@ const SCHEMA = {
         table: "purchase_order_lines", fk: "purchaseOrderId", pk: "id",
         columns: {
           id: "str", rawMaterialId: "ref:rawMaterials!", qty: "num!",
-          unitCost: "num", packagingId: "str", containerCount: "num", notes: "str"
+          unitCost: "num", packagingId: "str", containerCount: "num", notes: "str",
+          /* What this line was actually billed at, per unit. Deliberately
+             separate from unitCost, which stays the ordered price forever.
+
+             Blank is not zero: blank means no invoice figure was given for
+             this line and the ordered price stands. The CSV codec preserves
+             "" on a num column, so that distinction survives a round trip -
+             a zero here would claim the supplier billed nothing. */
+          actualUnitCost: "num"
         }
       },
       // Deliveries land in instalments more often than not, so receipts are
@@ -778,6 +805,25 @@ const SCHEMA = {
         table: "purchase_receipts", fk: "purchaseOrderId", pk: "id",
         columns: { id: "str", lineId: "str", date: "date!", qty: "num!", lotId: "str", notes: "str" },
         lotRefs: { lotId: { companion: "lotNumber" } }
+      },
+      /* What the delivery cost beyond the material itself.
+
+         Freight, duty and tax are real money against the same stock, and
+         leaving them off the order means every unit cost in the system is
+         understated by whatever it took to get the pallet here. They are
+         charges on the ORDER, not on a line: a single freight bill covers
+         the truck, not one material on it, so splitting it at entry would
+         be inventing a precision the invoice does not have. landedCost is
+         what does the splitting, and it says which basis it used.
+
+         "Other" has to say what it is. A charge nobody can identify later
+         is indistinguishable from a keying error. */
+      charges: {
+        table: "purchase_order_charges", fk: "purchaseOrderId", pk: "id",
+        columns: {
+          id: "str", kind: "enum:Tax|Shipping|Handling|Other!",
+          description: "str", amount: "num!", date: "date", notes: "str"
+        }
       },
       /* Append-only, exactly as a frozen run's revisions are. A placed order
          is a commitment the supplier holds, so changing one after the fact is
@@ -1553,7 +1599,7 @@ const IMPORT_ORDER = [
   "equipment", "customers", "waste_streams", "processes",
   "composition", "packagings", "process_inputs", "process_equipment", "process_outputs",
   "maintenance", "production_targets", "purchase_orders", "purchase_order_lines",
-  "purchase_order_revisions", "warehouse_receipts",
+  "purchase_order_charges", "purchase_order_revisions", "warehouse_receipts",
   // Families before family_tags, and family_tags after finished_goods: a tag
   // points at both. This list is hand-maintained and has bitten us twice.
   "product_families", "family_tags", "inventory_snapshots",
@@ -2943,6 +2989,96 @@ const tx = {
     // stored status is re-derived rather than left to drift.
     if (po.status !== "Cancelled") po.status = poDerivedStatus(po);
     return { ok: true, po, changed: Array.from(new Set(changed)) };
+  },
+
+  /* Record what the supplier actually billed.
+
+     Deliberately not part of amendPurchaseOrder. An amendment changes what
+     we asked for; this changes nothing about the order at all. The order
+     stays exactly as placed - same lines, same agreed prices - and the
+     invoice is written beside it. That is the whole design constraint: an
+     actual cost must never overwrite an ordered one, or the variance it
+     was entered to show stops existing the moment it is entered.
+
+     `invoiceVariance` gates only the per-line prices. Untick it and those
+     prices are cleared, because a line claiming to be billed differently
+     on an invoice that matches is a contradiction. Charges are independent
+     of it - freight is owed whether or not the material prices agreed.
+
+     A draft has not been sent to anyone, so nobody can have invoiced it.
+     A cancelled order should not be accruing cost either. Everything from
+     Ordered onward can be, including a fully received one - the invoice
+     almost always arrives after the goods. */
+  recordPurchaseCosts(db, { purchaseOrderId, invoiceVariance, invoiceRef, invoiceDate,
+                            invoiceNotes, chargeBasis, lineCosts, charges }) {
+    const po = repo.find(db, "purchaseOrders", purchaseOrderId);
+    if (!po) return { ok: false, error: "That purchase order no longer exists." };
+    if (po.status === "Draft") {
+      return { ok: false, error: "A draft has not been sent to anyone, so it cannot have been invoiced." };
+    }
+    if (po.status === "Cancelled") {
+      return { ok: false, error: "A cancelled order cannot take invoice costs." };
+    }
+
+    const differs = !!invoiceVariance;
+    const lines = poLines(po);
+    const byId = {};
+    lines.forEach(l => { byId[l.id] = l; });
+
+    // Validate everything before writing anything, so a rejected invoice
+    // leaves the order carrying no half of it.
+    const costs = [];
+    if (differs) {
+      for (const entry of (lineCosts || [])) {
+        if (!entry) continue;
+        const line = byId[entry.lineId];
+        if (!line) return { ok: false, error: "That order has no line " + entry.lineId + "." };
+        const v = entry.actualUnitCost;
+        // Clearing one line's figure is allowed and is not an error - the
+        // rest of the invoice may still differ.
+        if (v === "" || v === null || v === undefined) { costs.push({ line, value: "" }); continue; }
+        const n = Number(v);
+        if (!Number.isFinite(n)) return { ok: false, error: "An invoiced cost has to be a number." };
+        if (n < 0) return { ok: false, error: "An invoiced cost cannot be negative." };
+        costs.push({ line, value: n });
+      }
+    }
+
+    const cleanCharges = [];
+    for (const c of (charges || [])) {
+      if (!c) continue;
+      const amount = Number(c.amount) || 0;
+      if (amount === 0) continue;   // an empty row someone abandoned
+      if (amount < 0) return { ok: false, error: "A charge cannot be negative. Remove it instead." };
+      const kind = PO_CHARGE_KINDS.indexOf(c.kind) >= 0 ? c.kind : "Other";
+      const description = String(c.description || "").trim();
+      // The explanation is the only thing that makes an "Other" charge
+      // auditable later, so it is required rather than encouraged.
+      if (kind === "Other" && !description) {
+        return { ok: false, error: "An \"Other\" charge has to say what it is." };
+      }
+      cleanCharges.push({
+        id: c.id || uid(), kind, description,
+        amount, date: c.date || "", notes: c.notes || ""
+      });
+    }
+
+    po.invoiceVariance = differs;
+    po.invoiceRef = invoiceRef || "";
+    po.invoiceDate = invoiceDate || "";
+    po.invoiceNotes = invoiceNotes || "";
+    if (chargeBasis !== undefined) po.chargeBasis = chargeBasis === "byValue" ? "byValue" : "perUnit";
+    if (!po.chargeBasis) po.chargeBasis = "perUnit";
+    po.charges = cleanCharges;
+
+    if (differs) {
+      costs.forEach(({ line, value }) => { line.actualUnitCost = value; });
+    } else {
+      // The claim has been withdrawn, so the figures behind it go with it.
+      lines.forEach(l => { l.actualUnitCost = ""; });
+    }
+
+    return { ok: true, po, landed: landedCost(db, po) };
   },
 
   /* Cancel an order. A cancelled order stops counting toward cover and
@@ -5093,7 +5229,10 @@ function normalizePurchaseOrders(list) {
       id: l.id || uid(), rawMaterialId: l.rawMaterialId || "",
       qty: Number(l.qty) || 0, unitCost: Number(l.unitCost) || 0,
       packagingId: l.packagingId || "", containerCount: Number(l.containerCount) || 0,
-      notes: l.notes || ""
+      notes: l.notes || "",
+      // Blank stays blank. `Number(l.actualUnitCost) || 0` here would turn
+      // "never invoiced" into "billed at nothing" on every load.
+      actualUnitCost: hasActualCost(l) ? Number(l.actualUnitCost) : ""
     }));
     const firstLineId = lines.length ? lines[0].id : "";
     const next = {
@@ -5103,6 +5242,15 @@ function normalizePurchaseOrders(list) {
       receipts: (Array.isArray(po.receipts) ? po.receipts : []).map(r => ({
         id: r.id || uid(), lineId: r.lineId || firstLineId, date: r.date || "",
         qty: Number(r.qty) || 0, lotId: r.lotId || "", notes: r.notes || ""
+      })),
+      invoiceVariance: !!po.invoiceVariance,
+      invoiceRef: po.invoiceRef || "", invoiceDate: po.invoiceDate || "",
+      invoiceNotes: po.invoiceNotes || "",
+      chargeBasis: po.chargeBasis === "byValue" ? "byValue" : "perUnit",
+      charges: (Array.isArray(po.charges) ? po.charges : []).map(c => ({
+        id: c.id || uid(), kind: c.kind || "Other",
+        description: c.description || "", amount: Number(c.amount) || 0,
+        date: c.date || "", notes: c.notes || ""
       })),
       revisions: Array.isArray(po.revisions) ? po.revisions : []
     };
@@ -6331,6 +6479,148 @@ function poLines(po) {
   return (po && po.lines) || [];
 }
 
+/* Whether a line carries an invoiced price at all.
+
+   The distinction this exists to protect: a line with no invoice figure is
+   not a line billed at zero. Blank, null, undefined and a non-numeric string
+   all mean "not invoiced"; only a real number counts. Zero itself IS a
+   figure - a supplier can bill nothing for a line they shipped free - so it
+   passes. */
+function hasActualCost(line) {
+  if (!line) return false;
+  const v = line.actualUnitCost;
+  if (v === "" || v === null || v === undefined) return false;
+  return Number.isFinite(Number(v));
+}
+
+/* The price a line is actually costed at: what was billed if we know, what
+   was ordered if we do not. Never reaches into unitCost to change it. */
+function poLineEffectiveUnitCost(po, line) {
+  if (po && po.invoiceVariance && hasActualCost(line)) return Number(line.actualUnitCost);
+  return Number(line && line.unitCost) || 0;
+}
+
+const PO_CHARGE_KINDS = ["Tax", "Shipping", "Handling", "Other"];
+
+function poCharges(po) {
+  return (po && po.charges) || [];
+}
+
+function poChargeTotal(po) {
+  return poCharges(po).reduce((s, c) => s + (Number(c.amount) || 0), 0);
+}
+
+/* Landed cost: what a unit of this order really costs once the supplier's
+   invoice and the charges to get it here are both counted.
+
+   Three figures are kept apart on purpose, because collapsing them is how
+   the reason for a variance disappears:
+
+     ordered   - qty x the price we agreed. Never moves.
+     invoiced  - qty x the price we were billed. Falls back to ordered per
+                 line, so a partly-invoiced order is not half zero.
+     landed    - invoiced plus a share of the charges.
+
+   The charge split. "Evenly per unit" is what was asked for and is the
+   right answer for the ordinary order, which carries one material: divide
+   the freight by the units and every unit wears the same share. It stops
+   being arithmetic the moment an order mixes units of measure - 1000 kg of
+   coffee and 40 ea of drums are not 1040 of anything, and a "per unit"
+   figure spread across them is a number with no meaning. So when the units
+   on an order do not agree, the per-unit basis is reported unavailable and
+   the split falls back to line value, which is unit-agnostic and always
+   defined. `basisUsed` says which one actually ran, so nothing has to
+   guess from the shape of the result.
+
+   An order with no charges lands exactly where it was invoiced; an order
+   with charges but no quantity at all leaves the share unallocated rather
+   than dividing by zero, and says so. */
+function landedCost(data, po, options) {
+  const opts = options || {};
+  const lines = poLines(po);
+  const charges = poCharges(po);
+  const chargeTotal = poChargeTotal(po);
+
+  const rows = lines.map(line => {
+    const raw = data ? getRaw(data, line.rawMaterialId) : null;
+    const qty = Number(line.qty) || 0;
+    const orderedUnitCost = Number(line.unitCost) || 0;
+    const invoiced = hasActualCost(line) && po.invoiceVariance;
+    const effectiveUnitCost = poLineEffectiveUnitCost(po, line);
+    return {
+      line, raw,
+      materialName: raw ? raw.name : "(deleted material)",
+      unit: raw ? raw.unit : "",
+      qty,
+      orderedUnitCost,
+      orderedValue: qty * orderedUnitCost,
+      // Null, not zero: this line was never invoiced.
+      actualUnitCost: invoiced ? Number(line.actualUnitCost) : null,
+      invoiced,
+      effectiveUnitCost,
+      invoicedValue: qty * effectiveUnitCost,
+      unitCostVariance: invoiced ? Number(line.actualUnitCost) - orderedUnitCost : null,
+      valueVariance: invoiced ? qty * (Number(line.actualUnitCost) - orderedUnitCost) : 0
+    };
+  });
+
+  const orderedValue = rows.reduce((s, r) => s + r.orderedValue, 0);
+  const invoicedValue = rows.reduce((s, r) => s + r.invoicedValue, 0);
+  const unitsTotal = rows.reduce((s, r) => s + r.qty, 0);
+
+  const units = Array.from(new Set(rows.map(r => r.unit).filter(Boolean)));
+  const mixedUnits = units.length > 1;
+  const requested = opts.basis || (po && po.chargeBasis) || "perUnit";
+  const perUnitAvailable = !mixedUnits && unitsTotal > 0;
+  const basisUsed = requested === "byValue" ? "byValue"
+    : perUnitAvailable ? "perUnit"
+    : invoicedValue > 0 ? "byValue" : "unallocated";
+
+  const chargePerUnit = basisUsed === "perUnit" && unitsTotal > 0
+    ? chargeTotal / unitsTotal : null;
+
+  const withCharges = rows.map(r => {
+    let share = 0;
+    if (chargeTotal > 0) {
+      if (basisUsed === "perUnit") share = chargeTotal * (r.qty / unitsTotal);
+      else if (basisUsed === "byValue" && invoicedValue > 0) share = chargeTotal * (r.invoicedValue / invoicedValue);
+    }
+    const landedValue = r.invoicedValue + share;
+    return {
+      ...r,
+      chargeShare: share,
+      landedValue,
+      // A line with no quantity has no per-unit anything, and saying zero
+      // would read as free.
+      landedUnitCost: r.qty > 0 ? landedValue / r.qty : null
+    };
+  });
+
+  const byKind = {};
+  PO_CHARGE_KINDS.forEach(k => { byKind[k] = 0; });
+  charges.forEach(c => {
+    const k = PO_CHARGE_KINDS.indexOf(c.kind) >= 0 ? c.kind : "Other";
+    byKind[k] += Number(c.amount) || 0;
+  });
+
+  return {
+    lines: withCharges,
+    charges, chargeTotal, chargesByKind: byKind,
+    orderedValue, invoicedValue,
+    landedValue: invoicedValue + (basisUsed === "unallocated" ? 0 : chargeTotal),
+    // Held apart so the two reasons a landed cost moved never merge into one
+    // unexplained number.
+    materialVariance: invoicedValue - orderedValue,
+    hasInvoice: !!(po && po.invoiceVariance) && rows.some(r => r.invoiced),
+    invoicedLineCount: rows.filter(r => r.invoiced).length,
+    unitsTotal, units, mixedUnits, perUnitAvailable,
+    basisRequested: requested, basisUsed, chargePerUnit,
+    // Charges that could not be apportioned to anything are still real money;
+    // they are reported rather than quietly dropped into a line.
+    unallocatedCharges: basisUsed === "unallocated" ? chargeTotal : 0
+  };
+}
+
 /* Total ordered across every line - the figure the order as a whole is
    judged against. */
 function poOrderedQty(po) {
@@ -7557,6 +7847,19 @@ function purchaseOrderRecords(data, options) {
     const status = poDerivedStatus(po);
     const actualDate = poActualDate(po);
     const daysLate = poDaysLate(po);
+    // One reckoning of what this order cost, shared by the list, the record
+    // and the invoice form, so the three cannot disagree.
+    const landed = landedCost(data, po);
+    lineRows.forEach((row, i) => {
+      const l = landed.lines[i];
+      if (!l) return;
+      row.actualUnitCost = l.actualUnitCost;
+      row.effectiveUnitCost = l.effectiveUnitCost;
+      row.unitCostVariance = l.unitCostVariance;
+      row.chargeShare = l.chargeShare;
+      row.landedUnitCost = l.landedUnitCost;
+      row.landedValue = l.landedValue;
+    });
     return {
       po, raw, lines: lineRows,
       reference: po.reference,
@@ -7584,7 +7887,18 @@ function purchaseOrderRecords(data, options) {
       overdue: (status === "Ordered" || status === "Part received") &&
                !!po.expectedDate && po.expectedDate < todayStr(),
       receipts: (po.receipts || []).slice().sort((a, b) => String(a.date).localeCompare(String(b.date))),
-      revisions: (po.revisions || []).slice().sort((a, b) => String(a.at).localeCompare(String(b.at)))
+      revisions: (po.revisions || []).slice().sort((a, b) => String(a.at).localeCompare(String(b.at))),
+      // `value` above stays the ORDERED value - what was agreed, unmoved by
+      // anything that happened afterwards. These sit beside it.
+      landed,
+      landedValue: landed.landedValue,
+      chargeTotal: landed.chargeTotal,
+      invoiceVariance: !!po.invoiceVariance,
+      hasInvoice: landed.hasInvoice,
+      materialVariance: landed.materialVariance,
+      // The single number the buyer is judged on: everything the order cost
+      // against everything it was supposed to.
+      landedVariance: landed.landedValue - landed.orderedValue
     };
   })
   // An order carries its materials on its lines, so "orders for this
@@ -10770,11 +11084,17 @@ export default function App() {
           ? <PurchaseOrderEditor data={data} id={modal.id} onClose={() => setModal(null)} update={update} />
           : <PurchaseOrderModal record={rec} onClose={() => setModal(null)}
               onAmend={() => setModal({ type: "amendPurchaseOrder", id: modal.id })}
+              onCosts={() => setModal({ type: "purchaseCosts", id: modal.id })}
               onCancelOrder={() => { update(d => { tx.cancelPurchaseOrder(d, { purchaseOrderId: modal.id }); return d; }); setModal(null); }} />;
       })()}
       {modal && modal.type === "amendPurchaseOrder" && (() => {
         const rec = purchaseOrderRecords(data).find(r => r.po.id === modal.id);
         return rec ? <PurchaseOrderAmendModal data={data} record={rec}
+          onClose={() => setModal({ type: "purchaseOrder", id: modal.id })} update={update} /> : null;
+      })()}
+      {modal && modal.type === "purchaseCosts" && (() => {
+        const rec = purchaseOrderRecords(data).find(r => r.po.id === modal.id);
+        return rec ? <PurchaseCostsModal data={data} record={rec}
           onClose={() => setModal({ type: "purchaseOrder", id: modal.id })} update={update} /> : null;
       })()}
       {modal && modal.type === "newPurchaseOrder" && (
@@ -14233,9 +14553,14 @@ const PO_SORT_COLUMNS = [
   { key: "materialName", label: "Material", kind: "str" },
   { key: "status", label: "Status", kind: "str" },
   { key: "outstanding", label: "Outstanding quantity", kind: "num" },
-  { key: "value", label: "Order value", kind: "num" }
+  { key: "value", label: "Order value", kind: "num" },
+  { key: "landedValue", label: "Landed cost", kind: "num" },
+  // Sorting by this is how you find the orders that cost more than they said
+  // they would, which is the reason to record any of it.
+  { key: "landedVariance", label: "Variance against plan", kind: "num" }
 ];
 const PO_SEARCH_FIELDS = ["reference", "supplier", "status", "materialName",
+  r => r.po.invoiceRef || "",
   r => (r.lines || []).map(l => l.materialName + " " + l.materialSku).join(" ")];
 
 function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder }) {
@@ -14271,6 +14596,10 @@ function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder }) {
   // a cancelled one never will be.
   const committed = open.reduce((s, r) =>
     s + r.lines.reduce((n, l) => n + l.outstanding * l.unitCost, 0), 0);
+  // Only orders where something actually moved contribute; an order that
+  // landed where it was ordered is not a zero to be averaged in.
+  const moved = records.filter(r => Math.abs(r.landedVariance) >= 0.005);
+  const varianceTotal = moved.reduce((s, r) => s + r.landedVariance, 0);
 
   const seg = (active) => ({
     padding: "5px 11px", fontSize: 12, fontWeight: 600, cursor: "pointer", borderRadius: 6,
@@ -14328,6 +14657,12 @@ function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder }) {
         <div style={{ color: "#5B6470" }}>
           {fmtMoney(committed)} still to be delivered
         </div>
+        {moved.length > 0 && (
+          <div style={{ color: varianceTotal > 0 ? "#A32D2D" : "#1F5B3E" }}>
+            <b>{(varianceTotal > 0 ? "+" : "") + fmtMoney(varianceTotal)}</b> landed against plan
+            <span style={{ color: "#8A9099" }}> on {moved.length} order(s)</span>
+          </div>
+        )}
       </div>
 
       <div style={{ background: "#fff", border: "1px solid #E2E4DD", borderRadius: 10,
@@ -14343,7 +14678,8 @@ function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder }) {
               <th>Quantity</th>
               <th>Received</th>
               <SortableTh view={view} col={PO_SORT_COLUMNS[6]}>Outstanding</SortableTh>
-              <SortableTh view={view} col={PO_SORT_COLUMNS[7]}>Value</SortableTh>
+              <SortableTh view={view} col={PO_SORT_COLUMNS[7]}>Ordered value</SortableTh>
+              <SortableTh view={view} col={PO_SORT_COLUMNS[8]}>Landed</SortableTh>
               <SortableTh view={view} col={PO_SORT_COLUMNS[5]}>Status</SortableTh>
             </tr>
           </thead>
@@ -14373,6 +14709,19 @@ function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder }) {
                     : (r.outstanding > 0 ? fmtNum(r.outstanding) + " " + r.unit : "—")}
                 </td>
                 <td className="mono">{fmtMoney(r.value)}</td>
+                {/* Landed only earns its own figure when something moved it;
+                    otherwise repeating the ordered value says nothing. */}
+                <td className="mono">
+                  {Math.abs(r.landedVariance) < 0.005
+                    ? <span style={{ color: "#9AA09A" }}>—</span>
+                    : <>
+                        {fmtMoney(r.landedValue)}
+                        <div style={{ fontSize: 11,
+                              color: r.landedVariance > 0 ? "#A32D2D" : "#1F5B3E" }}>
+                          {(r.landedVariance > 0 ? "+" : "") + fmtMoney(r.landedVariance)}
+                        </div>
+                      </>}
+                </td>
                 <td>
                   <Badge tone={tone(r)}>{r.status}</Badge>
                   {r.late && <span style={{ color: "#8C6B45", fontSize: 11.5 }}> {r.daysLate}d late</span>}
@@ -14382,7 +14731,7 @@ function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder }) {
               </tr>
             ))}
             {filtered.length === 0 && (
-              <tr><td colSpan={10} style={{ textAlign: "center", color: "#8A9099", padding: 24 }}>
+              <tr><td colSpan={11} style={{ textAlign: "center", color: "#8A9099", padding: 24 }}>
                 No purchase orders match.
               </td></tr>
             )}
@@ -14393,6 +14742,8 @@ function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder }) {
       <div style={{ fontSize: 11.5, color: "#8A9099" }}>
         A draft opens for editing. A placed order opens as a record, and can be amended
         with a reason — quantities cannot be cut below what has already been received.
+        Invoiced prices and delivery charges are entered under "Costs and invoice"; they sit
+        beside the agreed prices rather than replacing them, and produce the landed cost.
       </div>
     </div>
   );
@@ -17011,8 +17362,11 @@ function PurchaseOrderEditor({ data, id, onClose, update }) {
   );
 }
 
-function PurchaseOrderModal({ record, onClose, onCancelOrder, onAmend }) {
+function PurchaseOrderModal({ record, onClose, onCancelOrder, onAmend, onCosts }) {
   const r = record;
+  // Nothing invoiced and no charges means landed == ordered, and a column of
+  // repeated numbers is worse than no column.
+  const showLanded = r.landed.chargeTotal > 0 || r.hasInvoice;
   const money = (n) => fmtMoney(n || 0);
   const tone = r.status === "Received" ? "good"
     : r.status === "Cancelled" ? "neutral"
@@ -17063,6 +17417,7 @@ function PurchaseOrderModal({ record, onClose, onCancelOrder, onAmend }) {
             <th style={{ padding: "4px 6px", textAlign: "right" }}>Quantity</th>
             <th style={{ padding: "4px 6px", textAlign: "right" }}>Unit cost</th>
             <th style={{ padding: "4px 6px", textAlign: "right" }}>Line total</th>
+            {showLanded && <th style={{ padding: "4px 6px", textAlign: "right" }}>Landed / unit</th>}
             <th style={{ padding: "4px 6px", textAlign: "right" }}>Outstanding</th>
           </tr>
         </thead>
@@ -17073,16 +17428,91 @@ function PurchaseOrderModal({ record, onClose, onCancelOrder, onAmend }) {
                 {l.materialSku && <span style={{ color: "#9AA09A" }}> · {l.materialSku}</span>}</td>
               <td style={{ padding: "5px 6px" }}>{l.containers || "\u2014"}</td>
               <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>{fmtNum(l.qty)} {l.unit}</td>
-              <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>{money(l.unitCost)}</td>
+              {/* The agreed price stays visible even once an invoice exists.
+                  The billed one goes underneath it, never in place of it. */}
+              <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>
+                {money(l.unitCost)}
+                {l.actualUnitCost !== null && l.actualUnitCost !== undefined && (
+                  <div style={{ fontSize: 11,
+                        color: l.unitCostVariance > 0 ? "#A32D2D"
+                          : l.unitCostVariance < 0 ? "#1F5B3E" : "#7A8079" }}>
+                    billed {money(l.actualUnitCost)}
+                  </div>
+                )}
+              </td>
               <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>{money(l.value)}</td>
+              {showLanded && (
+                <td className="mono" style={{ padding: "5px 6px", textAlign: "right", fontWeight: 700 }}>
+                  {l.landedUnitCost === null || l.landedUnitCost === undefined
+                    ? "—" : money(l.landedUnitCost)}
+                </td>
+              )}
               <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>{fmtNum(l.outstanding)}</td>
             </tr>
           ))}
           {(r.lines || []).length === 0 && (
-            <tr><td colSpan={6} style={{ padding: "6px", color: "#9AA09A" }}>Nothing on this order.</td></tr>
+            <tr><td colSpan={showLanded ? 7 : 6} style={{ padding: "6px", color: "#9AA09A" }}>Nothing on this order.</td></tr>
           )}
         </tbody>
       </table>
+
+      {/* Only shown once there is something to show. An order with no invoice
+          and no charges lands where it was ordered, and a panel saying so
+          three times over is noise. */}
+      {(r.landed.chargeTotal > 0 || r.hasInvoice) && (
+        <div style={{ marginBottom: 16, padding: "11px 13px", borderRadius: 8,
+                      background: "#F7F8F4", border: "1px solid #E2E4DD" }}>
+          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8 }}>
+            Landed cost
+            {r.po.invoiceRef && <span style={{ fontWeight: 400, color: "#7A8079" }}>
+              {" · invoice " + r.po.invoiceRef}
+              {r.po.invoiceDate ? " of " + fmtDate(r.po.invoiceDate) : ""}
+            </span>}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12 }}>
+            {[["Ordered", money(r.landed.orderedValue), "as agreed"],
+              ["Invoiced", money(r.landed.invoicedValue),
+               r.hasInvoice ? r.landed.invoicedLineCount + " line(s) differ" : "as ordered"],
+              ["Charges", money(r.landed.chargeTotal),
+               r.landed.chargePerUnit !== null && r.landed.chargeTotal > 0
+                 ? money(r.landed.chargePerUnit) + " per unit" : "spread by line value"],
+              ["Landed", money(r.landed.landedValue), "invoiced + charges"],
+              ["Against plan",
+               (r.landedVariance > 0 ? "+" : "") + money(r.landedVariance),
+               "landed less ordered"]].map(([label, value, hint]) => (
+              <div key={label}>
+                <div style={{ fontSize: 11, color: "#7A8079", fontWeight: 600 }}>{label}</div>
+                <div className="mono" style={{ fontSize: 14, fontWeight: 700,
+                      color: label !== "Against plan" ? "#20262B"
+                        : r.landedVariance > 0.005 ? "#A32D2D"
+                        : r.landedVariance < -0.005 ? "#1F5B3E" : "#5B6470" }}>{value}</div>
+                <div style={{ fontSize: 11, color: "#8A9099" }}>{hint}</div>
+              </div>
+            ))}
+          </div>
+          {r.landed.chargeTotal > 0 && (
+            <div style={{ fontSize: 12, color: "#5B6470", marginTop: 9 }}>
+              {r.landed.charges.map(c => (
+                <span key={c.id} style={{ marginRight: 14 }}>
+                  {c.kind}{c.description ? " (" + c.description + ")" : ""}{" "}
+                  <b className="mono">{money(c.amount)}</b>
+                </span>
+              ))}
+            </div>
+          )}
+          {r.landed.unallocatedCharges > 0 && (
+            <div style={{ fontSize: 11.5, color: "#B87510", marginTop: 6 }}>
+              {money(r.landed.unallocatedCharges)} of charges could not be spread — this order has
+              nothing to spread them over.
+            </div>
+          )}
+          {r.po.invoiceNotes && (
+            <div style={{ fontSize: 12, color: "#8A9099", marginTop: 8, fontStyle: "italic" }}>
+              {r.po.invoiceNotes}
+            </div>
+          )}
+        </div>
+      )}
 
       <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>
         Deliveries ({r.receipts.length})
@@ -17150,6 +17580,11 @@ function PurchaseOrderModal({ record, onClose, onCancelOrder, onAmend }) {
           changing one is a recorded amendment rather than an edit.
         </div>
         <div style={{ display: "flex", gap: 8 }}>
+          {/* Unlike amendment, this stays open on a fully received order -
+              the invoice almost always turns up after the goods do. */}
+          {onCosts && r.status !== "Cancelled" && (
+            <Btn variant="secondary" onClick={onCosts}><DollarSign size={14} />Costs and invoice</Btn>
+          )}
           {onAmend && r.status !== "Cancelled" && r.status !== "Received" && (
             <Btn variant="secondary" onClick={onAmend}><Pencil size={14} />Amend order</Btn>
           )}
@@ -17341,6 +17776,278 @@ function PurchaseOrderAmendModal({ data, record, onClose, update }) {
         <div style={{ display: "flex", gap: 8 }}>
           <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
           <Btn onClick={save} style={{ opacity: reason.trim() ? 1 : 0.5 }}>Record amendment</Btn>
+        </div>
+      </div>
+      {error && <div style={{ color: "#A32D2D", fontSize: 12.5, marginTop: 8, textAlign: "right" }}>{error}</div>}
+    </Modal>
+  );
+}
+
+/* Record the supplier's invoice against an order.
+
+   Two independent things live here, and the form keeps them apart because
+   they are answers to different questions. The tick box asks "were we
+   billed different prices than we agreed?" - if yes, each line gets an
+   invoiced price shown NEXT TO the ordered one, never in place of it, so
+   the variance stays legible for as long as the record exists. The charges
+   below it ask "what else did this delivery cost?" and are owed whether or
+   not the prices matched.
+
+   The landed cost updates as it is typed, because the whole reason to
+   enter any of this is to see that number. */
+function PurchaseCostsModal({ data, record, onClose, update }) {
+  const r = record;
+  const po = r.po;
+  const [differs, setDiffers] = useState(!!po.invoiceVariance);
+  const [f, setF] = useState(() => ({
+    invoiceRef: po.invoiceRef || "",
+    invoiceDate: po.invoiceDate || todayStr(),
+    invoiceNotes: po.invoiceNotes || "",
+    chargeBasis: po.chargeBasis === "byValue" ? "byValue" : "perUnit"
+  }));
+  const [costs, setCosts] = useState(() => {
+    const m = {};
+    (po.lines || []).forEach(l => { m[l.id] = hasActualCost(l) ? String(l.actualUnitCost) : ""; });
+    return m;
+  });
+  const [charges, setCharges] = useState(() => (po.charges || []).map(c => ({ ...c })));
+  const [error, setError] = useState("");
+
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+  const patchCharge = (i, patch) => setCharges(cs => cs.map((c, j) => (j === i ? { ...c, ...patch } : c)));
+  const addCharge = () => setCharges(cs => [...cs, { id: uid(), kind: "Shipping",
+    description: "", amount: 0, date: f.invoiceDate, notes: "" }]);
+  const removeCharge = (i) => setCharges(cs => cs.filter((_, j) => j !== i));
+
+  /* Preview against a throwaway copy of the order, so the figures shown are
+     produced by exactly the function that will store them - not by a second
+     implementation that can drift out of step with it. */
+  const preview = useMemo(() => {
+    const draft = {
+      ...po,
+      invoiceVariance: differs,
+      chargeBasis: f.chargeBasis,
+      charges: charges.filter(c => (Number(c.amount) || 0) !== 0),
+      lines: (po.lines || []).map(l => ({
+        ...l,
+        actualUnitCost: differs && String(costs[l.id] || "").trim() !== ""
+          ? Number(costs[l.id]) : ""
+      }))
+    };
+    return landedCost(data, draft);
+  }, [data, po, differs, costs, charges, f.chargeBasis]);
+
+  const save = () => {
+    let res;
+    update(d => {
+      res = tx.recordPurchaseCosts(d, {
+        purchaseOrderId: po.id,
+        invoiceVariance: differs,
+        invoiceRef: f.invoiceRef, invoiceDate: f.invoiceDate, invoiceNotes: f.invoiceNotes,
+        chargeBasis: f.chargeBasis,
+        lineCosts: (po.lines || []).map(l => ({ lineId: l.id, actualUnitCost: costs[l.id] })),
+        charges
+      });
+      return d;
+    });
+    if (res && !res.ok) { setError(res.error); return; }
+    onClose();
+  };
+
+  const money = (n) => fmtMoney(n || 0);
+  const figure = (label, value, hint, colour) => (
+    <div key={label}>
+      <div style={{ fontSize: 11, color: "#7A8079", fontWeight: 600 }}>{label}</div>
+      <div className="mono" style={{ fontSize: 15, fontWeight: 700, color: colour || "#20262B" }}>{value}</div>
+      {hint && <div style={{ fontSize: 11, color: "#8A9099" }}>{hint}</div>}
+    </div>
+  );
+
+  return (
+    <Modal title={"Costs and invoice — " + r.reference} onClose={onClose} wide>
+      <label style={{ display: "flex", gap: 9, alignItems: "flex-start", cursor: "pointer",
+                      padding: "10px 12px", marginBottom: 14, borderRadius: 7,
+                      background: differs ? "#FBF7EF" : "#F4F6F9",
+                      border: "1px solid " + (differs ? "#E4D3B0" : "#DCE1E8") }}>
+        <input type="checkbox" checked={differs} style={{ marginTop: 2 }}
+          onChange={e => setDiffers(e.target.checked)} />
+        <span>
+          <b style={{ fontSize: 13 }}>Received invoice different than original PO</b>
+          <div style={{ fontSize: 11.5, color: "#5B6470", marginTop: 2 }}>
+            Tick this to enter the prices actually billed. The ordered prices are kept exactly
+            as agreed and shown beside them — nothing here overwrites the original order.
+            Clearing the box removes the invoiced prices again.
+          </div>
+        </span>
+      </label>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 2fr", gap: 12, marginBottom: 16 }}>
+        <Field label="Invoice reference">
+          <input style={inputStyle} value={f.invoiceRef}
+            onChange={e => set("invoiceRef", e.target.value)} placeholder="Supplier invoice no." />
+        </Field>
+        <Field label="Invoice date">
+          <input type="date" style={inputStyle} value={f.invoiceDate}
+            onChange={e => set("invoiceDate", e.target.value)} />
+        </Field>
+        <Field label="Invoice notes">
+          <input style={inputStyle} value={f.invoiceNotes}
+            onChange={e => set("invoiceNotes", e.target.value)}
+            placeholder="Anything worth recording about this invoice" />
+        </Field>
+      </div>
+
+      <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>Lines</div>
+      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5, marginBottom: 18 }}>
+        <thead>
+          <tr style={{ textAlign: "left", color: "#7A8079" }}>
+            <th style={{ padding: "4px 6px" }}>Material</th>
+            <th style={{ padding: "4px 6px", textAlign: "right" }}>Quantity</th>
+            <th style={{ padding: "4px 6px", textAlign: "right" }}>Ordered cost</th>
+            <th style={{ padding: "4px 6px", textAlign: "right" }}>Invoiced cost</th>
+            <th style={{ padding: "4px 6px", textAlign: "right" }}>Variance</th>
+            <th style={{ padding: "4px 6px", textAlign: "right" }}>Charge share</th>
+            <th style={{ padding: "4px 6px", textAlign: "right" }}>Landed / unit</th>
+          </tr>
+        </thead>
+        <tbody>
+          {preview.lines.map((l, i) => (
+            <tr key={l.line.id} style={{ borderTop: "1px solid #EEF0EA" }}>
+              <td style={{ padding: "5px 6px" }}>{l.materialName}</td>
+              <td className="mono" style={{ padding: "5px 6px", textAlign: "right" }}>
+                {fmtNum(l.qty)} {l.unit}
+              </td>
+              <td className="mono" style={{ padding: "5px 6px", textAlign: "right", color: "#5B6470" }}>
+                {money(l.orderedUnitCost)}
+              </td>
+              <td style={{ padding: "3px 6px", textAlign: "right" }}>
+                {differs ? (
+                  <input type="number" step="0.0001" min="0"
+                    style={{ ...inputStyle, width: 100, textAlign: "right", height: 32 }}
+                    value={costs[l.line.id] === undefined ? "" : costs[l.line.id]}
+                    placeholder="as ordered"
+                    onChange={e => setCosts(m => ({ ...m, [l.line.id]: e.target.value }))} />
+                ) : <span style={{ color: "#9AA09A" }}>—</span>}
+              </td>
+              {/* Blank is not zero, so an uninvoiced line shows a dash rather
+                  than a variance of nothing. */}
+              <td className="mono" style={{ padding: "5px 6px", textAlign: "right",
+                    color: l.unitCostVariance === null ? "#9AA09A"
+                      : l.unitCostVariance > 0 ? "#A32D2D"
+                      : l.unitCostVariance < 0 ? "#1F5B3E" : "#5B6470" }}>
+                {l.unitCostVariance === null ? "—"
+                  : (l.unitCostVariance > 0 ? "+" : "") + money(l.unitCostVariance)}
+              </td>
+              <td className="mono" style={{ padding: "5px 6px", textAlign: "right", color: "#5B6470" }}>
+                {l.chargeShare > 0 ? money(l.chargeShare) : "—"}
+              </td>
+              <td className="mono" style={{ padding: "5px 6px", textAlign: "right", fontWeight: 700 }}>
+                {l.landedUnitCost === null ? "—" : money(l.landedUnitCost)}
+              </td>
+            </tr>
+          ))}
+          {preview.lines.length === 0 && (
+            <tr><td colSpan={7} style={{ padding: 6, color: "#9AA09A" }}>Nothing on this order.</td></tr>
+          )}
+        </tbody>
+      </table>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+        <div style={{ fontWeight: 700, fontSize: 13 }}>Non-material costs</div>
+        <Btn variant="secondary" onClick={addCharge}><Plus size={14} />Add cost</Btn>
+      </div>
+      <div style={{ fontSize: 11.5, color: "#8A9099", marginBottom: 10 }}>
+        Tax, freight and handling are charges on the delivery, not on one material — so they
+        are entered against the order and spread across it below.
+      </div>
+
+      {charges.length === 0 && (
+        <div style={{ fontSize: 12.5, color: "#8A9099", marginBottom: 12 }}>
+          No charges recorded. The landed cost is the invoiced cost.
+        </div>
+      )}
+      {charges.map((c, i) => (
+        <div key={c.id || i} style={{ display: "grid", gridTemplateColumns: "1fr 2fr 1fr auto",
+                                      gap: 8, alignItems: "end", marginBottom: 8 }}>
+          <Field label="Kind">
+            <select style={inputStyle} value={c.kind}
+              onChange={e => patchCharge(i, { kind: e.target.value })}>
+              {PO_CHARGE_KINDS.map(k => <option key={k} value={k}>{k}</option>)}
+            </select>
+          </Field>
+          <Field label={c.kind === "Other" ? "What is this? (required)" : "Description"}>
+            <input style={{ ...inputStyle,
+                    borderColor: c.kind === "Other" && !String(c.description || "").trim()
+                      ? "#E3B9B2" : undefined }}
+              value={c.description || ""}
+              onChange={e => patchCharge(i, { description: e.target.value })}
+              placeholder={c.kind === "Other" ? "Explain this charge" : "Optional"} />
+          </Field>
+          <Field label="Amount">
+            <input type="number" step="0.01" min="0" style={inputStyle} value={c.amount || 0}
+              onChange={e => patchCharge(i, { amount: parseFloat(e.target.value) || 0 })} />
+          </Field>
+          <IconBtn title="Remove cost" onClick={() => removeCharge(i)}><Trash2 size={14} /></IconBtn>
+        </div>
+      ))}
+
+      {preview.chargeTotal > 0 && (
+        <div style={{ marginTop: 12, marginBottom: 14 }}>
+          <div style={{ fontSize: 12, color: "#7A8079", marginBottom: 5 }}>Spread these charges</div>
+          <div style={{ display: "flex", gap: 14, flexWrap: "wrap", alignItems: "center" }}>
+            {[["perUnit", "Evenly per unit"], ["byValue", "In proportion to line value"]].map(([k, label]) => (
+              <label key={k} style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12.5,
+                                      cursor: k === "perUnit" && !preview.perUnitAvailable ? "not-allowed" : "pointer",
+                                      opacity: k === "perUnit" && !preview.perUnitAvailable ? 0.5 : 1 }}>
+                <input type="radio" name="chargeBasis" checked={f.chargeBasis === k}
+                  disabled={k === "perUnit" && !preview.perUnitAvailable}
+                  onChange={() => set("chargeBasis", k)} />
+                {label}
+              </label>
+            ))}
+          </div>
+          {/* Per-unit is the default and the right answer for the ordinary
+              one-material order. It stops being arithmetic across mixed units,
+              and saying so beats printing a number that means nothing. */}
+          {!preview.perUnitAvailable && (
+            <div style={{ fontSize: 11.5, color: "#B87510", marginTop: 6 }}>
+              {preview.mixedUnits
+                ? "This order mixes " + preview.units.join(" and ") + ", so its units cannot be added " +
+                  "together — an even per-unit split would be meaningless. Charges are spread by line value instead."
+                : "There is no quantity on this order to spread charges over."}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 14,
+                    padding: "12px 14px", borderRadius: 8, marginTop: 4,
+                    background: "#F1F6F2", border: "1px solid #CFE0D3" }}>
+        {figure("Ordered", money(preview.orderedValue), "as agreed")}
+        {figure("Invoiced", money(preview.invoicedValue),
+                preview.hasInvoice ? preview.invoicedLineCount + " line(s) billed differently" : "no variance entered")}
+        {figure("Charges", money(preview.chargeTotal),
+                preview.chargePerUnit !== null && preview.chargeTotal > 0
+                  ? money(preview.chargePerUnit) + " per unit" : "tax, freight, handling")}
+        {figure("Landed", money(preview.landedValue), "invoiced + charges")}
+        {figure("Against plan",
+                (preview.landedValue - preview.orderedValue > 0 ? "+" : "") +
+                  money(preview.landedValue - preview.orderedValue),
+                "landed less ordered",
+                preview.landedValue - preview.orderedValue > 0.005 ? "#A32D2D"
+                  : preview.landedValue - preview.orderedValue < -0.005 ? "#1F5B3E" : "#5B6470")}
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+                    marginTop: 16, gap: 10, flexWrap: "wrap" }}>
+        <div style={{ fontSize: 11.5, color: "#8A9099", maxWidth: 520 }}>
+          Landed cost is reported here and on the order. It does not restate the cost of stock
+          already received — those lots keep the price they were booked in at, which is what
+          stops a late invoice from rewriting a margin already earned.
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+          <Btn onClick={save}>Save costs</Btn>
         </div>
       </div>
       {error && <div style={{ color: "#A32D2D", fontSize: 12.5, marginTop: 8, textAlign: "right" }}>{error}</div>}

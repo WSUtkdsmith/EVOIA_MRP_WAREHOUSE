@@ -44,6 +44,7 @@ through the phase notes below and easy to lose.
 | # | Item | Needs |
 |---|---|---|
 | B | **The nightly valuation snapshot fires at 23:59 UTC.** `vercel.json` sets `59 23 * * *`, and Vercel crons only run on UTC. | The plant's timezone. "11:59 pm local" is a different instant, and for anywhere west of UTC a different *date* — which shifts a day's movement into the wrong bucket rather than losing it, but is still wrong. Tell me the timezone and I will set the cron offset. Also worth deciding: Vercel's Hobby plan runs crons **once a day at an approximate time**, so if the exact minute matters the project needs to be on Pro. |
+| C | **Should landed cost flow into inventory valuation and COGS?** Built and reported, but deliberately not wired into stock costing: a received lot keeps the price it was booked in at, so a late invoice or a freight bill cannot restate a margin already earned. That is the safe default, and it means reported inventory is understated by whatever freight and duty it took to get the material here. | Whether the plant wants **landed** or **invoice-price** inventory valuation. Wiring it in is not hard, but it changes every historic COGS figure in the system and needs a rule for lots received *before* the invoice arrives — re-cost them retroactively (moves history) or apply landed cost only from the invoice date forward (two costing bases coexist). Both are defensible; only one can be the plant's. |
 | A | **"Semi-finished goods" as a fifth material category.** Not built — see `docs/SEMI-FINISHED-GOODS.md`. The capability already exists (bulk = an intermediate product; packing = a process), so the fifth `itemType` would buy a label at the cost of widening the polymorphic surface everywhere. A `stage` flag on intermediate products is the cheap version, under an hour. | Five questions in that doc — chiefly whether a semi-finished good can be **sold as-is**, and whether anything needs to **report on it separately**. Either would justify the type; a labelling preference would not. |
 
 ### Design notes to preserve (so they are not "fixed" by mistake)
@@ -161,6 +162,40 @@ through the phase notes below and easy to lose.
 - **A fully received order is closed to amendment.** Adding to one is a new
   order, not a revision of a finished one — a supplier who has already shipped
   in full is not holding anything to revise.
+- **An invoiced cost NEVER overwrites an ordered one.** `line.unitCost` is the
+  price agreed and does not move; `line.actualUnitCost` is what the supplier
+  billed and sits beside it. Collapsing the two would destroy the variance the
+  moment it was entered — the figure only exists as the gap between them.
+  `tx.recordPurchaseCosts` is deliberately separate from `amendPurchaseOrder`:
+  an amendment changes what we asked for, an invoice changes nothing about the
+  order at all.
+- **Blank `actualUnitCost` is not zero.** Blank means "no invoice figure, the
+  ordered price stands"; zero means "billed nothing", which a supplier can
+  legitimately do. `hasActualCost()` is the only correct test — never
+  `Number(x) || 0`. The CSV codec preserves `""` on a `num` column, and
+  `normalizePurchaseOrders` must keep doing the same, or every export/import
+  cycle would silently re-price half the plant at zero.
+- **`invoiceVariance` gates only the per-line prices.** Charges are owed
+  whether or not the material prices matched, so freight does not disappear
+  when the box is unticked. Unticking *does* clear the line prices, because a
+  line claiming to be billed differently on an invoice that matches is a
+  contradiction.
+- **Charges are on the ORDER, never on a line.** One freight bill covers the
+  truck, not one material on it; splitting at entry would invent a precision
+  the invoice does not have. `landedCost` does the splitting and reports which
+  basis it used.
+- **The per-unit charge split is refused across mixed units.** "Split evenly
+  over all units" is exactly right for the ordinary one-material order and is
+  the default. It stops being arithmetic when an order mixes units of measure —
+  1000 kg and 40 ea are not 1040 of anything — so `perUnitAvailable` goes
+  false, the split falls back to line value (unit-agnostic, always defined),
+  and the UI says why. `basisUsed` always reports what actually ran. Do not
+  "fix" this by summing the quantities.
+- **Landed cost does NOT restate stock already received.** Lots keep the price
+  they were booked in at, which is what stops a late invoice from rewriting a
+  margin already earned — the same rule that protects historic COGS from a
+  supplier price rise. Whether landed cost should flow into inventory
+  valuation is flag C below, and it is the product owner's call.
 - **`purchaseOrderRecords(data, { rawMaterialId })` matches on the LINES.** It
   used to read `po.rawMaterialId`, a header field that `normalizePurchaseOrders`
   deletes when it migrates an order onto lines — so every material filter

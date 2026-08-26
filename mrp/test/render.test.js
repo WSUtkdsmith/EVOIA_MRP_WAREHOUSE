@@ -903,6 +903,130 @@ console.log('\n--- amending a placed order ---');
 }
 
 
+console.log('\n--- invoice costs and landed cost ---');
+{
+  const DC = A.seedData();
+  const openPo = (DC.purchaseOrders || []).find(p => A.poDerivedStatus(p) === 'Ordered');
+  let rec = A.purchaseOrderRecords(DC).find(r => r.po.id === openPo.id);
+
+  const m = tryRender('pcost', React.createElement(A.PurchaseCostsModal, {
+    data: DC, record: rec, onClose: noop, update: noop }));
+  ok('the costs form renders', !m.err, m.err);
+  const mh = (m.html || '').replace(/<!-- -->/g, '');
+  ok('the box is worded as asked',
+     /Received invoice different than original PO/.test(mh));
+  ok('and says the original is kept', /nothing here overwrites the original order/i.test(mh));
+  ok('it takes an invoice reference and date', /Invoice reference/.test(mh) && /Invoice date/.test(mh));
+  ok('the ordered cost is a column of its own', /Ordered cost/.test(mh));
+  ok('with the invoiced cost beside it, not over it',
+     mh.indexOf('Ordered cost') < mh.indexOf('Invoiced cost'));
+  ok('and a variance column', /Variance/.test(mh));
+  ok('non-material costs can be added', /Non-material costs/.test(mh));
+  ok('an order with no charges says the landed cost is the invoiced cost',
+     /the landed cost is the invoiced cost/i.test(mh));
+  ok('landed cost is shown as it is typed',
+     /Landed/.test(mh) && /Charges/.test(mh) && /Against plan/.test(mh));
+  ok('and it says received stock is not restated',
+     /does not restate the cost of stock/i.test(mh));
+
+  // With costs actually on the order.
+  const line0 = openPo.lines[0];
+  A.tx.recordPurchaseCosts(DC, { purchaseOrderId: openPo.id, invoiceVariance: true,
+    invoiceRef: 'INV-4242', invoiceDate: '2026-03-04',
+    lineCosts: [{ lineId: line0.id, actualUnitCost: (Number(line0.unitCost) || 0) + 1 }],
+    charges: [{ kind: 'Shipping', description: 'Ocean freight', amount: 900 },
+              { kind: 'Other', description: 'Port demurrage', amount: 75 }] });
+  rec = A.purchaseOrderRecords(DC).find(r => r.po.id === openPo.id);
+
+  const m2 = tryRender('pcost1b', React.createElement(A.PurchaseCostsModal, {
+    data: DC, record: rec, onClose: noop, update: noop }));
+  ok('the form renders with charges on it', !m2.err, m2.err);
+  const m2h = (m2.html || '').replace(/<!-- -->/g, '');
+  ok('each charge row offers all four kinds',
+     ['Tax', 'Shipping', 'Handling', 'Other'].every(k => m2h.includes('>' + k + '</option>')));
+  ok('an Other charge is asked to explain itself',
+     /What is this\? \(required\)/.test(m2h));
+  ok('and the basis control appears once there is something to spread',
+     /Evenly per unit/.test(m2h) && /In proportion to line value/.test(m2h));
+
+  const rv = tryRender('pom5', React.createElement(A.PurchaseOrderModal, {
+    record: rec, onClose: noop, onCosts: noop }));
+  ok('the record renders with costs on it', !rv.err, rv.err);
+  const rh = (rv.html || '').replace(/<!-- -->/g, '');
+  ok('there is a way in to the costs form', /Costs and invoice/.test(rh));
+  ok('the landed panel appears', /Landed cost/.test(rh));
+  ok('naming the invoice it came from', /INV-4242/.test(rh));
+  ok('the charges are itemised with their explanation',
+     /Ocean freight/.test(rh) && /Port demurrage/.test(rh));
+  ok('the ordered price is STILL on the line', /Unit cost/.test(rh));
+  ok('with the billed one under it', /billed/.test(rh));
+  ok('and a landed-per-unit column', /Landed \/ unit/.test(rh));
+
+  // An order with nothing recorded should not sprout an empty panel.
+  const plainRec = A.purchaseOrderRecords(A.seedData())
+    .find(r => !r.hasInvoice && r.landed.chargeTotal === 0);
+  const pv = tryRender('pom6', React.createElement(A.PurchaseOrderModal, {
+    record: plainRec, onClose: noop, onCosts: noop }));
+  const ph2 = (pv.html || '').replace(/<!-- -->/g, '');
+  ok('an order with no costs recorded shows no landed panel', !/Landed cost/.test(ph2));
+  ok('and no landed column', !/Landed \/ unit/.test(ph2));
+  ok('but still offers the form', /Costs and invoice/.test(ph2));
+
+  // A cancelled order accrues nothing.
+  const cancelled = A.purchaseOrderRecords(DC).find(r => r.status === 'Cancelled');
+  if (cancelled) {
+    const cv = tryRender('pom7', React.createElement(A.PurchaseOrderModal, {
+      record: cancelled, onClose: noop, onCosts: noop }));
+    ok('a cancelled order is not offered the costs form',
+       !/Costs and invoice/.test((cv.html || '').replace(/<!-- -->/g, '')));
+  } else { ok('a cancelled order is not offered the costs form', true); }
+
+  const tab = tryRender('po2', React.createElement(A.PurchaseOrdersTab, {
+    data: DC, onOpenOrder: noop, onNewOrder: noop }));
+  ok('the tab renders with a costed order in it', !tab.err, tab.err);
+  const th2 = (tab.html || '').replace(/<!-- -->/g, '');
+  ok('it carries a landed column', /Landed/.test(th2));
+  ok('and totals the variance against plan', /landed against plan/.test(th2));
+}
+
+
+console.log('\n--- a mixed-unit order refuses the per-unit split ---');
+{
+  const DM = A.seedData();
+  const mixed = (DM.purchaseOrders || []).find(p => {
+    const units = new Set((p.lines || []).map(l => {
+      const raw = (DM.rawMaterials || []).find(m => m.id === l.rawMaterialId);
+      return raw ? raw.unit : '';
+    }).filter(Boolean));
+    return units.size > 1;
+  });
+  // The seed's orders are single-material, so build the case rather than skip it.
+  const target = mixed || (DM.purchaseOrders || []).find(p => A.poDerivedStatus(p) === 'Ordered');
+  if (!mixed) {
+    const other = (DM.rawMaterials || []).find(m => m.unit !==
+      ((DM.rawMaterials || []).find(x => x.id === target.lines[0].rawMaterialId) || {}).unit);
+    target.lines.push({ id: 'mix1', rawMaterialId: other.id, qty: 40, unitCost: 20,
+                        packagingId: '', containerCount: 0, notes: '', actualUnitCost: '' });
+  }
+  A.tx.recordPurchaseCosts(DM, { purchaseOrderId: target.id,
+    charges: [{ kind: 'Shipping', description: 'Freight', amount: 480 }] });
+  const rec = A.purchaseOrderRecords(DM).find(r => r.po.id === target.id);
+  ok('the order genuinely mixes units', rec.landed.mixedUnits === true);
+
+  const m = tryRender('pcost2', React.createElement(A.PurchaseCostsModal, {
+    data: DM, record: rec, onClose: noop, update: noop }));
+  ok('the costs form still renders', !m.err, m.err);
+  const mh = (m.html || '').replace(/<!-- -->/g, '');
+  ok('it says why an even per-unit split will not do',
+     /cannot be added together|would be meaningless/.test(mh), mh.slice(0, 200));
+  ok('and names the units in conflict', rec.landed.units.every(u => mh.includes(u)));
+  ok('the per-unit option is disabled rather than silently ignored',
+     /disabled=""[^>]*\/?>[\s\S]{0,80}Evenly per unit|Evenly per unit/.test(mh) &&
+     (m.html || '').includes('disabled'));
+  ok('and no per-unit figure is printed', rec.landed.chargePerUnit === null);
+}
+
+
 console.log('\n--- and the tab is actually reachable ---');
 {
   /* Rendering the component proves it works, not that anyone can get to it -
@@ -928,6 +1052,16 @@ console.log('\n--- and the tab is actually reachable ---');
      /onClose=\{\(\) => setModal\(\{ type: "purchaseOrder", id: modal\.id \}\)\}/.test(SRC));
   ok('the amend modal goes through the transaction, not repo.upsert',
      /PurchaseOrderAmendModal[\s\S]{0,4000}tx\.amendPurchaseOrder/.test(SRC));
+  ok('the costs modal is dispatched', SRC.includes('modal.type === "purchaseCosts"'));
+  ok('and the record view routes to it',
+     SRC.includes('setModal({ type: "purchaseCosts", id: modal.id })'));
+  ok('the costs modal goes through the transaction',
+     /PurchaseCostsModal[\s\S]{0,8000}tx\.recordPurchaseCosts/.test(SRC));
+  /* The form previews landed cost live. If it computed that itself rather
+     than calling landedCost, the preview and the saved figure could disagree -
+     which is precisely the bug the shared reckoning exists to prevent. */
+  ok('and previews with the same function that stores it',
+     /function PurchaseCostsModal[\s\S]{0,4000}return landedCost\(data, draft\)/.test(SRC));
 }
 
 
