@@ -143,6 +143,29 @@ through the phase notes below and easy to lose.
   quantity again for a part-covered line would double the plant's commitment.
 - **A cancelled order releases its capacity.** `runCommittedQty` skips cancelled
   orders, so a withdrawn order stops holding a run booked against nothing.
+- **A placed purchase order is amended, never edited.** `savePurchaseOrder`
+  still refuses anything that is not a Draft, and that refusal is the point —
+  an order the supplier holds is a commitment, and rewriting one silently is
+  how a delivery ends up matching nothing. `tx.amendPurchaseOrder` is the one
+  sanctioned path, and it demands a reason, writes a `purchase_order_revisions`
+  row per changed field before applying anything, and derives the status
+  afterwards. Do not relax `savePurchaseOrder` to "just handle both".
+- **What may be amended follows the stock, not the status.** A line nothing has
+  been received against is still an intention: material, container, quantity
+  and removal are all open. A line stock has landed against is fixed by that
+  stock — material and container cannot change (lots exist under that
+  identity) and quantity cannot fall below what arrived, or the order would
+  claim less than the warehouse booked. Unit cost stays editable either way: it
+  prices future receipts only, and lots already created keep the price they
+  were received at, which is what stops an old variance from being restated.
+- **A fully received order is closed to amendment.** Adding to one is a new
+  order, not a revision of a finished one — a supplier who has already shipped
+  in full is not holding anything to revise.
+- **`purchaseOrderRecords(data, { rawMaterialId })` matches on the LINES.** It
+  used to read `po.rawMaterialId`, a header field that `normalizePurchaseOrders`
+  deletes when it migrates an order onto lines — so every material filter
+  silently matched nothing, which is why the forecast's "arrives late" warning
+  never fired and the procurement calendar's material filter emptied the grid.
 - **Ownership split, MRP vs warehouse:** the MRP owns the lot (produced quantity,
   cost, genealogy); the warehouse owns placement (pallet, slot, working quantity
   for picking). Where the two disagree the difference is **shown, not
@@ -169,6 +192,9 @@ through the phase notes below and easy to lose.
   `packagesPerSlot` (captured and displayed, but does not yet reserve positions).
 - **Storage rules global vs per-BU** is still TBD in the scoping table.
 - Purchase orders are **single-supplier**; grouping is per supplier by design.
+- **Amending an order does not tell the supplier anything.** There is no
+  outbound message, no re-issued PDF, no acknowledgement to chase. The record
+  is internal; agreeing the change with the supplier is still a phone call.
 
 ### Technical debt
 

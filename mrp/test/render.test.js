@@ -820,6 +820,117 @@ console.log('\n--- sales orders ---');
 }
 
 
+console.log('\n--- purchase orders have a home of their own ---');
+{
+  const DP = A.seedData();
+  const t = tryRender('po', React.createElement(A.PurchaseOrdersTab, {
+    data: DP, onOpenOrder: noop, onNewOrder: noop }));
+  ok('purchase order sheet renders', !t.err, t.err);
+  const h = (t.html || '').replace(/<!-- -->/g, '');
+  ok('there is a way to raise one from here', /New purchase order/.test(h));
+  ok('it lists references', /PO-\d+/.test(h));
+  ok('shows supplier and expected date', h.includes('Supplier') && h.includes('Expected'));
+  ok('shows what is still outstanding', h.includes('Outstanding'));
+  ok('status segments are offered', h.includes('Part received') && h.includes('Cancelled'));
+  ok('and an open filter, since that is the working question', />Open</.test(h));
+  ok('it can be filtered by supplier and material',
+     h.includes('All suppliers') && h.includes('All materials'));
+  ok('rows are clickable', /cursor:pointer/.test(t.html || ''));
+  ok('the banner counts what is past its date', /past the promised date|Nothing is past/.test(h));
+
+  // The tab is the answer to "where do I look one up"; the numbers on it have
+  // to be the same ones the records produce, not a second reckoning.
+  const recs = A.purchaseOrderRecords(DP);
+  ok('the count on the banner is the record count',
+     h.includes('>' + recs.length + '</b> order(s)') ||
+     h.includes('<b>' + recs.length + '</b> order(s)'), String(recs.length));
+
+  const empty2 = Object.fromEntries(Object.keys(DP).map(k => [k, []]));
+  const e = tryRender('po0', React.createElement(A.PurchaseOrdersTab, {
+    data: empty2, onOpenOrder: noop, onNewOrder: noop }));
+  ok('an empty database renders it', !e.err, e.err);
+  ok('and says nothing matches rather than drawing a blank table',
+     /No purchase orders match/.test((e.html || '').replace(/<!-- -->/g, '')));
+}
+
+
+console.log('\n--- amending a placed order ---');
+{
+  const DP = A.seedData();
+  const openRec = A.purchaseOrderRecords(DP).find(r => r.status === 'Ordered');
+  const partRec = A.purchaseOrderRecords(DP).find(r => r.status === 'Part received');
+
+  const m = tryRender('poam', React.createElement(A.PurchaseOrderAmendModal, {
+    data: DP, record: openRec, onClose: noop, update: noop }));
+  ok('the amend dialog renders', !m.err, m.err);
+  const mh = (m.html || '').replace(/<!-- -->/g, '');
+  ok('it asks for a reason up front', /Reason for the amendment/.test(mh));
+  ok('and who agreed it', /Amended by/.test(mh));
+  ok('the expected date is editable', /type="date"/.test(m.html || ''));
+  ok('it says what is fixed and what is not', /cannot be cut below what has arrived/.test(mh));
+  ok('the action names what it does', /Record amendment/.test(mh));
+
+  const p = tryRender('poam2', React.createElement(A.PurchaseOrderAmendModal, {
+    data: DP, record: partRec, onClose: noop, update: noop }));
+  ok('a part-received order renders', !p.err, p.err);
+  const ph = (p.html || '').replace(/<!-- -->/g, '');
+  ok('and the received line says so on its face', /already received/.test(ph));
+
+  // The record view is where the amendment is reached from, and where the
+  // trail it leaves has to be readable afterwards.
+  const rv = tryRender('pom2', React.createElement(A.PurchaseOrderModal, {
+    record: openRec, onClose: noop, onAmend: noop }));
+  ok('the record offers the amendment', /Amend order/.test((rv.html || '').replace(/<!-- -->/g, '')));
+  ok('a fully received order does not', (() => {
+    const done = A.purchaseOrderRecords(DP).find(r => r.status === 'Received');
+    const r = tryRender('pom3', React.createElement(A.PurchaseOrderModal, {
+      record: done, onClose: noop, onAmend: noop }));
+    return !/Amend order/.test((r.html || '').replace(/<!-- -->/g, ''));
+  })());
+
+  const amended = A.seedData();
+  const target = (amended.purchaseOrders || []).find(x => A.poDerivedStatus(x) === 'Ordered');
+  A.tx.amendPurchaseOrder(amended, { purchaseOrderId: target.id,
+    expectedDate: '2027-01-01', reason: 'Supplier moved the ship date',
+    author: 'Buyer', date: '2026-02-02', lines: (target.lines || []).map(l => ({ ...l })) });
+  const withTrail = A.purchaseOrderRecords(amended).find(x => x.po.id === target.id);
+  const tr = tryRender('pom4', React.createElement(A.PurchaseOrderModal, {
+    record: withTrail, onClose: noop, onAmend: noop }));
+  ok('the record shows the amendment history', !tr.err, tr.err);
+  const th = (tr.html || '').replace(/<!-- -->/g, '');
+  ok('with the reason, not just the fact', /Supplier moved the ship date/.test(th));
+  ok('and both sides of the change', /Amendments/.test(th) && th.includes('2027-01-01'));
+}
+
+
+console.log('\n--- and the tab is actually reachable ---');
+{
+  /* Rendering the component proves it works, not that anyone can get to it -
+     which was the whole complaint. That is a wiring question, so it is asked
+     of the source. */
+  const fs = require('fs');
+  const path = require('path');
+  const SRC = fs.readFileSync(path.join(__dirname, '..', 'mrp-console.jsx'), 'utf8');
+  const navAt = SRC.indexOf('const ADMIN_NAV_GROUPS');
+  const navEnd = SRC.indexOf('\nconst OPERATOR_NAV', navAt);
+  const nav = SRC.slice(navAt, navEnd > 0 ? navEnd : navAt + 4000);
+  ok('the nav model is found', navAt > 0 && nav.length > 100);
+  ok('purchase orders is a nav destination', /key: "purchaseOrders"/.test(nav));
+  ok('and it is labelled', /label: "Purchase orders"/.test(nav));
+  ok('the tab renders when that key is selected',
+     /tab === "purchaseOrders"[^\n]*\n\s*<PurchaseOrdersTab/.test(SRC));
+  ok('rows open the order', SRC.includes('type: "purchaseOrder", id }'));
+  ok('the New button opens the editor', SRC.includes('type: "newPurchaseOrder"'));
+  ok('the amend modal is dispatched', SRC.includes('modal.type === "amendPurchaseOrder"'));
+  ok('and the record view routes to it',
+     SRC.includes('setModal({ type: "amendPurchaseOrder", id: modal.id })'));
+  ok('closing the amendment returns to the record, not to nowhere',
+     /onClose=\{\(\) => setModal\(\{ type: "purchaseOrder", id: modal\.id \}\)\}/.test(SRC));
+  ok('the amend modal goes through the transaction, not repo.upsert',
+     /PurchaseOrderAmendModal[\s\S]{0,4000}tx\.amendPurchaseOrder/.test(SRC));
+}
+
+
 console.log('\n--- held finished goods ---');
 {
   const DH2 = A.seedData();

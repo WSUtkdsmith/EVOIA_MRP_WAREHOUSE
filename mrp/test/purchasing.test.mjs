@@ -4,7 +4,7 @@ import { bucketKeyOf, shipmentLines, lotCost, computeItemUnitCost,
          poOutstanding, poDerivedStatus, poDaysLate, poActualDate, openOrderQty,
          purchaseOrderedEvents, purchaseExpectedEvents, purchaseReceivedEvents,
          bucketEvents, exportCsvBundle, importCsvBundle, allTables, csvColumns,
-         normalizeData } from '/tmp/core.mjs';
+         poOrderedQty, IMPORT_ORDER, normalizeData } from '/tmp/core.mjs';
 
 let pass = 0, fail = 0;
 const ok = (n, c, x) => { if (c) { pass++; console.log('  PASS  ' + n); }
@@ -159,6 +159,168 @@ console.log('\n--- against the seeded plant ---');
      (D.rawMaterials || []).every(m => openOrderQty(D, m.id) >= 0));
 }
 
+console.log('\n--- amending an order the supplier already holds ---');
+{
+  const d = plant();
+  d.rawMaterials.push({ id:'RM2', name:'Cocoa', sku:'RM2', supplier:'Acme',
+    unitCost:8, unit:'kg', certStatus:'', leadTimeDays:20, moq:0, reorderPoint:0,
+    onOrder:0, notes:'', composition:[], lots:[] });
+  const o = po(d, { qty: 1000 });
+  o.lines.push({ id:'L2', rawMaterialId:'RM2', qty:200, unitCost:8,
+                 packagingId:'', containerCount:0, notes:'' });
+
+  const noReason = tx.amendPurchaseOrder(d, { purchaseOrderId:'PO1',
+    expectedDate:'2026-03-01', lines: o.lines.map(l => ({...l})) });
+  ok('an amendment with no reason is refused',
+     noReason.ok === false && /reason is required/i.test(noReason.error));
+  ok('and nothing moved', o.expectedDate === '2026-02-01');
+
+  const moved = tx.amendPurchaseOrder(d, { purchaseOrderId:'PO1',
+    expectedDate:'2026-03-01', lines: o.lines.map(l => ({...l})),
+    reason:'Supplier pushed the ship date', author:'AB', date:'2026-01-20' });
+  ok('with a reason it is accepted', moved.ok === true, moved.error);
+  ok('the date moved', o.expectedDate === '2026-03-01');
+  ok('and one revision was written', (o.revisions || []).length === 1);
+  ok('naming the field, both values and the reason', (() => {
+    const r = o.revisions[0];
+    return r.field === 'expectedDate' && r.fromValue === '2026-02-01' &&
+           r.toValue === '2026-03-01' && /pushed/.test(r.reason) && r.author === 'AB';
+  })(), JSON.stringify(o.revisions[0]));
+
+  const same = tx.amendPurchaseOrder(d, { purchaseOrderId:'PO1',
+    expectedDate:'2026-03-01', lines: o.lines.map(l => ({...l})), reason:'no-op' });
+  ok('an amendment that changes nothing records nothing',
+     same.ok === true && same.changed.length === 0 && o.revisions.length === 1);
+}
+
+console.log('\n--- what stock has already fixed cannot be amended away ---');
+{
+  const d = plant();
+  d.rawMaterials.push({ id:'RM2', name:'Cocoa', sku:'RM2', supplier:'Acme',
+    unitCost:8, unit:'kg', certStatus:'', leadTimeDays:20, moq:0, reorderPoint:0,
+    onOrder:0, notes:'', composition:[], lots:[] });
+  const o = po(d, { qty: 1000 });
+  o.lines.push({ id:'L2', rawMaterialId:'RM2', qty:200, unitCost:8,
+                 packagingId:'', containerCount:0, notes:'' });
+  o.receipts.push({ id:'r1', lineId:'L1', date:'2026-02-03', qty:400, lotId:'', notes:'' });
+  const R = () => ({ reason:'revised', date:'2026-02-04' });
+
+  const cut = tx.amendPurchaseOrder(d, { purchaseOrderId:'PO1', ...R(),
+    lines: [{ ...o.lines[0], qty: 300 }, { ...o.lines[1] }] });
+  ok('a received line cannot be cut below what arrived',
+     cut.ok === false && /already been received/.test(cut.error), cut.error);
+
+  const dropped = tx.amendPurchaseOrder(d, { purchaseOrderId:'PO1', ...R(),
+    lines: [{ ...o.lines[1] }] });
+  ok('nor removed', dropped.ok === false && /Cannot remove/.test(dropped.error), dropped.error);
+
+  const repointed = tx.amendPurchaseOrder(d, { purchaseOrderId:'PO1', ...R(),
+    lines: [{ ...o.lines[0], rawMaterialId:'RM2' }, { ...o.lines[1] }] });
+  ok('nor re-pointed at another material',
+     repointed.ok === false && /change the material/.test(repointed.error), repointed.error);
+
+  ok('and after three refusals the order is untouched',
+     poOrderedQty(o) === 1200 && o.lines.length === 2 && (o.revisions || []).length === 0);
+
+  // The untouched line is still just an intention, so it may go.
+  const ok1 = tx.amendPurchaseOrder(d, { purchaseOrderId:'PO1', ...R(),
+    lines: [{ ...o.lines[0] }] });
+  ok('a line with nothing received against it can be removed', ok1.ok === true, ok1.error);
+  ok('the order is down to one line', o.lines.length === 1);
+  ok('the removal is on the record',
+     (o.revisions || []).some(r => r.field === 'line removed' && r.lineRef === 'Cocoa'),
+     JSON.stringify(o.revisions));
+
+  // Cutting the received line back to exactly what arrived closes the order.
+  const closed = tx.amendPurchaseOrder(d, { purchaseOrderId:'PO1', ...R(),
+    lines: [{ ...o.lines[0], qty: 400 }] });
+  ok('cutting a line to what arrived is allowed', closed.ok === true, closed.error);
+  ok('and the order reads as received rather than still open',
+     poDerivedStatus(o) === 'Received' && o.status === 'Received', o.status);
+
+  const done = tx.amendPurchaseOrder(d, { purchaseOrderId:'PO1', ...R(),
+    lines: [{ ...o.lines[0], qty: 900 }] });
+  ok('a fully received order cannot then be re-opened by amendment',
+     done.ok === false && /received in full/.test(done.error), done.error);
+}
+
+console.log('\n--- amendment is not a back door round the other states ---');
+{
+  const d = plant();
+  const draft = po(d, { status:'Draft' });
+  const r1 = tx.amendPurchaseOrder(d, { purchaseOrderId:'PO1', reason:'x',
+    lines: draft.lines.map(l => ({...l})), expectedDate:'2026-05-01' });
+  ok('a draft is edited, not amended',
+     r1.ok === false && /still a draft/.test(r1.error), r1.error);
+
+  const e = plant();
+  const cancelled = po(e, { status:'Cancelled' });
+  const r2 = tx.amendPurchaseOrder(e, { purchaseOrderId:'PO1', reason:'x',
+    lines: cancelled.lines.map(l => ({...l})), expectedDate:'2026-05-01' });
+  ok('a cancelled order cannot be amended', r2.ok === false, r2.error);
+
+  const g = plant();
+  const placed = po(g);
+  const r3 = tx.amendPurchaseOrder(g, { purchaseOrderId:'PO1', reason:'x', lines: [] });
+  ok('an amendment cannot empty an order',
+     r3.ok === false && /at least one line/.test(r3.error), r3.error);
+  ok('and savePurchaseOrder still refuses a placed order outright', (() => {
+    const s = tx.savePurchaseOrder(g, { purchaseOrderId:'PO1', reference:'PO-1',
+      lines: placed.lines.map(l => ({...l})) });
+    return s.ok === false && /already been placed/.test(s.error);
+  })());
+}
+
+console.log('\n--- a placed order can grow, and the growth is on the record ---');
+{
+  const d = plant();
+  d.rawMaterials.push({ id:'RM2', name:'Cocoa', sku:'RM2', supplier:'Acme',
+    unitCost:8, unit:'kg', certStatus:'', leadTimeDays:20, moq:0, reorderPoint:0,
+    onOrder:0, notes:'', composition:[], lots:[] });
+  const o = po(d, { qty: 1000 });
+  o.receipts.push({ id:'r1', lineId:'L1', date:'2026-02-03', qty:1000, lotId:'', notes:'' });
+  ok('it starts fully received', poDerivedStatus(o) === 'Received');
+
+  // Which is exactly why it is closed to amendment - adding to a completed
+  // order is a new order, not a revision of a finished one.
+  const grow = tx.amendPurchaseOrder(d, { purchaseOrderId:'PO1', reason:'more',
+    lines: [{ ...o.lines[0] }, { id:'L2', rawMaterialId:'RM2', qty:50, unitCost:8,
+                                 packagingId:'', containerCount:0, notes:'' }] });
+  ok('so it is refused', grow.ok === false, grow.error);
+
+  const e = plant();
+  e.rawMaterials.push({ id:'RM2', name:'Cocoa', sku:'RM2', supplier:'Acme',
+    unitCost:8, unit:'kg', certStatus:'', leadTimeDays:20, moq:0, reorderPoint:0,
+    onOrder:0, notes:'', composition:[], lots:[] });
+  const p = po(e, { qty: 1000 });
+  p.receipts.push({ id:'r1', lineId:'L1', date:'2026-02-03', qty:400, lotId:'', notes:'' });
+  const added = tx.amendPurchaseOrder(e, { purchaseOrderId:'PO1', reason:'added cocoa',
+    date:'2026-02-04',
+    lines: [{ ...p.lines[0] }, { id:'L2', rawMaterialId:'RM2', qty:50, unitCost:8,
+                                 packagingId:'', containerCount:0, notes:'' }] });
+  ok('a part-received order can take a new line', added.ok === true, added.error);
+  ok('the quantity on order went up', poOrderedQty(p) === 1050);
+  ok('and the addition names the material it added',
+     (p.revisions || []).some(r => r.field === 'line added' && r.lineRef === 'Cocoa'),
+     JSON.stringify(p.revisions));
+  ok('the order is still part received', poDerivedStatus(p) === 'Part received');
+}
+
+console.log('\n--- orders can be found by the material on their lines ---');
+{
+  const D = seedData();
+  const raw = D.rawMaterials.find(m =>
+    (D.purchaseOrders || []).some(p => (p.lines || []).some(l => l.rawMaterialId === m.id)));
+  ok('a material with orders exists', !!raw);
+  const forRaw = purchaseOrderRecords(D, { rawMaterialId: raw.id });
+  ok('filtering by it returns those orders', forRaw.length > 0, String(forRaw.length));
+  ok('and only those', forRaw.every(r =>
+     r.lines.some(l => l.line.rawMaterialId === raw.id)));
+  ok('which is fewer than all of them', forRaw.length < purchaseOrderRecords(D).length);
+  ok('an unknown material returns nothing',
+     purchaseOrderRecords(D, { rawMaterialId: 'nope' }).length === 0);
+}
+
 console.log('\n--- schema, export and migration ---');
 {
   const tables = allTables().map(t => t.table);
@@ -167,6 +329,13 @@ console.log('\n--- schema, export and migration ---');
   const rt = allTables().find(t => t.table === 'purchase_receipts');
   ok('receipts carry their order', csvColumns(rt)[0] === 'purchaseOrderId');
   ok('and a readable lot reference', csvColumns(rt).includes('lotNumber'));
+  ok('purchase_order_revisions is a table', tables.includes('purchase_order_revisions'));
+  ok('and it is in the import order after its parent',
+     IMPORT_ORDER.indexOf('purchase_order_revisions') >
+     IMPORT_ORDER.indexOf('purchase_orders'));
+  const rv = allTables().find(t => t.table === 'purchase_order_revisions');
+  ok('revisions carry their order', csvColumns(rv)[0] === 'purchaseOrderId');
+  ok('and the reason is required', (rv.columns.reason || '').endsWith('!'));
 
   const D = seedData();
   const bundle = exportCsvBundle(D);
@@ -181,6 +350,26 @@ console.log('\n--- schema, export and migration ---');
   ok('and statuses still derive the same way',
      JSON.stringify(purchaseOrderRecords(data).map(r=>r.status).sort()) ===
      JSON.stringify(purchaseOrderRecords(D).map(r=>r.status).sort()));
+
+  /* An audit trail that does not survive an export is not an audit trail, so
+     round-trip a database that actually carries one. */
+  const amended = seedData();
+  const target = (amended.purchaseOrders || []).find(p => poDerivedStatus(p) === 'Ordered');
+  const am = tx.amendPurchaseOrder(amended, { purchaseOrderId: target.id,
+    expectedDate: day(target.expectedDate, 14),
+    reason: 'Supplier moved the ship date', author: 'Buyer', date: '2026-02-02',
+    lines: (target.lines || []).map(l => ({ ...l })) });
+  ok('the seeded order amends cleanly', am.ok === true, am.error);
+  const rr = importCsvBundle(Object.fromEntries(ENTITIES.map(e => [e, []])),
+    Object.fromEntries(exportCsvBundle(amended).map(b => [b.table, b.csv])));
+  ok('the amended export round trips clean', rr.report.errors.length === 0,
+     rr.report.errors.slice(0,3).join('; '));
+  const back = (rr.data.purchaseOrders || []).find(p => p.reference === target.reference);
+  ok('the amendment came back with it',
+     !!back && (back.revisions || []).length === 1, JSON.stringify(back && back.revisions));
+  ok('with its reason intact', !!back &&
+     back.revisions[0].reason === 'Supplier moved the ship date' &&
+     back.revisions[0].author === 'Buyer');
 
   const legacy = seedData();
   delete legacy.purchaseOrders;

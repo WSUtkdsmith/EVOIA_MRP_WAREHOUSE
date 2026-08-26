@@ -778,6 +778,19 @@ const SCHEMA = {
         table: "purchase_receipts", fk: "purchaseOrderId", pk: "id",
         columns: { id: "str", lineId: "str", date: "date!", qty: "num!", lotId: "str", notes: "str" },
         lotRefs: { lotId: { companion: "lotNumber" } }
+      },
+      /* Append-only, exactly as a frozen run's revisions are. A placed order
+         is a commitment the supplier holds, so changing one after the fact is
+         a negotiation with an outside party rather than an edit - and the
+         only useful record of that is what changed, when, and why. `lineRef`
+         names the line a line-level change landed on, because "qty" on its
+         own says nothing on a four-material order. */
+      revisions: {
+        table: "purchase_order_revisions", fk: "purchaseOrderId", pk: "id",
+        columns: {
+          id: "str", at: "date!", field: "str!", lineRef: "str",
+          fromValue: "str", toValue: "str", reason: "str!", author: "str"
+        }
       }
     }
   },
@@ -1539,7 +1552,8 @@ const IMPORT_ORDER = [
   "components", "operating_calendars", "calendar_closures", "calendar_overrides",
   "equipment", "customers", "waste_streams", "processes",
   "composition", "packagings", "process_inputs", "process_equipment", "process_outputs",
-  "maintenance", "production_targets", "purchase_orders", "purchase_order_lines", "warehouse_receipts",
+  "maintenance", "production_targets", "purchase_orders", "purchase_order_lines",
+  "purchase_order_revisions", "warehouse_receipts",
   // Families before family_tags, and family_tags after finished_goods: a tag
   // points at both. This list is hand-maintained and has bitten us twice.
   "product_families", "family_tags", "inventory_snapshots",
@@ -2795,6 +2809,140 @@ const tx = {
     };
     const po = repo.upsert(db, "purchaseOrders", existing ? existing.id : null, payload);
     return { ok: true, po };
+  },
+
+  /* The only sanctioned way to change an order the supplier already holds.
+
+     savePurchaseOrder refuses anything that has been placed, and that was
+     right as far as it went: an order is a commitment, and silently
+     rewriting one is how a delivery ends up matching nothing. But suppliers
+     move dates, quantities get revised, and lines get dropped before they
+     ship - and with no path for any of that, the only options were to cancel
+     and re-raise (losing the reference and the receipt history) or to leave
+     the record wrong. So this is the path, with the record kept.
+
+     What may move and what may not follows from the stock, not from the
+     status. A line nothing has been received against is still just an
+     intention and is fully editable, including removal. A line stock has
+     landed against is history on the shelf: its material and container
+     cannot change - lots already exist under that identity - and its
+     quantity cannot fall below what has already arrived, because that
+     would make the order claim less than the warehouse booked.
+
+     Unit cost stays editable either way. It prices future receipts only;
+     lots already created keep the price they were received at, which is
+     what makes an old variance stay put.
+
+     Revisions are written before the change is applied, so a failure
+     part-way cannot leave an unexplained edit behind. A reason is not
+     optional. */
+  amendPurchaseOrder(db, { purchaseOrderId, supplier, expectedDate, notes, lines, reason, author, date }) {
+    const po = repo.find(db, "purchaseOrders", purchaseOrderId);
+    if (!po) return { ok: false, error: "That purchase order no longer exists." };
+    if (po.status === "Draft") {
+      return { ok: false, error: "That order is still a draft - edit it directly rather than amending it." };
+    }
+    if (po.status === "Cancelled") return { ok: false, error: "A cancelled order cannot be amended." };
+    if (poDerivedStatus(po) === "Received") {
+      return { ok: false, error: "That order has been received in full - there is nothing left to amend." };
+    }
+    const why = String(reason || "").trim();
+    if (!why) return { ok: false, error: "A reason is required to amend a placed order." };
+
+    const when = date || todayStr();
+    const existingLines = poLines(po);
+    const byId = {};
+    existingLines.forEach(l => { byId[l.id] = l; });
+    const nameOf = (rawMaterialId) => {
+      const raw = (db.rawMaterials || []).find(m => m && m.id === rawMaterialId);
+      return raw ? raw.name : "(unknown material)";
+    };
+
+    const clean = (lines || [])
+      .filter(l => l && l.rawMaterialId && (Number(l.qty) || 0) > 0)
+      .map(l => ({
+        id: l.id || uid(),
+        rawMaterialId: l.rawMaterialId,
+        qty: Number(l.qty) || 0,
+        unitCost: Number(l.unitCost) || 0,
+        packagingId: l.packagingId || "",
+        containerCount: Number(l.containerCount) || 0,
+        notes: l.notes || ""
+      }));
+    if (!clean.length) return { ok: false, error: "An order needs at least one line with a material and a quantity." };
+
+    // Every check runs before anything is written, so a rejected amendment
+    // leaves the order exactly as it was.
+    const kept = {};
+    clean.forEach(l => { kept[l.id] = true; });
+    for (const line of existingLines) {
+      const received = poLineReceivedQty(po, line.id);
+      if (received <= 0) continue;
+      const next = clean.find(l => l.id === line.id);
+      if (!next) {
+        return { ok: false, error: "Cannot remove " + nameOf(line.rawMaterialId) +
+                 ": " + received + " has already been received against it." };
+      }
+      if (next.rawMaterialId !== line.rawMaterialId) {
+        return { ok: false, error: "Cannot change the material on a line that has already been received - " +
+                 "stock exists under " + nameOf(line.rawMaterialId) + "." };
+      }
+      if ((next.packagingId || "") !== (line.packagingId || "")) {
+        return { ok: false, error: "Cannot change the container on " + nameOf(line.rawMaterialId) +
+                 ": stock has already been booked in at the ordered container size." };
+      }
+      if (next.qty + 0.001 < received) {
+        return { ok: false, error: "Cannot cut " + nameOf(line.rawMaterialId) + " to " + next.qty +
+                 ": " + received + " has already been received." };
+      }
+    }
+
+    if (!Array.isArray(po.revisions)) po.revisions = [];
+    const val = (v) => String(v === undefined || v === null ? "" : v);
+    const rev = (field, from, to, lineRef) => {
+      if (val(from) === val(to)) return false;
+      po.revisions.push({
+        id: uid(), at: when, field, lineRef: lineRef || "",
+        fromValue: val(from), toValue: val(to),
+        reason: why, author: String(author || "").trim()
+      });
+      return true;
+    };
+
+    const changed = [];
+    if (supplier !== undefined && rev("supplier", po.supplier, supplier)) changed.push("supplier");
+    if (expectedDate !== undefined && rev("expectedDate", po.expectedDate, expectedDate)) changed.push("expectedDate");
+    if (notes !== undefined && rev("notes", po.notes, notes)) changed.push("notes");
+
+    clean.forEach(next => {
+      const prev = byId[next.id];
+      const ref = nameOf(next.rawMaterialId);
+      if (!prev) {
+        if (rev("line added", "", next.qty, ref)) changed.push("lines");
+        return;
+      }
+      ["rawMaterialId", "qty", "unitCost", "packagingId", "containerCount"].forEach(k => {
+        const from = k === "rawMaterialId" ? nameOf(prev[k]) : prev[k];
+        const to = k === "rawMaterialId" ? nameOf(next[k]) : next[k];
+        if (rev("line " + k, from, to, ref)) changed.push("lines");
+      });
+    });
+    existingLines.forEach(prev => {
+      if (kept[prev.id]) return;
+      if (rev("line removed", prev.qty, "", nameOf(prev.rawMaterialId))) changed.push("lines");
+    });
+
+    if (!changed.length) return { ok: true, po, changed: [] };
+
+    if (supplier !== undefined) po.supplier = supplier || "";
+    if (expectedDate !== undefined) po.expectedDate = expectedDate || po.expectedDate;
+    if (notes !== undefined) po.notes = notes || "";
+    po.lines = clean;
+    // Cutting a line back to what has already landed completes the order;
+    // adding to one re-opens it. Neither is a decision anyone typed, so the
+    // stored status is re-derived rather than left to drift.
+    if (po.status !== "Cancelled") po.status = poDerivedStatus(po);
+    return { ok: true, po, changed: Array.from(new Set(changed)) };
   },
 
   /* Cancel an order. A cancelled order stops counting toward cover and
@@ -4955,7 +5103,8 @@ function normalizePurchaseOrders(list) {
       receipts: (Array.isArray(po.receipts) ? po.receipts : []).map(r => ({
         id: r.id || uid(), lineId: r.lineId || firstLineId, date: r.date || "",
         qty: Number(r.qty) || 0, lotId: r.lotId || "", notes: r.notes || ""
-      }))
+      })),
+      revisions: Array.isArray(po.revisions) ? po.revisions : []
     };
     delete next.rawMaterialId; delete next.qty; delete next.unitCost;
     delete next.packagingId; delete next.containerCount;
@@ -7434,10 +7583,15 @@ function purchaseOrderRecords(data, options) {
       // chase; it is not "late" yet because nothing has arrived to judge.
       overdue: (status === "Ordered" || status === "Part received") &&
                !!po.expectedDate && po.expectedDate < todayStr(),
-      receipts: (po.receipts || []).slice().sort((a, b) => String(a.date).localeCompare(String(b.date)))
+      receipts: (po.receipts || []).slice().sort((a, b) => String(a.date).localeCompare(String(b.date))),
+      revisions: (po.revisions || []).slice().sort((a, b) => String(a.at).localeCompare(String(b.at)))
     };
   })
-  .filter(r => !opts.rawMaterialId || r.po.rawMaterialId === opts.rawMaterialId)
+  // An order carries its materials on its lines, so "orders for this
+  // material" is a question about the lines. This read the header field that
+  // orders used to have before lines existed, which normalization deletes -
+  // so every material filter silently matched nothing.
+  .filter(r => !opts.rawMaterialId || r.lines.some(l => l.line.rawMaterialId === opts.rawMaterialId))
   .filter(r => !opts.from || (
     (r.orderDate >= opts.from && r.orderDate <= (opts.to || "9999-12-31")) ||
     (r.expectedDate >= opts.from && r.expectedDate <= (opts.to || "9999-12-31")) ||
@@ -9966,6 +10120,9 @@ const ADMIN_NAV_GROUPS = [
     items: [
       { key: "components", label: "Components", icon: Beaker },
       { key: "materials", label: "Raw materials", icon: Package },
+      // Orders were only reachable from the forecast, which is where they get
+      // raised - not where anyone goes to look one up afterwards.
+      { key: "purchaseOrders", label: "Purchase orders", icon: ShoppingCart },
       { key: "intermediateProducts", label: "Intermediate products", icon: Layers },
       { key: "finished", label: "Finished goods", icon: Boxes },
       { key: "wasteStreams", label: "Waste streams", icon: Recycle },
@@ -10451,6 +10608,11 @@ export default function App() {
             onOpenOrder={(id) => setModal({ type: "salesOrder", id })}
             onNewOrder={() => setModal({ type: "newSalesOrder" })} />
         )}
+        {tab === "purchaseOrders" && view === "admin" && (
+          <PurchaseOrdersTab data={data}
+            onOpenOrder={(id) => setModal({ type: "purchaseOrder", id })}
+            onNewOrder={() => setModal({ type: "newPurchaseOrder" })} />
+        )}
         {tab === "customers" && (
           <CustomersTab data={data} search={search} setSearch={setSearch}
             onAdd={() => setModal({ type: "customer", id: null })}
@@ -10602,11 +10764,18 @@ export default function App() {
         const rec = purchaseOrderRecords(data).find(r => r.po.id === modal.id);
         if (!rec) return null;
         // A draft is still being written, so it opens editable. Anything
-        // placed is a commitment the supplier holds, and opens read-only.
+        // placed opens as a record, from which an amendment is a deliberate
+        // second step rather than something you fall into by typing.
         return rec.po.status === "Draft"
           ? <PurchaseOrderEditor data={data} id={modal.id} onClose={() => setModal(null)} update={update} />
           : <PurchaseOrderModal record={rec} onClose={() => setModal(null)}
+              onAmend={() => setModal({ type: "amendPurchaseOrder", id: modal.id })}
               onCancelOrder={() => { update(d => { tx.cancelPurchaseOrder(d, { purchaseOrderId: modal.id }); return d; }); setModal(null); }} />;
+      })()}
+      {modal && modal.type === "amendPurchaseOrder" && (() => {
+        const rec = purchaseOrderRecords(data).find(r => r.po.id === modal.id);
+        return rec ? <PurchaseOrderAmendModal data={data} record={rec}
+          onClose={() => setModal({ type: "purchaseOrder", id: modal.id })} update={update} /> : null;
       })()}
       {modal && modal.type === "newPurchaseOrder" && (
         <PurchaseOrderEditor data={data} id={null} onClose={() => setModal(null)} update={update} />
@@ -14045,6 +14214,190 @@ function SalesOrdersTab({ data, onOpenOrder, onNewOrder }) {
   );
 }
 
+/* ---------------------------------------------------------------
+   Purchase orders
+
+   Orders were raisable from the forecast and openable from the
+   procurement calendar, and that was the whole of it: no list, no
+   way to find one by reference, no way to see what is outstanding
+   with which supplier. This is that list, built the same way the
+   sales order list is - same toolbar, same sort and search, same
+   status segments - because it answers the same shape of question
+   from the other side of the plant.
+----------------------------------------------------------------*/
+const PO_SORT_COLUMNS = [
+  { key: "orderDate", label: "Order date", kind: "str" },
+  { key: "expectedDate", label: "Expected date", kind: "str" },
+  { key: "reference", label: "Reference", kind: "str" },
+  { key: "supplier", label: "Supplier", kind: "str" },
+  { key: "materialName", label: "Material", kind: "str" },
+  { key: "status", label: "Status", kind: "str" },
+  { key: "outstanding", label: "Outstanding quantity", kind: "num" },
+  { key: "value", label: "Order value", kind: "num" }
+];
+const PO_SEARCH_FIELDS = ["reference", "supplier", "status", "materialName",
+  r => (r.lines || []).map(l => l.materialName + " " + l.materialSku).join(" ")];
+
+function PurchaseOrdersTab({ data, onOpenOrder, onNewOrder }) {
+  const [statusFilter, setStatusFilter] = useState("");
+  const [supplierFilter, setSupplierFilter] = useState("");
+  const [materialFilter, setMaterialFilter] = useState("");
+
+  const all = useMemo(() => purchaseOrderRecords(data), [data]);
+
+  const suppliers = useMemo(() => Array.from(new Set(
+    all.map(r => r.supplier).filter(Boolean))).sort((a, b) => a.localeCompare(b)), [all]);
+  const materials = useMemo(() => (data.rawMaterials || []).slice()
+    .sort((a, b) => String(a.name).localeCompare(String(b.name))), [data.rawMaterials]);
+
+  const records = useMemo(() => all.filter(r =>
+    (!statusFilter || (statusFilter === "open" ? r.open : r.status === statusFilter)) &&
+    (!supplierFilter || r.supplier === supplierFilter) &&
+    (!materialFilter || r.lines.some(l => l.line.rawMaterialId === materialFilter))
+  ), [all, statusFilter, supplierFilter, materialFilter]);
+
+  const view = useListView(records, {
+    columns: PO_SORT_COLUMNS,
+    fields: PO_SEARCH_FIELDS,
+    initialSort: { key: "orderDate", dir: "desc" }
+  });
+  const filtered = view.rows;
+
+  const open = records.filter(r => r.open);
+  const overdue = records.filter(r => r.overdue);
+  const drafts = records.filter(r => r.status === "Draft");
+  // Committed money is what is still owed on open orders, not the value of
+  // every order ever raised - a received order has already been paid for and
+  // a cancelled one never will be.
+  const committed = open.reduce((s, r) =>
+    s + r.lines.reduce((n, l) => n + l.outstanding * l.unitCost, 0), 0);
+
+  const seg = (active) => ({
+    padding: "5px 11px", fontSize: 12, fontWeight: 600, cursor: "pointer", borderRadius: 6,
+    background: active ? "#1F6F78" : "#fff", color: active ? "#fff" : "#5B6470",
+    border: "1px solid " + (active ? "#1F6F78" : "#D7DAD3")
+  });
+  const tone = (r) => r.status === "Received" ? "good"
+    : r.status === "Cancelled" ? "neutral"
+    : r.status === "Draft" ? "neutral"
+    : r.overdue ? "bad" : "info";
+
+  return (
+    <div>
+      <PageHeader tabKey="purchaseOrders"
+        subtitle="What has been ordered from whom, what is still outstanding, and what arrived late"
+        action={<Btn onClick={onNewOrder}><Plus size={15} />New purchase order</Btn>} />
+
+      <ListToolbar view={view} columns={PO_SORT_COLUMNS} placeholder="Order, supplier, material…">
+        <select style={{ ...inputStyle, width: "auto", minWidth: 150 }} value={supplierFilter}
+          onChange={e => setSupplierFilter(e.target.value)} title="Filter by supplier">
+          <option value="">All suppliers</option>
+          {suppliers.map(s => <option key={s} value={s}>{s}</option>)}
+        </select>
+        <select style={{ ...inputStyle, width: "auto", minWidth: 160 }} value={materialFilter}
+          onChange={e => setMaterialFilter(e.target.value)} title="Filter by material">
+          <option value="">All materials</option>
+          {materials.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+        </select>
+      </ListToolbar>
+
+      <div style={{ display: "flex", gap: 4, marginBottom: 14, flexWrap: "wrap" }}>
+        {[["", "All"], ["open", "Open"], ["Draft", "Draft"], ["Ordered", "Ordered"],
+          ["Part received", "Part received"], ["Received", "Received"],
+          ["Cancelled", "Cancelled"]].map(([k, label]) => (
+          <div key={k || "all"} role="button" tabIndex={0} onClick={() => setStatusFilter(k)}
+            onKeyDown={e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setStatusFilter(k); } }}
+            style={seg(statusFilter === k)}>{label}</div>
+        ))}
+      </div>
+
+      <div style={{
+        display: "flex", gap: 20, flexWrap: "wrap", alignItems: "center",
+        padding: "10px 14px", marginBottom: 14, borderRadius: 8, fontSize: 13,
+        background: overdue.length ? "#FCF4F3" : "#F1F6F2",
+        border: "1px solid " + (overdue.length ? "#E3B9B2" : "#CFE0D3")
+      }}>
+        <div><b>{records.length}</b> order(s)</div>
+        <div><b>{open.length}</b> still open</div>
+        {overdue.length > 0
+          ? <div style={{ color: "#A32D2D" }}><b>{overdue.length}</b> past the promised date</div>
+          : <div style={{ color: "#2E7D5B" }}>Nothing is past its promised date.</div>}
+        {drafts.length > 0 && (
+          <div style={{ color: "#8C6B45" }}><b>{drafts.length}</b> draft(s) never placed</div>
+        )}
+        <div style={{ color: "#5B6470" }}>
+          {fmtMoney(committed)} still to be delivered
+        </div>
+      </div>
+
+      <div style={{ background: "#fff", border: "1px solid #E2E4DD", borderRadius: 10,
+                    overflow: "hidden", marginBottom: 16 }}>
+        <table className="mrp-table">
+          <thead>
+            <tr>
+              <SortableTh view={view} col={PO_SORT_COLUMNS[2]}>Order</SortableTh>
+              <SortableTh view={view} col={PO_SORT_COLUMNS[3]}>Supplier</SortableTh>
+              <SortableTh view={view} col={PO_SORT_COLUMNS[4]}>Material</SortableTh>
+              <SortableTh view={view} col={PO_SORT_COLUMNS[0]}>Ordered</SortableTh>
+              <SortableTh view={view} col={PO_SORT_COLUMNS[1]}>Expected</SortableTh>
+              <th>Quantity</th>
+              <th>Received</th>
+              <SortableTh view={view} col={PO_SORT_COLUMNS[6]}>Outstanding</SortableTh>
+              <SortableTh view={view} col={PO_SORT_COLUMNS[7]}>Value</SortableTh>
+              <SortableTh view={view} col={PO_SORT_COLUMNS[5]}>Status</SortableTh>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map(r => (
+              <tr key={r.po.id}
+                  onClick={() => onOpenOrder && onOpenOrder(r.po.id)}
+                  style={{ cursor: onOpenOrder ? "pointer" : "default" }}
+                  title="Open the order">
+                <td className="mono">{r.reference}</td>
+                <td>{r.supplier || "—"}</td>
+                <td>{r.materialName}
+                  {r.materialSku && <span style={{ color: "#9AA09A" }}> · {r.materialSku}</span>}</td>
+                <td className="mono">{fmtDate(r.orderDate)}</td>
+                <td className="mono" style={{ color: r.overdue ? "#A32D2D" : undefined }}>
+                  {fmtDate(r.expectedDate)}
+                </td>
+                {/* Quantities only add up within one material, so a mixed
+                    order shows its line count instead of a meaningless total. */}
+                <td className="mono">{r.lines.length > 1
+                  ? r.lines.length + " lines" : fmtNum(r.qty) + " " + r.unit}</td>
+                <td className="mono">{r.lines.length > 1
+                  ? "—" : fmtNum(r.receivedQty) + " " + r.unit}</td>
+                <td className="mono" style={{ fontWeight: r.outstanding > 0 ? 700 : 400 }}>
+                  {r.lines.length > 1
+                    ? (r.outstanding > 0 ? "outstanding" : "—")
+                    : (r.outstanding > 0 ? fmtNum(r.outstanding) + " " + r.unit : "—")}
+                </td>
+                <td className="mono">{fmtMoney(r.value)}</td>
+                <td>
+                  <Badge tone={tone(r)}>{r.status}</Badge>
+                  {r.late && <span style={{ color: "#8C6B45", fontSize: 11.5 }}> {r.daysLate}d late</span>}
+                  {(r.revisions || []).length > 0 &&
+                    <span style={{ color: "#8C6B45", fontSize: 11.5 }}> · amended</span>}
+                </td>
+              </tr>
+            ))}
+            {filtered.length === 0 && (
+              <tr><td colSpan={10} style={{ textAlign: "center", color: "#8A9099", padding: 24 }}>
+                No purchase orders match.
+              </td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ fontSize: 11.5, color: "#8A9099" }}>
+        A draft opens for editing. A placed order opens as a record, and can be amended
+        with a reason — quantities cannot be cut below what has already been received.
+      </div>
+    </div>
+  );
+}
+
 function CustomersTab({ data, search, setSearch, onAdd, onEdit, onDelete }) {
   const rows = data.customers.filter(c => !search || c.name.toLowerCase().includes(search.toLowerCase()) || c.code.toLowerCase().includes(search.toLowerCase()));
   const tr = useTimeRange(data, "12m");
@@ -16658,7 +17011,7 @@ function PurchaseOrderEditor({ data, id, onClose, update }) {
   );
 }
 
-function PurchaseOrderModal({ record, onClose, onCancelOrder }) {
+function PurchaseOrderModal({ record, onClose, onCancelOrder, onAmend }) {
   const r = record;
   const money = (n) => fmtMoney(n || 0);
   const tone = r.status === "Received" ? "good"
@@ -16751,6 +17104,41 @@ function PurchaseOrderModal({ record, onClose, onCancelOrder }) {
         </div>
       ))}
 
+      {(r.revisions || []).length > 0 && (
+        <div style={{ marginTop: 16 }}>
+          <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>
+            Amendments ({r.revisions.length})
+          </div>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+            <thead>
+              <tr style={{ textAlign: "left", color: "#7A8079" }}>
+                <th style={{ padding: "4px 6px" }}>When</th>
+                <th style={{ padding: "4px 6px" }}>What</th>
+                <th style={{ padding: "4px 6px" }}>From</th>
+                <th style={{ padding: "4px 6px" }}>To</th>
+                <th style={{ padding: "4px 6px" }}>Reason</th>
+              </tr>
+            </thead>
+            <tbody>
+              {r.revisions.map(rev => (
+                <tr key={rev.id} style={{ borderTop: "1px solid #EEF0EA" }}>
+                  <td className="mono" style={{ padding: "4px 6px" }}>{fmtDate(rev.at)}</td>
+                  <td style={{ padding: "4px 6px" }}>
+                    {rev.field}
+                    {rev.lineRef && <span style={{ color: "#9AA09A" }}> · {rev.lineRef}</span>}
+                  </td>
+                  <td className="mono" style={{ padding: "4px 6px", color: "#8A9099" }}>{rev.fromValue || "—"}</td>
+                  <td className="mono" style={{ padding: "4px 6px" }}>{rev.toValue || "—"}</td>
+                  <td style={{ padding: "4px 6px", color: "#5B6470" }}>
+                    {rev.reason}{rev.author ? " — " + rev.author : ""}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
       {r.po.notes && (
         <div style={{ fontSize: 12, color: "#8A9099", marginTop: 12, fontStyle: "italic" }}>
           {r.po.notes}
@@ -16758,15 +17146,204 @@ function PurchaseOrderModal({ record, onClose, onCancelOrder }) {
       )}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 16, gap: 10 }}>
         <div style={{ fontSize: 11.5, color: "#8A9099" }}>
-          A placed order is read-only — the supplier holds it, and stock may already have landed against it.
+          The supplier holds this order and stock may already have landed against it, so
+          changing one is a recorded amendment rather than an edit.
         </div>
         <div style={{ display: "flex", gap: 8 }}>
+          {onAmend && r.status !== "Cancelled" && r.status !== "Received" && (
+            <Btn variant="secondary" onClick={onAmend}><Pencil size={14} />Amend order</Btn>
+          )}
           {onCancelOrder && r.status !== "Cancelled" && r.status !== "Received" && (
             <Btn variant="secondary" onClick={onCancelOrder}>Cancel order</Btn>
           )}
           <Btn variant="secondary" onClick={onClose}>Close</Btn>
         </div>
       </div>
+    </Modal>
+  );
+}
+
+/* Amend a placed order.
+
+   The editor is deliberately not reused. It is built around a draft, where
+   every field is still an intention; here a line's history decides what may
+   move, so the form has to show that history line by line rather than
+   present a uniform set of inputs and let the save fail. A line that has
+   been received says so, and locks the fields that stock has already fixed.
+
+   The reason is required at the top rather than confirmed at the end,
+   because it is what the amendment is for. */
+function PurchaseOrderAmendModal({ data, record, onClose, update }) {
+  const r = record;
+  const [f, setF] = useState(() => ({
+    supplier: r.po.supplier || "",
+    expectedDate: r.po.expectedDate || "",
+    notes: r.po.notes || "",
+    lines: (r.po.lines || []).map(l => ({ ...l }))
+  }));
+  const [reason, setReason] = useState("");
+  const [author, setAuthor] = useState("");
+  const [error, setError] = useState("");
+
+  const set = (k, v) => setF(p => ({ ...p, [k]: v }));
+  const patchLine = (i, patch) => setF(p => ({
+    ...p, lines: p.lines.map((l, j) => (j === i ? { ...l, ...patch } : l))
+  }));
+  const removeLine = (i) => setF(p => ({ ...p, lines: p.lines.filter((_, j) => j !== i) }));
+  const addLine = () => setF(p => ({
+    ...p,
+    lines: [...p.lines, { id: uid(), rawMaterialId: "", qty: 0, unitCost: 0,
+                          packagingId: "", containerCount: 0, notes: "" }]
+  }));
+
+  const receivedOn = (lineId) => poLineReceivedQty(r.po, lineId);
+  const materials = data.rawMaterials || [];
+  const packagingsFor = (rawMaterialId) => {
+    const raw = getRaw(data, rawMaterialId);
+    return (raw && raw.packagings) || [];
+  };
+  const setContainers = (i, count) => {
+    const line = f.lines[i];
+    const pkg = packagingsFor(line.rawMaterialId).find(p => p.id === line.packagingId);
+    patchLine(i, { containerCount: count, ...(pkg ? { qty: qtyFromContainers(pkg, count) } : {}) });
+  };
+
+  const total = f.lines.reduce((s, l) => s + (Number(l.qty) || 0) * (Number(l.unitCost) || 0), 0);
+
+  const save = () => {
+    let res;
+    update(d => {
+      res = tx.amendPurchaseOrder(d, {
+        purchaseOrderId: r.po.id,
+        supplier: f.supplier, expectedDate: f.expectedDate, notes: f.notes,
+        lines: f.lines, reason, author, date: todayStr()
+      });
+      return d;
+    });
+    if (res && !res.ok) { setError(res.error); return; }
+    if (res && res.ok && !res.changed.length) { setError("Nothing changed, so nothing was recorded."); return; }
+    onClose();
+  };
+
+  return (
+    <Modal title={"Amend purchase order " + r.reference} onClose={onClose} wide>
+      <div style={{ fontSize: 12.5, color: "#5B6470", padding: "9px 12px", marginBottom: 14,
+                    borderRadius: 7, background: "#F4F6F9", border: "1px solid #DCE1E8" }}>
+        This order has been placed. Anything already received is fixed — those lines keep their
+        material and container, and cannot be cut below what has arrived. Every change is recorded
+        against the order with the reason given here.
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
+        <Field label="Reason for the amendment">
+          <input style={inputStyle} value={reason} onChange={e => setReason(e.target.value)}
+            placeholder="Supplier moved the date, quantity revised…" />
+        </Field>
+        <Field label="Amended by">
+          <input style={inputStyle} value={author} onChange={e => setAuthor(e.target.value)}
+            placeholder="Who agreed this" />
+        </Field>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 14 }}>
+        <Field label="Supplier">
+          <input style={inputStyle} value={f.supplier} onChange={e => set("supplier", e.target.value)} />
+        </Field>
+        <Field label="Expected">
+          <input type="date" style={inputStyle} value={f.expectedDate}
+            onChange={e => set("expectedDate", e.target.value)} />
+        </Field>
+      </div>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+        <div style={{ fontWeight: 700, fontSize: 13 }}>Lines</div>
+        <Btn variant="secondary" onClick={addLine}><Plus size={14} />Add line</Btn>
+      </div>
+
+      {f.lines.map((line, i) => {
+        const received = receivedOn(line.id);
+        const locked = received > 0;
+        const packs = packagingsFor(line.rawMaterialId);
+        const pkg = packs.find(p => p.id === line.packagingId);
+        const raw = getRaw(data, line.rawMaterialId);
+        return (
+          <div key={line.id || i} style={{ marginBottom: 10, padding: locked ? "8px 10px" : 0,
+                                           borderRadius: locked ? 7 : 0,
+                                           background: locked ? "#F7F8F4" : "transparent",
+                                           border: locked ? "1px solid #E2E4DD" : "none" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1.6fr 1.2fr 0.8fr 1fr 0.9fr auto",
+                          gap: 8, alignItems: "end" }}>
+              <Field label="Material">
+                {locked ? (
+                  <div style={{ height: 38, display: "flex", alignItems: "center", fontSize: 13 }}>
+                    {raw ? raw.name : "(deleted material)"}
+                  </div>
+                ) : (
+                  <select style={inputStyle} value={line.rawMaterialId}
+                    onChange={e => patchLine(i, { rawMaterialId: e.target.value, packagingId: "" })}>
+                    <option value="">Select a material…</option>
+                    {materials.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                  </select>
+                )}
+              </Field>
+              <Field label="Container">
+                {locked || !packs.length ? (
+                  <div style={{ height: 38, display: "flex", alignItems: "center", fontSize: 12.5, color: "#7A8079" }}>
+                    {pkg ? packagingLabel(pkg) : "—"}
+                  </div>
+                ) : (
+                  <select style={inputStyle} value={line.packagingId}
+                    onChange={e => patchLine(i, { packagingId: e.target.value })}>
+                    <option value="">By quantity</option>
+                    {packs.map(p => <option key={p.id} value={p.id}>{packagingLabel(p)}</option>)}
+                  </select>
+                )}
+              </Field>
+              <Field label="Containers">
+                <input type="number" min="0" style={inputStyle} disabled={!pkg}
+                  value={line.containerCount || 0}
+                  onChange={e => setContainers(i, Math.max(0, parseInt(e.target.value) || 0))} />
+              </Field>
+              <Field label={"Quantity" + (raw && raw.unit ? " (" + raw.unit + ")" : "")}>
+                <input type="number" step="any" min={locked ? received : 0} style={inputStyle}
+                  disabled={!!pkg && !locked}
+                  value={line.qty || 0}
+                  onChange={e => patchLine(i, { qty: parseFloat(e.target.value) || 0 })} />
+              </Field>
+              <Field label="Unit cost">
+                <input type="number" step="0.01" min="0" style={inputStyle} value={line.unitCost || 0}
+                  onChange={e => patchLine(i, { unitCost: parseFloat(e.target.value) || 0 })} />
+              </Field>
+              {locked
+                ? <div style={{ width: 32 }} />
+                : <IconBtn title="Remove line" onClick={() => removeLine(i)}><Trash2 size={14} /></IconBtn>}
+            </div>
+            {locked && (
+              <div style={{ fontSize: 11.5, color: "#8C6B45", marginTop: 4 }}>
+                {fmtNum(received)} {raw && raw.unit ? raw.unit : ""} already received — this line cannot
+                be removed, re-pointed, or cut below that.
+              </div>
+            )}
+          </div>
+        );
+      })}
+
+      <Field label="Notes">
+        <input style={inputStyle} value={f.notes} onChange={e => set("notes", e.target.value)} />
+      </Field>
+
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center",
+                    marginTop: 16, flexWrap: "wrap", gap: 10 }}>
+        <div style={{ fontSize: 14 }}>
+          Order total <b className="mono">{fmtMoney(total)}</b>
+          <span style={{ color: "#8A9099", fontSize: 12 }}> · {f.lines.length} line(s)</span>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+          <Btn onClick={save} style={{ opacity: reason.trim() ? 1 : 0.5 }}>Record amendment</Btn>
+        </div>
+      </div>
+      {error && <div style={{ color: "#A32D2D", fontSize: 12.5, marginTop: 8, textAlign: "right" }}>{error}</div>}
     </Modal>
   );
 }
